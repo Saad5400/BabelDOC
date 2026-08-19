@@ -79,12 +79,139 @@ LINE_BREAK_REGEX = regex.compile(
     r"\U0001E030-\U0001E08F"  # Cyrillic Extended-D
     r"\uA000-\uA48F"  # Yi Syllables
     r"\uA490-\uA4CF"  # Yi Radicals
+    r"\u0600-\u06FF"  # Arabic
+    r"\u0750-\u077F"  # Arabic Supplement
+    r"\u0870-\u089F"  # Arabic Extended-B
+    r"\u08A0-\u08FF"  # Arabic Extended-A
+    r"\uFB50-\uFDFF"  # Arabic Presentation Forms-A
+    r"\uFE70-\uFEFF"  # Arabic Presentation Forms-B
+    r"\u0590-\u05FF"  # Hebrew
     r"'"
     r"-"  # Hyphen
     r"·"  # Middle Dot (U+00B7) For Català
     r"ʻ"  # Spacing Modifier Letters U+02BB
     r"]+$"
 )
+
+# --- RTL (Arabic / Hebrew) support ------------------------------------------
+RTL_CHAR_REGEX = regex.compile(
+    r"[\u0590-\u05FF"  # Hebrew
+    r"\u0600-\u06FF"  # Arabic
+    r"\u0750-\u077F"  # Arabic Supplement
+    r"\u0870-\u089F"  # Arabic Extended-B
+    r"\u08A0-\u08FF"  # Arabic Extended-A
+    r"\uFB1D-\uFB4F"  # Hebrew Presentation Forms
+    r"\uFB50-\uFDFF"  # Arabic Presentation Forms-A
+    r"\uFE70-\uFEFF"  # Arabic Presentation Forms-B
+    r"]"
+)
+
+# Invisible bidi control / zero-width characters. Our per-character renderer
+# gives every code point a real advance width (the font mapper falls back to a
+# visible-width glyph), so control characters that should be zero-width instead
+# create spurious gaps ("justified"-looking lines). They carry no information
+# for our explicit bidi algorithm, so strip them from translated text.
+BIDI_CONTROL_REGEX = regex.compile(
+    "[\u200b\u200c\u200d\u200e\u200f"  # ZWSP ZWNJ ZWJ LRM RLM
+    "\u061c"  # Arabic Letter Mark
+    "\u202a-\u202e"  # LRE RLE PDF LRO RLO
+    "\u2066-\u2069"  # LRI RLI FSI PDI
+    "\u2060\ufeff]"  # word joiner, BOM/ZWNBSP
+)
+
+# Collapse runs of plain spaces left behind by control-char stripping
+# (translators sometimes emit "word ‏ word", which would otherwise
+# render as a double-width gap).
+MULTI_SPACE_REGEX = regex.compile(r"[  ]{2,}")
+
+# Neutral operator characters that bind to a following digit run
+# (e.g. "> 10", "= 5", "±3"): keeping them with the digits preserves the
+# left-to-right reading of the math snippet inside an RTL sentence.
+NEUTRAL_OPERATOR_CHARS = set("=<>+±×÷≈≠≤≥~∼*/-−")
+
+# Characters replaced by their bidi-mirrored counterpart when they are part of
+# a right-to-left visual run.
+BIDI_MIRROR_MAP = {
+    "(": ")",
+    ")": "(",
+    "[": "]",
+    "]": "[",
+    "{": "}",
+    "}": "{",
+    "<": ">",
+    ">": "<",
+    "«": "»",
+    "»": "«",
+    "‹": "›",
+    "›": "‹",
+}
+
+RTL_LANG_PREFIXES = ("AR", "FA", "HE", "IW", "UR", "PS", "SD", "UG", "YI", "CKB", "DV")
+
+# A glyph's visual bbox larger than this many times its advance box is
+# considered corrupt (typical offender: color-emoji fonts whose glyph bbox
+# covers the whole font matrix). Such boxes inflate formula and paragraph
+# boxes and end up teleporting content (emoji rendered on top of headings,
+# paragraphs anchored inside banners).
+VISUAL_BBOX_INFLATION_RATIO = 3.0
+
+
+def char_bidi_class(ch: str) -> str:
+    """Simplified bidi class of one character: 'R', 'L' or 'N' (neutral).
+
+    Glyphs without a usable unicode mapping ("(cid:NN)" placeholders) are
+    treated as strong LTR: they come from preserved source content (math
+    italics, symbol fonts) whose internal left-to-right order must never be
+    disturbed.
+    """
+    if not ch:
+        return "N"
+    if "(cid" in ch:
+        return "L"
+    ch = ch[0]
+    if RTL_CHAR_REGEX.match(ch):
+        return "R"
+    if unicodedata.bidirectional(ch) in ("L", "EN", "AN"):
+        return "L"
+    return "N"
+
+
+def is_rtl_lang(lang_code: str) -> bool:
+    code = lang_code.upper().replace("_", "-").split("-")[0]
+    return code in RTL_LANG_PREFIXES
+
+
+@cache
+def _get_arabic_reshaper():
+    try:
+        from arabic_reshaper import ArabicReshaper
+
+        return ArabicReshaper(configuration={"delete_harakat": False})
+    except Exception:
+        logger.warning(
+            "arabic_reshaper is not available; "
+            "Arabic text will be rendered with isolated letter forms.",
+        )
+        return None
+
+
+def reshape_rtl_text(text: str) -> str:
+    """Substitute Arabic letters with their contextual presentation forms.
+
+    The string stays in logical order; only the joining forms (and lam-alef
+    ligatures) are substituted so that every character can still be rendered
+    as an independent glyph by the per-character renderer.
+    """
+    if not text or not RTL_CHAR_REGEX.search(text):
+        return text
+    reshaper = _get_arabic_reshaper()
+    if reshaper is None:
+        return text
+    try:
+        return reshaper.reshape(text)
+    except Exception:
+        logger.exception("Failed to reshape RTL text")
+        return text
 
 
 class TypesettingUnit:
@@ -217,6 +344,75 @@ class TypesettingUnit:
         if LINE_BREAK_REGEX.match(unicode):
             return False
         return True
+
+    @property
+    def bidi_class(self):
+        """Simplified bidi class: 'R' strong RTL, 'L' strong LTR, 'N' neutral.
+
+        Formulas (preserved source content, usually Latin/digits) count as
+        strong LTR when they contain at least one strong/numeric character, so
+        they keep their internal left-to-right order when embedded in an RTL
+        line. A formula made only of neutrals (an arrow, "= ", "(" ...) is
+        itself neutral: it must join the surrounding RTL flow instead of being
+        pinned as a left-to-right island.
+        """
+        if self.formular:
+            classes = [
+                char_bidi_class(c.char_unicode)
+                for c in self.formular.pdf_character
+                if c.char_unicode
+            ]
+            if not classes or any(cls == "L" for cls in classes):
+                # No mapped characters at all: preserved source content,
+                # keep the old strong-LTR behaviour.
+                return "L"
+            if any(cls == "R" for cls in classes):
+                return "R"
+            return "N"
+        s = self.try_get_unicode()
+        if not s:
+            return "N"
+        # Pass the full string: char_bidi_class must see "(cid:NN)"
+        # placeholders whole, not their first character "(".
+        return char_bidi_class(s)
+
+    def horizontal_shift(self, dx: float):
+        """Shift an already relocated unit horizontally, in place."""
+        if abs(dx) < 1e-9:
+            return
+
+        def _shift_box(box):
+            if box is not None:
+                box.x += dx
+                box.x2 += dx
+
+        if self.char:
+            _shift_box(self.char.box)
+            if self.char.visual_bbox:
+                _shift_box(self.char.visual_bbox.box)
+        elif self.formular:
+            _shift_box(self.formular.box)
+            for char in self.formular.pdf_character:
+                _shift_box(char.box)
+                if char.visual_bbox:
+                    _shift_box(char.visual_bbox.box)
+            for curve in self.formular.pdf_curve:
+                _shift_box(curve.box)
+                if curve.relocation_transform and len(curve.relocation_transform) == 6:
+                    curve.relocation_transform[4] += dx
+            for form in self.formular.pdf_form:
+                _shift_box(form.box)
+                if form.relocation_transform and len(form.relocation_transform) == 6:
+                    form.relocation_transform[4] += dx
+        elif self.unicode:
+            if self.x is not None:
+                self.x += dx
+        self.box_cache = None
+
+    def apply_bidi_mirror(self):
+        """Swap mirrorable punctuation when rendered in an RTL visual run."""
+        if self.unicode and self.unicode in BIDI_MIRROR_MAP:
+            self.unicode = BIDI_MIRROR_MAP[self.unicode]
 
     @property
     def is_cjk_char(self):
@@ -843,6 +1039,87 @@ class TypesettingUnit:
             return [], [], []
 
 
+class _RtlBidiElement:
+    """One bidi-resolvable element of a finished RTL line.
+
+    Either a whole TypesettingUnit, or a single character split out of a
+    formula block (so that the formula's edge neutrals can be resolved
+    independently of its strong LTR core).
+    """
+
+    __slots__ = ("unit", "char", "cls", "text")
+
+    def __init__(self, unit, char, cls, text):
+        self.unit = unit
+        self.char = char
+        self.cls = cls
+        self.text = text
+
+    @classmethod
+    def from_unit(cls, unit: TypesettingUnit) -> "_RtlBidiElement":
+        text = unit.try_get_unicode()
+        if text is None and unit.formular:
+            text = "".join(
+                c.char_unicode
+                for c in unit.formular.pdf_character
+                if c.char_unicode
+            )
+        return cls(unit, None, unit.bidi_class, text or "")
+
+    @classmethod
+    def from_formula_char(cls, char) -> "_RtlBidiElement":
+        text = char.char_unicode or ""
+        if not text:
+            # Glyph with no unicode at all: preserved source content, keep it
+            # anchored in the formula's LTR island.
+            return cls(None, char, "L", text)
+        return cls(None, char, char_bidi_class(text), text)
+
+    @property
+    def x(self) -> float:
+        if self.unit is not None:
+            return self.unit.box.x
+        return self.char.box.x
+
+    @property
+    def x2(self) -> float:
+        if self.unit is not None:
+            return self.unit.box.x2
+        return self.char.box.x2
+
+    def shift(self, dx: float) -> None:
+        if abs(dx) < 1e-9:
+            return
+        if self.unit is not None:
+            self.unit.horizontal_shift(dx)
+            return
+        char_box = self.char.box
+        char_box.x += dx
+        char_box.x2 += dx
+        if self.char.visual_bbox and self.char.visual_bbox.box:
+            visual_box = self.char.visual_bbox.box
+            visual_box.x += dx
+            visual_box.x2 += dx
+
+    def apply_bidi_mirror(self) -> None:
+        # Formula characters render by glyph id from the original font, so
+        # their glyphs cannot be swapped here; only unicode units mirror.
+        if self.unit is not None:
+            self.unit.apply_bidi_mirror()
+
+    @property
+    def is_neutral_operator(self) -> bool:
+        return len(self.text) == 1 and self.text in NEUTRAL_OPERATOR_CHARS
+
+    @property
+    def starts_with_digit(self) -> bool:
+        return bool(self.text) and self.text[0].isdigit()
+
+    @property
+    def is_space_like(self) -> bool:
+        return bool(self.text) and self.text.isspace()
+
+
 class Typesetting:
     stage_name = "Typesetting"
 
@@ -861,6 +1138,7 @@ class Typesetting:
             or ("HK" in self.lang_code)
             or ("TW" in self.lang_code)
         )
+        self.is_rtl = is_rtl_lang(self.lang_code)
 
     def preprocess_document(self, document: il_version_1.Document, pbar):
         """预处理文档，获取每个段落的最优缩放因子，不执行实际排版"""
@@ -1116,6 +1394,44 @@ class Typesetting:
         )
 
     def typesetting_document(self, document: il_version_1.Document):
+        # Corrupt (emoji) visual bboxes must be repaired before mirroring or
+        # layout: they inflate formula and paragraph boxes, which corrupts the
+        # mirror translation and the line layout alike.
+        if self.is_rtl:
+            for page in document.page:
+                for paragraph in page.pdf_paragraph:
+                    try:
+                        self._sanitize_paragraph_visual_boxes(page, paragraph)
+                    except Exception:
+                        logger.exception(
+                            "Failed to sanitize visual boxes for paragraph "
+                            f"{getattr(paragraph, 'debug_id', None)}"
+                        )
+        # RTL page mirroring must run before any layout: paragraphs are then
+        # typeset directly into their final (mirrored) boxes, so the per-line
+        # RTL logic never double-mirrors.
+        # OCR-workaround pages are backed by a full-page raster that cannot be
+        # mirrored, so masks and translated text must stay at their original
+        # positions; only in-box RTL alignment applies there.
+        shared_context = getattr(
+            self.translation_config, "shared_context_cross_split_part", None
+        )
+        auto_ocr = getattr(
+            self.translation_config,
+            "auto_enabled_ocr_workaround",
+            getattr(shared_context, "auto_enabled_ocr_workaround", False),
+        )
+        if self.is_rtl and not (
+            getattr(self.translation_config, "ocr_workaround", False) or auto_ocr
+        ):
+            for page in document.page:
+                try:
+                    self._mirror_page_layout(page)
+                except Exception:
+                    logger.exception(
+                        f"Failed to mirror RTL page layout for page "
+                        f"{page.page_number}"
+                    )
         # 原有的排版逻辑
         if self.translation_config.progress_monitor:
             with self.translation_config.progress_monitor.stage_start(
@@ -1133,6 +1449,482 @@ class Typesetting:
             for page in document.page:
                 self.translation_config.raise_if_cancelled()
                 self.render_page(page)
+
+    # ------------------------------------------------------------------
+    # Visual-bbox sanitization (corrupt emoji glyph boxes)
+    # ------------------------------------------------------------------
+    def _sanitize_paragraph_visual_boxes(
+        self, page: il_version_1.Page, paragraph: il_version_1.PdfParagraph
+    ) -> None:
+        """Repair paragraphs whose boxes were inflated by corrupt glyph boxes.
+
+        Color-emoji glyphs report visual bboxes covering the whole font
+        matrix (10x the advance box). Those propagate into formula boxes and
+        the paragraph box, so the paragraph anchors far away from its real
+        text line (legend lines rendered inside the banner above, emoji
+        mirrored onto headings). Clamp such visual bboxes to the advance box,
+        recompute the affected formula boxes, and pull the paragraph box back
+        to its surviving content.
+        """
+        changed = False
+        content_boxes: list[Box] = []
+        inflated_pre_x2 = None
+
+        def collect(chars) -> None:
+            for char in chars:
+                if self._box_is_valid(char.box):
+                    content_boxes.append(char.box)
+
+        for composition in paragraph.pdf_paragraph_composition or []:
+            if composition is None:
+                continue
+            if composition.pdf_formula:
+                formula = composition.pdf_formula
+                formula_changed = False
+                for char in formula.pdf_character:
+                    box = char.box
+                    visual = char.visual_bbox.box if char.visual_bbox else None
+                    if not (self._box_is_valid(box) and self._box_is_valid(visual)):
+                        continue
+                    char_w = box.x2 - box.x
+                    char_h = box.y2 - box.y
+                    if char_w <= 0 or char_h <= 0:
+                        continue
+                    if (
+                        visual.x2 - visual.x
+                        > VISUAL_BBOX_INFLATION_RATIO * char_w + 2
+                        or visual.y2 - visual.y
+                        > VISUAL_BBOX_INFLATION_RATIO * char_h + 2
+                    ):
+                        if inflated_pre_x2 is None or visual.x2 > inflated_pre_x2:
+                            inflated_pre_x2 = visual.x2
+                        char.visual_bbox.box = copy.deepcopy(box)
+                        formula_changed = True
+                if formula_changed and formula.pdf_character:
+                    update_formula_data(formula)
+                    changed = True
+                    # Unrelated page graphics (chip/pill backgrounds) can get
+                    # absorbed into the formula through the corrupt visual
+                    # bbox. Members that do not even touch the repaired
+                    # formula box belong to the page: return them so they are
+                    # mirrored/rendered like their untouched siblings.
+                    self._evict_foreign_formula_members(page, formula)
+                collect(formula.pdf_character)
+            elif composition.pdf_line:
+                collect(composition.pdf_line.pdf_character)
+            elif composition.pdf_same_style_characters:
+                collect(composition.pdf_same_style_characters.pdf_character)
+            elif composition.pdf_character:
+                collect([composition.pdf_character])
+
+        if not changed or not content_boxes:
+            return
+        box = paragraph.box
+        if not self._box_is_valid(box):
+            return
+        union_x = min(b.x for b in content_boxes)
+        union_y = min(b.y for b in content_boxes)
+        union_x2 = max(b.x2 for b in content_boxes)
+        union_y2 = max(b.y2 for b in content_boxes)
+
+        font_sizes = [
+            comp.pdf_same_style_unicode_characters.pdf_style.font_size
+            for comp in paragraph.pdf_paragraph_composition or []
+            if comp is not None
+            and comp.pdf_same_style_unicode_characters is not None
+            and comp.pdf_same_style_unicode_characters.pdf_style is not None
+            and comp.pdf_same_style_unicode_characters.pdf_style.font_size
+        ]
+        if paragraph.pdf_style is not None and paragraph.pdf_style.font_size:
+            font_sizes.append(paragraph.pdf_style.font_size)
+        line_height = max([*font_sizes, union_y2 - union_y, 1.0])
+
+        if box.y > union_y2 or box.y2 < union_y:
+            # The whole stored box is displaced away from its real content
+            # (single-formula emoji paragraphs): trust the content.
+            box.x, box.y = union_x - 0.5, union_y - 0.5
+            box.x2, box.y2 = union_x2 + 0.5, union_y2 + 0.5
+            return
+        if box.y2 - union_y2 > 2.5 * line_height:
+            box.y2 = union_y2 + 0.2 * line_height
+        if union_y - box.y > 2.5 * line_height:
+            box.y = union_y - 0.2 * line_height
+        # Only reclaim the right edge when it was set by an inflated visual
+        # box; translated text (which carries no boxes) may legitimately
+        # extend past the surviving content on either side.
+        if (
+            inflated_pre_x2 is not None
+            and inflated_pre_x2 >= box.x2 - 1
+            and box.x2 - union_x2 > 2.5 * line_height
+        ):
+            box.x2 = union_x2 + 0.2 * line_height
+
+    def _evict_foreign_formula_members(
+        self, page: il_version_1.Page, formula: PdfFormula
+    ) -> None:
+        """Move formula curves/forms that don't touch the formula box back to
+        the page level."""
+        fbox = formula.box
+        if not self._box_is_valid(fbox):
+            return
+
+        def is_foreign(box) -> bool:
+            if not self._box_is_valid(box):
+                return False
+            return (
+                box.x2 < fbox.x - 1
+                or box.x > fbox.x2 + 1
+                or box.y2 < fbox.y - 1
+                or box.y > fbox.y2 + 1
+            )
+
+        kept_curves = []
+        for curve in formula.pdf_curve:
+            if is_foreign(curve.box):
+                page.pdf_curve.append(curve)
+            else:
+                kept_curves.append(curve)
+        formula.pdf_curve = kept_curves
+
+        kept_forms = []
+        for form in formula.pdf_form:
+            if is_foreign(form.box):
+                page.pdf_form.append(form)
+            else:
+                kept_forms.append(form)
+        formula.pdf_form = kept_forms
+
+    # ------------------------------------------------------------------
+    # RTL page mirroring
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _box_is_valid(box) -> bool:
+        return box is not None and None not in (box.x, box.y, box.x2, box.y2)
+
+    @staticmethod
+    def _shift_box_x(box, dx: float) -> None:
+        box.x += dx
+        box.x2 += dx
+
+    @staticmethod
+    def _shift_char_x(char, dx: float) -> None:
+        if char.box is not None and char.box.x is not None:
+            char.box.x += dx
+            char.box.x2 += dx
+        if (
+            char.visual_bbox
+            and char.visual_bbox.box
+            and char.visual_bbox.box.x is not None
+        ):
+            char.visual_bbox.box.x += dx
+            char.visual_bbox.box.x2 += dx
+
+    @staticmethod
+    def _compose_device_translation(obj, dx: float) -> None:
+        """Add a device-space horizontal translation to a curve/form.
+
+        The relocation transform is emitted first in the content stream, so it
+        is the outermost matrix: composing a translation reduces to adding dx
+        to its e-component. Content is only translated, never flipped.
+        """
+        transform = getattr(obj, "relocation_transform", None)
+        if transform is not None and len(transform) == 6:
+            transform[4] = float(transform[4]) + dx
+        else:
+            obj.relocation_transform = [1.0, 0.0, 0.0, 1.0, dx, 0.0]
+
+    @staticmethod
+    def _paragraph_will_retypeset(paragraph: il_version_1.PdfParagraph) -> bool:
+        """Mirror of render_paragraph's passthrough decision.
+
+        A paragraph is retypeset when it contains at least one translated
+        unicode composition (those cannot pass through). Retypeset paragraphs
+        only need their box mirrored; passthrough paragraphs render at their
+        stored character positions and need their content shifted too.
+        """
+        for composition in paragraph.pdf_paragraph_composition or []:
+            unicode_comp = composition.pdf_same_style_unicode_characters
+            if (
+                unicode_comp is not None
+                and unicode_comp.unicode
+                and unicode_comp.pdf_style is not None
+                and unicode_comp.pdf_style.font_id is not None
+            ):
+                return True
+        return False
+
+    def _shift_paragraph_content(
+        self, paragraph: il_version_1.PdfParagraph, dx: float
+    ) -> None:
+        for composition in paragraph.pdf_paragraph_composition or []:
+            if composition is None:
+                continue
+            if composition.pdf_line:
+                line = composition.pdf_line
+                if self._box_is_valid(line.box):
+                    self._shift_box_x(line.box, dx)
+                for char in line.pdf_character:
+                    self._shift_char_x(char, dx)
+            elif composition.pdf_character:
+                self._shift_char_x(composition.pdf_character, dx)
+            elif composition.pdf_same_style_characters:
+                same_style = composition.pdf_same_style_characters
+                if self._box_is_valid(getattr(same_style, "box", None)):
+                    self._shift_box_x(same_style.box, dx)
+                for char in same_style.pdf_character:
+                    self._shift_char_x(char, dx)
+            elif composition.pdf_formula:
+                formula = composition.pdf_formula
+                if self._box_is_valid(formula.box):
+                    self._shift_box_x(formula.box, dx)
+                for char in formula.pdf_character:
+                    self._shift_char_x(char, dx)
+                for curve in formula.pdf_curve:
+                    if self._box_is_valid(curve.box):
+                        self._shift_box_x(curve.box, dx)
+                    self._compose_device_translation(curve, dx)
+                for form in formula.pdf_form:
+                    if self._box_is_valid(form.box):
+                        self._shift_box_x(form.box, dx)
+                    self._compose_device_translation(form, dx)
+
+    def _mirror_loose_characters(
+        self, page, pivot: float, in_scope
+    ) -> list[tuple[tuple[float, float, float, float], float]]:
+        """Mirror characters that never joined a paragraph.
+
+        Characters are clustered into visual runs (same line, small gaps) and
+        each run is translated rigidly, so multi-character labels keep their
+        internal order instead of being scrambled per glyph.
+
+        Returns the clusters as ``(bbox, dx)`` anchors so that page-level
+        curves/forms living inside a cluster (fraction bars, radical rules of
+        a preserved equation) can follow the same rigid translation.
+        """
+        loose = [
+            char
+            for char in page.pdf_character
+            if in_scope(char.xobj_id) and self._box_is_valid(char.box)
+        ]
+        if not loose:
+            return []
+        # Union-find over generously expanded boxes: sub/superscripts,
+        # fraction parts and operator spacing of a formula must all land in
+        # ONE cluster, otherwise the mirror scrambles the formula.
+        loose.sort(key=lambda c: c.box.y)
+        count = len(loose)
+        parent = list(range(count))
+
+        def find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        boxes = [(c.box.x, c.box.y, c.box.x2, c.box.y2) for c in loose]
+        for i in range(count):
+            x1, y1, x2, y2 = boxes[i]
+            height_i = y2 - y1
+            for j in range(i + 1, count):
+                a1, b1, a2, b2 = boxes[j]
+                if b1 - y2 > 40:
+                    break  # sorted by y: nothing below can connect anymore
+                height = max(height_i, b2 - b1, 5.0)
+                x_gap = max(a1 - x2, x1 - a2)
+                y_gap = max(b1 - y2, y1 - b2)
+                if x_gap < 1.5 * height and y_gap < 0.5 * height:
+                    root_i, root_j = find(i), find(j)
+                    if root_i != root_j:
+                        parent[root_j] = root_i
+        clusters_by_root: dict[int, list] = {}
+        for i, char in enumerate(loose):
+            clusters_by_root.setdefault(find(i), []).append(char)
+        anchors: list[tuple[tuple[float, float, float, float], float]] = []
+        for cluster in clusters_by_root.values():
+            left = min(c.box.x for c in cluster)
+            right = max(c.box.x2 for c in cluster)
+            bottom = min(c.box.y for c in cluster)
+            top = max(c.box.y2 for c in cluster)
+            dx = pivot - left - right
+            anchors.append(((left, bottom, right, top), dx))
+            if abs(dx) < 1e-6:
+                continue
+            for char in cluster:
+                self._shift_char_x(char, dx)
+        return anchors
+
+    def _mirror_page_layout(self, page: il_version_1.Page) -> None:
+        """Mirror the page skeleton around its vertical midline for RTL.
+
+        Every page-space layout element's bounding box is mirrored
+        (new_x = page_right + page_left - old_x2) by translating the element
+        rigidly — content is never flipped: images keep their pixels, formulas
+        keep their glyph order, vector paths are translated via their
+        relocation transform. Elements living inside form XObjects use the
+        XObject's own coordinate space and are left untouched.
+        """
+        ref_box = None
+        if page.cropbox is not None and self._box_is_valid(page.cropbox.box):
+            ref_box = page.cropbox.box
+        elif page.mediabox is not None and self._box_is_valid(page.mediabox.box):
+            ref_box = page.mediabox.box
+        if ref_box is None:
+            return
+        pivot = ref_box.x + ref_box.x2
+        xobj_ids = {
+            xobj.xobj_id for xobj in page.pdf_xobject if xobj.xobj_id is not None
+        }
+
+        # Form XObjects placed at page level via a single pure-translation
+        # matrix (typically a full-page "EmbeddedPdfPage" wrapper) act as an
+        # alternate page coordinate space: mirror their CONTENT around the
+        # equivalent local pivot and leave their Do-form untouched. Any other
+        # XObject placement is opaque: the Do-form is translated to the
+        # mirrored position and the content (images included) is never
+        # touched, so nothing is ever flipped.
+        xref_to_xobj = {
+            xobj.xref_id: xobj for xobj in page.pdf_xobject if xobj.xref_id
+        }
+        placements: dict[int, list] = {}
+        for form in page.pdf_form:
+            if form.xobj_id in xobj_ids:
+                continue  # nested placement: moves with its parent scope
+            subtype = form.pdf_form_subtype
+            xobj_form = subtype.pdf_xobj_form if subtype is not None else None
+            if xobj_form is not None and xobj_form.xref_id in xref_to_xobj:
+                placements.setdefault(xobj_form.xref_id, []).append(form)
+
+        scope_pivots: dict[int | None, float] = {None: pivot}
+        wrapper_form_ids: set[int] = set()
+        for xref_id, forms in placements.items():
+            offsets = []
+            pure_translation = True
+            for form in forms:
+                matrix = form.pdf_matrix
+                if (
+                    matrix is None
+                    or abs((matrix.a or 0.0) - 1.0) > 1e-3
+                    or abs((matrix.d or 0.0) - 1.0) > 1e-3
+                    or abs(matrix.b or 0.0) > 1e-3
+                    or abs(matrix.c or 0.0) > 1e-3
+                ):
+                    pure_translation = False
+                    break
+                offsets.append(matrix.e or 0.0)
+            if (
+                pure_translation
+                and offsets
+                and max(offsets) - min(offsets) < 1e-3
+            ):
+                xobj = xref_to_xobj[xref_id]
+                scope_pivots[xobj.xobj_id] = pivot - 2.0 * offsets[0]
+                wrapper_form_ids.update(id(form) for form in forms)
+
+        unmirrored_xobjs = xobj_ids - set(scope_pivots)
+        if unmirrored_xobjs:
+            logger.info(
+                f"RTL mirror: leaving XObject scopes {sorted(unmirrored_xobjs)} "
+                f"as opaque blocks on page {page.page_number}"
+            )
+
+        for scope_id, scope_pivot in scope_pivots.items():
+            if scope_id is None:
+                def in_scope(xid, _ids=xobj_ids):
+                    return xid not in _ids
+            else:
+                def in_scope(xid, _sid=scope_id):
+                    return xid == _sid
+            self._mirror_scope(
+                page, scope_pivot, in_scope, wrapper_form_ids
+            )
+
+    @staticmethod
+    def _find_anchor_dx(anchors, box) -> float | None:
+        """dx of the smallest paragraph box containing `box`, if any."""
+        best = None
+        best_area = None
+        for (ax, ay, ax2, ay2), dx in anchors:
+            if (
+                ax - 1.0 <= box.x
+                and ax2 + 1.0 >= box.x2
+                and ay - 1.0 <= box.y
+                and ay2 + 1.0 >= box.y2
+            ):
+                area = (ax2 - ax) * (ay2 - ay)
+                if best_area is None or area < best_area:
+                    best_area = area
+                    best = dx
+        return best
+
+    def _mirror_scope(
+        self,
+        page: il_version_1.Page,
+        pivot: float,
+        in_scope,
+        wrapper_form_ids: set[int],
+    ) -> None:
+        # A page-level curve/form fully inside a paragraph box is part of that
+        # paragraph's content (fraction bars, inline rules): it must follow
+        # the paragraph's translation instead of being mirrored around its own
+        # center, or it detaches from the glyphs it belongs to.
+        paragraph_anchors: list[tuple[tuple[float, float, float, float], float]] = []
+        for paragraph in page.pdf_paragraph:
+            if not in_scope(paragraph.xobj_id):
+                continue
+            if not self._box_is_valid(paragraph.box):
+                continue
+            box = paragraph.box
+            dx = pivot - box.x - box.x2
+            paragraph_anchors.append(((box.x, box.y, box.x2, box.y2), dx))
+            if abs(dx) < 1e-6:
+                continue
+            self._shift_box_x(paragraph.box, dx)
+            if not self._paragraph_will_retypeset(paragraph):
+                self._shift_paragraph_content(paragraph, dx)
+
+        cluster_anchors = self._mirror_loose_characters(page, pivot, in_scope)
+        # Paragraph boxes are the more precise anchors; cluster bboxes only
+        # apply when no paragraph contains the element (smallest wins).
+        paragraph_anchors.extend(cluster_anchors)
+
+        for curve in page.pdf_curve:
+            if not in_scope(curve.xobj_id) or not self._box_is_valid(curve.box):
+                continue
+            dx = self._find_anchor_dx(paragraph_anchors, curve.box)
+            if dx is None:
+                dx = pivot - curve.box.x - curve.box.x2
+            if abs(dx) < 1e-6:
+                continue
+            self._shift_box_x(curve.box, dx)
+            self._compose_device_translation(curve, dx)
+
+        for form in page.pdf_form:
+            if id(form) in wrapper_form_ids:
+                continue
+            if not in_scope(form.xobj_id) or not self._box_is_valid(form.box):
+                continue
+            dx = self._find_anchor_dx(paragraph_anchors, form.box)
+            if dx is None:
+                dx = pivot - form.box.x - form.box.x2
+            if abs(dx) < 1e-6:
+                continue
+            self._shift_box_x(form.box, dx)
+            self._compose_device_translation(form, dx)
+
+        for rect in page.pdf_rectangle:
+            if not in_scope(rect.xobj_id) or not self._box_is_valid(rect.box):
+                continue
+            dx = pivot - rect.box.x - rect.box.x2
+            if abs(dx) >= 1e-6:
+                self._shift_box_x(rect.box, dx)
+
+        for figure in page.pdf_figure:
+            if not in_scope(getattr(figure, "xobj_id", None)):
+                continue
+            if self._box_is_valid(figure.box):
+                dx = pivot - figure.box.x - figure.box.x2
+                if abs(dx) >= 1e-6:
+                    self._shift_box_x(figure.box, dx)
 
     def render_page(self, page: il_version_1.Page):
         fonts: dict[
@@ -1358,6 +2150,12 @@ class Typesetting:
         all_units_fit = True
         last_unit: TypesettingUnit | None = None
         line_ys = [current_y]
+        # RTL: lines are filled left-to-right in logical order, then each
+        # finished line is mirrored into visual (right-to-left) order.
+        rtl_layout = self.is_rtl and any(
+            unit.bidi_class == "R" for unit in typesetting_units
+        )
+        line_start_index = 0
         if paragraph.first_line_indent:
             current_x += space_width * 4
         # 遍历所有排版单元
@@ -1407,8 +2205,13 @@ class Typesetting:
             if not unit.is_hung_punctuation and (
                 (current_x + unit_width > box.x2)
                 or (
+                    # width_before_next_break_point already includes the
+                    # current unit's width, so it must not be added again:
+                    # double counting made words wrap mid-word whenever the
+                    # remainder of the word only just fit on the line.
                     use_english_line_break
-                    and current_x + unit_width + width_before_next_break_point > box.x2
+                    and width_before_next_break_point > 0
+                    and current_x + width_before_next_break_point > box.x2
                 )
                 or (
                     unit.is_cannot_appear_in_line_end_punctuation
@@ -1416,6 +2219,9 @@ class Typesetting:
                 )
             ):
                 # 换行
+                if rtl_layout:
+                    self._finalize_rtl_line(typeset_units, line_start_index, box)
+                line_start_index = len(typeset_units)
                 current_x = box.x
                 if not current_line_heights:
                     return [], False
@@ -1463,7 +2269,145 @@ class Typesetting:
 
             last_unit = relocated_unit
 
+        if rtl_layout:
+            self._finalize_rtl_line(typeset_units, line_start_index, box)
+
         return typeset_units, all_units_fit
+
+    def _finalize_rtl_line(
+        self,
+        typeset_units: list[TypesettingUnit],
+        line_start_index: int,
+        box: Box,
+    ) -> None:
+        """Mirror one finished line into right-to-left visual order.
+
+        The line was filled left-to-right in logical order. Mirroring every
+        unit around the paragraph box converts it to RTL visual order and
+        right-aligns it against the box. Embedded LTR runs (Latin letters,
+        digits, formulas) are then reversed back so they keep their internal
+        left-to-right order, and mirrorable punctuation participating in the
+        RTL flow is swapped (e.g. "(" renders as ")").
+        """
+        line_units = typeset_units[line_start_index:]
+        if not line_units:
+            return
+        pivot = box.x + box.x2
+
+        # Build bidi elements. Most units map 1:1, but a formula without
+        # curves/forms is split into per-character elements: styled runs such
+        # as "80-20) →", "x =" or "> 10" arrive as single formula blocks, and
+        # only per-character resolution lets their edge neutrals join the
+        # surrounding RTL flow while the strong LTR core (digits/latin) keeps
+        # its internal order.
+        #
+        # The line mirror MUST be applied at the same (element) granularity as
+        # the later LTR-run restore: mirror then restore cancel into a rigid
+        # translation for LTR runs, which is only true when both act on the
+        # same pieces. (Mirroring whole formula blocks rigidly and then
+        # restoring per character would reverse formula-internal layout.)
+        elements = self._build_rtl_line_elements(line_units)
+        for element in elements:
+            element.shift(pivot - element.x - element.x2)
+
+        classes = [element.cls for element in elements]
+        resolved = self._resolve_rtl_neutrals(elements, classes)
+
+        count = len(elements)
+        index_ = 0
+        while index_ < count:
+            if resolved[index_] != "L":
+                elements[index_].apply_bidi_mirror()
+                index_ += 1
+                continue
+            run_end = index_
+            while run_end < count and resolved[run_end] == "L":
+                run_end += 1
+            run = elements[index_:run_end]
+            run_left = min(element.x for element in run)
+            run_right = max(element.x2 for element in run)
+            for element in run:
+                element.shift(run_left + run_right - element.x - element.x2)
+            index_ = run_end
+
+        # Formula boxes may be stale after per-character shifts; refresh them
+        # so debug rendering / later consumers see the true extent.
+        for unit in line_units:
+            if unit.formular and unit.formular.pdf_character:
+                update_formula_data(unit.formular)
+            unit.box_cache = None
+
+    def _build_rtl_line_elements(
+        self,
+        line_units: list[TypesettingUnit],
+    ) -> list["_RtlBidiElement"]:
+        elements: list[_RtlBidiElement] = []
+        for unit in line_units:
+            formular = unit.formular
+            splittable = (
+                formular is not None
+                and formular.pdf_character
+                and not formular.pdf_curve
+                and not formular.pdf_form
+            )
+            if not splittable:
+                elements.append(_RtlBidiElement.from_unit(unit))
+                continue
+            for char in formular.pdf_character:
+                elements.append(_RtlBidiElement.from_formula_char(char))
+        return elements
+
+    def _resolve_rtl_neutrals(
+        self,
+        elements: list["_RtlBidiElement"],
+        classes: list[str],
+    ) -> list[str]:
+        """Resolve neutral elements against their strong neighbours.
+
+        Rules (simplified UAX#9, paragraph direction RTL):
+        - a neutral between two strong runs of the same direction takes that
+          direction;
+        - a neutral operator (=, >, <, +, -, ...) directly preceding a digit
+          run stays with it, so math snippets like "> 10" read left-to-right
+          as one cluster;
+        - any other neutral (RTL/LTR boundaries, line edges) takes the
+          paragraph direction (RTL).
+        """
+        count = len(classes)
+        resolved = list(classes)
+        for i, cls in enumerate(classes):
+            if cls != "N":
+                continue
+            if resolved[i] != "N":
+                # Already claimed by an operator+digit cluster.
+                continue
+            prev_strong = next(
+                (classes[j] for j in range(i - 1, -1, -1) if classes[j] != "N"),
+                "R",
+            )
+            next_index = next(
+                (j for j in range(i + 1, count) if classes[j] != "N"),
+                None,
+            )
+            next_strong = classes[next_index] if next_index is not None else "R"
+            if prev_strong == next_strong:
+                resolved[i] = prev_strong
+                continue
+            if (
+                next_strong == "L"
+                and next_index is not None
+                and elements[i].is_neutral_operator
+                and elements[next_index].starts_with_digit
+                and all(
+                    elements[j].is_space_like for j in range(i + 1, next_index)
+                )
+            ):
+                # Operator + digit cluster: "> 10", "= 5", "±3" ...
+                for j in range(i, next_index):
+                    resolved[j] = "L"
+                continue
+            resolved[i] = "R"
+        return resolved
 
     def create_typesetting_units(
         self,
@@ -1524,7 +2468,18 @@ class Typesetting:
                     )
                     continue
                 font = get_font(font_id, paragraph.xobj_id)
-                if composition.pdf_same_style_unicode_characters.unicode:
+                unicode_text = composition.pdf_same_style_unicode_characters.unicode
+                if unicode_text and self.is_rtl:
+                    # Bidi control characters would render as visible-width
+                    # glyphs (spurious gaps) and our explicit bidi algorithm
+                    # ignores them anyway; drop them and collapse the space
+                    # runs they leave behind.
+                    unicode_text = BIDI_CONTROL_REGEX.sub("", unicode_text)
+                    unicode_text = MULTI_SPACE_REGEX.sub(" ", unicode_text)
+                    # Substitute Arabic contextual (presentation) forms so the
+                    # per-character renderer produces joined glyphs.
+                    unicode_text = reshape_rtl_text(unicode_text)
+                if unicode_text:
                     result.extend(
                         [
                             TypesettingUnit(
@@ -1540,7 +2495,7 @@ class Typesetting:
                                 debug_info=composition.pdf_same_style_unicode_characters.debug_info
                                 or False,
                             )
-                            for char_unicode in composition.pdf_same_style_unicode_characters.unicode
+                            for char_unicode in unicode_text
                             if char_unicode not in ("\n",)
                         ],
                     )
@@ -1623,7 +2578,31 @@ class Typesetting:
             ):
                 max_x = min(max_x, figure.box.x)
 
+        # A paragraph drawn inside a vector shape (chip/pill/card background)
+        # must not expand across the shape's border: its text would cross the
+        # visible outline and collide with neighbouring shapes.
+        for elem_box in self._containing_graphic_boxes(current_box, page):
+            max_x = min(max_x, elem_box.x2 - 1)
+
         return max_x
+
+    def _containing_graphic_boxes(self, current_box: Box, page: il_version_1.Page):
+        """Yield boxes of page-level curves/forms that contain current_box."""
+        for elems in (page.pdf_curve, page.pdf_form):
+            for elem in elems:
+                box = elem.box
+                if not self._box_is_valid(box):
+                    continue
+                if (
+                    box.x - 1 <= current_box.x
+                    and box.x2 + 1 >= current_box.x2
+                    and box.y - 1 <= current_box.y
+                    and box.y2 + 1 >= current_box.y2
+                    and (box.x2 - box.x) * (box.y2 - box.y)
+                    > (current_box.x2 - current_box.x)
+                    * (current_box.y2 - current_box.y)
+                ):
+                    yield box
 
     def get_max_bottom_space(self, current_box: Box, page: il_version_1.Page) -> float:
         """获取段落下方最大可用空间
@@ -1658,6 +2637,11 @@ class Typesetting:
                 figure.box.x >= current_box.x2 or figure.box.x2 <= current_box.x
             ):
                 min_y = max(min_y, figure.box.y2)
+
+        # Stay inside any vector shape that visually contains this paragraph
+        # (see get_max_right_space).
+        for elem_box in self._containing_graphic_boxes(current_box, page):
+            min_y = max(min_y, elem_box.y + 1)
 
         return min_y
 

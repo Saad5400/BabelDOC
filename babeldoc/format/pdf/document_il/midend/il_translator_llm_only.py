@@ -14,6 +14,11 @@ from babeldoc.format.pdf.document_il import PdfFont
 from babeldoc.format.pdf.document_il import PdfParagraph
 from babeldoc.format.pdf.document_il.midend import il_translator
 from babeldoc.format.pdf.document_il.midend.il_translator import (
+    ARABIC_STYLE_ADDENDUM,
+    CJK_CHARS_RE,
+    _is_arabic_lang,
+)
+from babeldoc.format.pdf.document_il.midend.il_translator import (
     DocumentTranslateTracker,
 )
 from babeldoc.format.pdf.document_il.midend.il_translator import ILTranslator
@@ -67,6 +72,7 @@ For each item:
 ## Style
 - Produce fluent, professional $lang_out.
 - Preserve punctuation unless needed for target language fluency.
+$style_addendum_block
 
 ### Example
 Input:
@@ -81,7 +87,7 @@ Output:
 [
     {
     "id": 0,
-    "output": "{v1}<style id='2'>你好</style>，世界！"
+    "output": "{v1}<style id='2'>$example_hello</style>$example_world"
     }
 ]
 
@@ -753,6 +759,15 @@ class ILTranslatorLLMOnly:
                     # Clean up any excessive punctuation in the translated text
                     translated_text = re.sub(r"[. 。…，]{20,}", ".", output)
 
+                    if _is_arabic_lang(
+                        self.translation_config.lang_out
+                    ) and CJK_CHARS_RE.search(translated_text):
+                        logger.warning(
+                            "CJK characters leaked into Arabic translation, "
+                            "falling back to simple translation."
+                        )
+                        continue
+
                     # Get the original input for this translation
                     translate_input = inputs[id_][1]
                     llm_translate_tracker = inputs[id_][4]
@@ -973,6 +988,14 @@ class ILTranslatorLLMOnly:
                 glossary_table_lines.append("")
             glossary_tables_block = "\n".join(glossary_table_lines)
 
+        style_addendum_block = ""
+        example_hello = "你好"
+        example_world = "，世界！"
+        if _is_arabic_lang(self.translation_config.lang_out):
+            style_addendum_block = ARABIC_STYLE_ADDENDUM
+            example_hello = "مرحبا"
+            example_world = "، أيها العالم!"
+
         return PROMPT_TEMPLATE.substitute(
             role_block=role_block,
             glossary_usage_rules_block=glossary_usage_rules_block,
@@ -980,6 +1003,9 @@ class ILTranslatorLLMOnly:
             json_input_str=json_input_str,
             glossary_tables_block=glossary_tables_block,
             lang_out=self.translation_config.lang_out,
+            style_addendum_block=style_addendum_block,
+            example_hello=example_hello,
+            example_world=example_world,
         )
 
     def _clean_json_output(self, llm_output: str) -> str:

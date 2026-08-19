@@ -42,6 +42,10 @@ logger = logging.getLogger(__name__)
 # Base58 alphabet (Bitcoin style, without numbers 0, O, I, l)
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
+# Matches a numbered list item prefix at the start of a line, e.g. "1. ", "12) ".
+# The negative lookahead avoids matching decimals like "3.14".
+NUMBERED_ITEM_PATTERN = re.compile(r"\s*(\d{1,2})[.)](?!\d)")
+
 
 def generate_base58_id(length: int = 5) -> str:
     """Generate a random base58 ID of specified length."""
@@ -274,6 +278,10 @@ class ParagraphFinder:
                 current_formula_font_ids = page_level_formula_font_ids
             self._split_paragraph_into_lines(paragraph, current_formula_font_ids)
 
+        # 第 2.5 步：合并同一视觉行上被布局框切开的段落碎片
+        # （例如加粗的 "AI3" 与 "011 — ..."，或 "The" / 标题主体 / ")"）
+        self.merge_same_line_fragment_paragraphs(paragraphs)
+
         # 第三步：处理段落中的空格
         for paragraph in paragraphs:
             add_space_dummy_chars(paragraph)
@@ -285,6 +293,11 @@ class ParagraphFinder:
 
         # 第五步：处理独立段落
         self.process_independent_paragraphs(paragraphs, median_width)
+
+        # 第 5.5 步：按列表项拆分段落
+        # 项目符号经常是矢量曲线（小圆点），不在文本流中；
+        # 编号列表（"1."、"2."…）也不会被布局模型分开。
+        self.split_list_item_paragraphs(page, paragraphs)
 
         # 新增后处理：合并带行号交替的正文段落（a 正文、b 行号、c 正文 -> 合并 a 与 c，保留 b）
         if getattr(self.translation_config, "merge_alternating_line_numbers", True):
@@ -416,6 +429,218 @@ class ParagraphFinder:
                     # 不移动 i，继续尝试把更多正文接到 a，实现 a l+ a l+ a ... 链式合并
                     continue
             i += 1
+
+    # ------------------------------------------------------------------
+    # Same-line fragment merging (fixes stranded styled prefixes such as
+    # a bold "AI3" split from "011 — ..." by overlapping layout boxes).
+    # ------------------------------------------------------------------
+
+    def merge_same_line_fragment_paragraphs(self, paragraphs: list[PdfParagraph]):
+        """Merge consecutive paragraphs that are fragments of one visual line.
+
+        Overlapping layout detections often split a heading into several
+        paragraphs on the same visual line (e.g. a bold first token). The
+        fragments end up as separate paragraphs which are translated (or not)
+        independently and typeset in place, leaving the prefix stranded.
+        Merging them lets the whole heading translate and move as one unit.
+        """
+        if len(paragraphs) < 2:
+            return
+        i = 0
+        while i < len(paragraphs) - 1:
+            a = paragraphs[i]
+            b = paragraphs[i + 1]
+            if self._should_merge_line_fragments(a, b):
+                self._merge_fragment_paragraph(a, b)
+                del paragraphs[i + 1]
+                # stay on i: allows chains like "The" + <title body> + ")"
+            else:
+                i += 1
+
+    @staticmethod
+    def _paragraph_lines(paragraph: PdfParagraph) -> list[PdfLine]:
+        return [
+            comp.pdf_line
+            for comp in paragraph.pdf_paragraph_composition
+            if comp.pdf_line
+        ]
+
+    def _should_merge_line_fragments(
+        self, a: PdfParagraph, b: PdfParagraph
+    ) -> bool:
+        if not a.pdf_paragraph_composition or not b.pdf_paragraph_composition:
+            return False
+        if a.xobj_id != b.xobj_id:
+            return False
+        a_lines = self._paragraph_lines(a)
+        b_lines = self._paragraph_lines(b)
+        if not a_lines or not b_lines:
+            return False
+        # Only merge when at least one side is a single-line fragment;
+        # two multi-line paragraphs are never a split heading.
+        if len(a_lines) > 1 and len(b_lines) > 1:
+            return False
+        last_a = a_lines[-1]
+        first_b = b_lines[0]
+        if last_a.box is None or first_b.box is None:
+            return False
+        # Must be on the same visual line: strong y-overlap.
+        inter = min(last_a.box.y2, first_b.box.y2) - max(
+            last_a.box.y, first_b.box.y
+        )
+        min_height = min(
+            last_a.box.y2 - last_a.box.y, first_b.box.y2 - first_b.box.y
+        )
+        if min_height <= 0 or inter / min_height < 0.5:
+            return False
+        # Must be horizontally adjacent (a lost inter-word space at most).
+        line_height = max(
+            last_a.box.y2 - last_a.box.y, first_b.box.y2 - first_b.box.y
+        )
+        gap = first_b.box.x - last_a.box.x2
+        return -2.0 <= gap <= max(2.0, line_height * 0.6)
+
+    def _merge_fragment_paragraph(self, a: PdfParagraph, b: PdfParagraph):
+        """Merge paragraph b into a; b's first line joins a's last line."""
+        a_line_indices = [
+            idx
+            for idx, comp in enumerate(a.pdf_paragraph_composition)
+            if comp.pdf_line
+        ]
+        b_line_indices = [
+            idx
+            for idx, comp in enumerate(b.pdf_paragraph_composition)
+            if comp.pdf_line
+        ]
+        a_last_line = a.pdf_paragraph_composition[a_line_indices[-1]].pdf_line
+        b_first_idx = b_line_indices[0]
+        b_first_line = b.pdf_paragraph_composition[b_first_idx].pdf_line
+
+        a_last_line.pdf_character.extend(b_first_line.pdf_character)
+        self.update_line_data(a_last_line)
+
+        for idx, comp in enumerate(b.pdf_paragraph_composition):
+            if idx == b_first_idx:
+                continue
+            a.pdf_paragraph_composition.append(comp)
+
+        # Keep the layout of the wider fragment (usually the real heading).
+        if (
+            a.box is not None
+            and b.box is not None
+            and (b.box.x2 - b.box.x) > (a.box.x2 - a.box.x)
+        ):
+            a.layout_id = b.layout_id
+            a.layout_label = b.layout_label
+
+        self.update_paragraph_data(a)
+
+    # ------------------------------------------------------------------
+    # List item splitting (fixes bullet/numbered items collapsing into a
+    # single paragraph blob with orphaned vector bullet markers).
+    # ------------------------------------------------------------------
+
+    def split_list_item_paragraphs(
+        self, page: Page, paragraphs: list[PdfParagraph]
+    ):
+        """Split paragraphs so each list item is its own paragraph.
+
+        Bullet markers are frequently drawn as small vector curves (dots)
+        rather than characters, so the paragraph flow has no textual signal
+        for item boundaries. Numbered items ("1.", "2.", ...) are text but
+        the layout model often puts a whole list into one layout box.
+        A paragraph is split before any line that has a bullet-marker curve
+        just to its left, or that starts the next number in a sequence.
+        """
+        marker_boxes = self._collect_bullet_marker_boxes(page)
+        i = 0
+        while i < len(paragraphs):
+            paragraph = paragraphs[i]
+            comps = paragraph.pdf_paragraph_composition
+            if comps and len(comps) > 1:
+                split_at = self._find_list_item_split_index(comps, marker_boxes)
+                if split_at is not None:
+                    new_paragraph = PdfParagraph(
+                        box=Box(0, 0, 0, 0),
+                        pdf_paragraph_composition=comps[split_at:],
+                        unicode="",
+                        debug_id=generate_base58_id(),
+                        layout_label=paragraph.layout_label,
+                        layout_id=paragraph.layout_id,
+                    )
+                    paragraph.pdf_paragraph_composition = comps[:split_at]
+                    self.update_paragraph_data(paragraph)
+                    self.update_paragraph_data(new_paragraph)
+                    paragraphs.insert(i + 1, new_paragraph)
+                    # The remainder is re-examined on the next iteration,
+                    # so chains of items split one by one.
+            i += 1
+
+    @staticmethod
+    def _collect_bullet_marker_boxes(page: Page) -> list[Box]:
+        """Small vector curves (dots/squares) that can act as bullet markers."""
+        markers = []
+        for curve in page.pdf_curve or []:
+            box = curve.box
+            if box is None:
+                continue
+            width = box.x2 - box.x
+            height = box.y2 - box.y
+            if 0 < width <= 8 and 0 < height <= 8:
+                markers.append(box)
+        return markers
+
+    @staticmethod
+    def _line_text(line: PdfLine) -> str:
+        return "".join(
+            char.char_unicode
+            for char in line.pdf_character
+            if char.char_unicode is not None
+        )
+
+    def _find_list_item_split_index(
+        self,
+        comps: list[PdfParagraphComposition],
+        marker_boxes: list[Box],
+    ) -> int | None:
+        # Numbered-sequence context comes from the paragraph's first line.
+        expected_number = None
+        first_line_x = None
+        first_comp_line = comps[0].pdf_line
+        if first_comp_line is not None and first_comp_line.box is not None:
+            match = NUMBERED_ITEM_PATTERN.match(self._line_text(first_comp_line))
+            if match:
+                expected_number = int(match.group(1)) + 1
+                first_line_x = first_comp_line.box.x
+
+        for j in range(1, len(comps)):
+            line = comps[j].pdf_line
+            if line is None or line.box is None:
+                continue
+            if marker_boxes and self._line_has_marker_to_left(line, marker_boxes):
+                return j
+            if expected_number is not None and first_line_x is not None:
+                match = NUMBERED_ITEM_PATTERN.match(self._line_text(line))
+                if (
+                    match
+                    and int(match.group(1)) == expected_number
+                    and abs(line.box.x - first_line_x) < 3.0
+                ):
+                    return j
+        return None
+
+    @staticmethod
+    def _line_has_marker_to_left(line: PdfLine, marker_boxes: list[Box]) -> bool:
+        line_box = line.box
+        line_height = line_box.y2 - line_box.y
+        for marker in marker_boxes:
+            marker_center_y = (marker.y + marker.y2) / 2
+            if not (line_box.y - 2 <= marker_center_y <= line_box.y2 + 2):
+                continue
+            gap = line_box.x - marker.x2
+            if 0 <= gap <= max(20.0, line_height * 1.5):
+                return True
+        return False
 
     def _group_characters_into_paragraphs(
         self, page: Page, layout_index, layout_map

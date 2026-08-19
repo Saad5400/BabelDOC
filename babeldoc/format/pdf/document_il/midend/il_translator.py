@@ -47,6 +47,80 @@ from babeldoc.utils.priority_thread_pool_executor import PriorityThreadPoolExecu
 logger = logging.getLogger(__name__)
 
 
+ARABIC_STYLE_ADDENDUM = """
+### Arabic Style Rules (target = Arabic)
+- Write clear, modern technical Arabic (فصحى معاصرة) in the register of a good university textbook: direct and natural, never bureaucratic, archaic, or stiffly literal.
+- ABSOLUTELY NO tashkeel/diacritics (فتحة، ضمة، كسرة، سكون، شدة، تنوين) unless the source text itself is diacritized. Write «أنظمة التشغيل - امتحان نهائي», NEVER «أَنْظِمَةُ التَّشْغِيلِ - اِمْتِحَانٌ نِهَائِيٌّ». This applies to titles, headers, and short labels too.
+- Keep well-known English technical terms in Latin script exactly as written: batch, deadlock, DevOps, Git, GitHub, CI/CD, SGD, API, cache, thread, mutex, semaphore, pipeline, epoch, commit, framework names, tool names, and similar. NEVER transliterate them into Arabic letters (write DevOps, never «ديف أوبس»; write Git, never «جيت»).
+- If the source sentence itself introduces or defines such a term, keep the term in English and let the surrounding Arabic explanation carry the meaning, e.g. «الـ deadlock هو حالة جمود تنتظر فيها كل عملية الأخرى».
+- Translate short standalone headers and labels into Arabic (CONTENTS → المحتويات, TOOL → الأداة, JOB → المهمة, VS → مقابل); do not leave small English UI-style labels untranslated unless they are proper nouns, code, or established technical terms as above.
+- Keep one space on each side of inline symbols like = + → < > when they connect words: write «التعلم = تحسين الأداء», never «التعلم=تحسين الأداء».
+- Prefer natural technical wording over dictionary-literal calques: pitfalls → «أخطاء شائعة» (not «مآزق»), overview → «نظرة عامة», best practices → «أفضل الممارسات».
+- Numbers, code, identifiers, and version strings stay exactly as in the source.
+- The output may contain ONLY Arabic script, Latin script, digits, and standard punctuation. NEVER emit Chinese/CJK or any other script.
+"""
+
+# Characters stripped by the Arabic post-processor when the source has no diacritics:
+# Arabic tashkeel and Quranic annotation marks.
+_ARABIC_DIACRITICS_RE = re.compile(
+    "[\u064b-\u0655\u0670\u06d6-\u06dc\u06df-\u06e4\u06e7\u06e8\u06ea-\u06ed]"
+)
+# Normalize spacing around inline connectors (= + arrows) that touch Arabic text.
+_ARABIC_OP_CANDIDATE_RE = re.compile("[ \t]*([=+\u2192\u2190])[ \t]*")
+_OP_CHARS = set("=+<>-\u2192\u2190")
+_STRAY_P_TAG_RE = re.compile(r"</?p\s*/?>")
+# CJK detection for guarding Arabic output against script leakage.
+CJK_CHARS_RE = re.compile("[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
+
+
+def _is_arabic_char(ch: str) -> bool:
+    return bool(ch) and "\u0600" <= ch <= "\u06ff"
+
+
+def _is_arabic_lang(lang: str | None) -> bool:
+    if not lang:
+        return False
+    lang = lang.lower()
+    return lang.startswith("ar") or "arab" in lang
+
+
+def _has_arabic_diacritics(text: str) -> bool:
+    return bool(_ARABIC_DIACRITICS_RE.search(text or ""))
+
+
+def _fix_arabic_operator_spacing(text: str) -> str:
+    def repl(m: "re.Match[str]") -> str:
+        op = m.group(1)
+        before = text[m.start() - 1] if m.start() > 0 else ""
+        after = text[m.end()] if m.end() < len(text) else ""
+        # Leave multi-character operators (==, <=, ->, etc.) alone.
+        if before in _OP_CHARS or after in _OP_CHARS:
+            return m.group(0)
+        if _is_arabic_char(before) or _is_arabic_char(after):
+            left = " " if before else ""
+            right = " " if after else ""
+            return f"{left}{op}{right}"
+        return m.group(0)
+
+    return _ARABIC_OP_CANDIDATE_RE.sub(repl, text)
+
+
+def postprocess_arabic_translation(source_text: str, translated_text: str) -> str:
+    """Deterministic safety net for Arabic output quality.
+
+    - Strips tashkeel unless the source itself was diacritized.
+    - Normalizes spacing around inline operators touching Arabic letters.
+    - Removes stray <p> tags occasionally emitted by the model.
+    """
+    if not translated_text:
+        return translated_text
+    if not _has_arabic_diacritics(source_text):
+        translated_text = _ARABIC_DIACRITICS_RE.sub("", translated_text)
+    translated_text = _fix_arabic_operator_spacing(translated_text)
+    translated_text = _STRAY_P_TAG_RE.sub("", translated_text)
+    return translated_text
+
+
 PROMPT_TEMPLATE = Template(
     """$role_block
 
@@ -59,7 +133,7 @@ PROMPT_TEMPLATE = Template(
 3. Do NOT translate or alter placeholders: {v1}, {name}, %s, %d, [[...]], %%...%%.
 4. If the entire input is pure code/identifiers, return it unchanged.
 5. Translate ALL human-readable content into $lang_out.
-
+$style_addendum_block
 $glossary_block
 
 $context_block
@@ -996,6 +1070,11 @@ class ILTranslator:
         translated_text: str,
     ):
         """Post-translation processing: update paragraph with translated text."""
+        if _is_arabic_lang(self.translation_config.lang_out):
+            translated_text = postprocess_arabic_translation(
+                translate_input if isinstance(translate_input, str) else "",
+                translated_text,
+            )
         tracker.set_output(translated_text)
         if translated_text == translate_input:
             if llm_translate_tracker := tracker.last_llm_translate_tracker():
@@ -1155,10 +1234,15 @@ class ILTranslator:
         )
         glossary_block = self._build_glossary_block(text)
 
+        style_addendum_block = ""
+        if _is_arabic_lang(self.translation_config.lang_out):
+            style_addendum_block = ARABIC_STYLE_ADDENDUM
+
         return PROMPT_TEMPLATE.substitute(
             role_block=role_block,
             glossary_block=glossary_block,
             context_block=context_block,
+            style_addendum_block=style_addendum_block,
             lang_out=self.translation_config.lang_out,
             text_to_translate=text,
         )

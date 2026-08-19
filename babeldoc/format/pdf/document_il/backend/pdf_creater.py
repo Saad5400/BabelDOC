@@ -1486,6 +1486,20 @@ class PDFCreater:
             except Exception:
                 logger.exception("restore media box failed")
 
+            try:
+                from babeldoc.format.pdf.document_il.midend.typesetting import (
+                    is_rtl_lang,
+                )
+
+                if is_rtl_lang(translation_config.lang_out or ""):
+                    pdf.xref_set_key(
+                        pdf.pdf_catalog(),
+                        "ViewerPreferences/Direction",
+                        "/R2L",
+                    )
+            except Exception:
+                logger.exception("failed to set RTL viewer preference")
+
             if translation_config.only_include_translated_page:
                 total_page = set(range(0, len(pdf)))
 
