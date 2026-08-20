@@ -22,6 +22,7 @@ from babeldoc.format.pdf.document_il import PdfStyle
 from babeldoc.format.pdf.document_il import il_version_1
 from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper
 from babeldoc.format.pdf.document_il.utils.formular_helper import update_formula_data
+from babeldoc.format.pdf.document_il.utils.layout_helper import BULLET_POINT_PATTERN
 from babeldoc.format.pdf.document_il.utils.layout_helper import box_to_tuple
 from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.format.pdf.translation_config import WatermarkOutputMode
@@ -1247,6 +1248,7 @@ class Typesetting:
         min_scale = 0.1
         expand_space_flag = 0
         final_typeset_units = None
+        rtl_align = self._rtl_ocr_paragraph_align(paragraph, page)
 
         while scale >= min_scale:
             try:
@@ -1258,6 +1260,7 @@ class Typesetting:
                     line_skip,
                     paragraph,
                     use_english_line_break,
+                    rtl_align=rtl_align,
                 )
 
                 # 如果所有单元都放得下
@@ -1352,6 +1355,50 @@ class Typesetting:
 
         # 最后返回最小缩放因子
         return min_scale, final_typeset_units
+
+    def _rtl_ocr_paragraph_align(
+        self,
+        paragraph: il_version_1.PdfParagraph,
+        page: il_version_1.Page,
+    ) -> str:
+        """Line alignment ("left"/"center"/"right") for an RTL paragraph.
+
+        Non-OCR RTL pages are mirrored, so in-box right alignment is always
+        correct there. OCR-workaround pages sit on an unmirrorable raster:
+        a short left-anchored original (a slide title) whose translation is
+        right-aligned inside the same tight box looks like it floats. Anchor
+        such paragraphs to the edge the original used, inferred from the
+        paragraph box position on the page. List items (they carry a textual
+        bullet marker) and full-width body text keep the natural RTL right
+        margin.
+        """
+        if not self.is_rtl:
+            return "right"
+        shared_context = getattr(
+            self.translation_config, "shared_context_cross_split_part", None
+        )
+        auto_ocr = getattr(
+            self.translation_config,
+            "auto_enabled_ocr_workaround",
+            getattr(shared_context, "auto_enabled_ocr_workaround", False),
+        )
+        if not (getattr(self.translation_config, "ocr_workaround", False) or auto_ocr):
+            return "right"
+        box = paragraph.box
+        page_box = page.cropbox.box if page.cropbox else None
+        if not (self._box_is_valid(box) and self._box_is_valid(page_box)):
+            return "right"
+        text = (paragraph.unicode or "").lstrip()
+        if text and BULLET_POINT_PATTERN.match(text[0]):
+            return "right"
+        page_width = page_box.x2 - page_box.x
+        if page_width <= 0 or box.x2 - box.x > 0.62 * page_width:
+            return "right"
+        left_gap = box.x - page_box.x
+        right_gap = page_box.x2 - box.x2
+        if abs(left_gap - right_gap) <= 0.08 * page_width:
+            return "center"
+        return "left" if left_gap < right_gap else "right"
 
     def _get_optimal_scale(
         self,
@@ -2097,6 +2144,7 @@ class Typesetting:
         line_skip: float,
         paragraph: il_version_1.PdfParagraph,
         use_english_line_break: bool = True,
+        rtl_align: str = "right",
     ) -> tuple[list[TypesettingUnit], bool]:
         """布局排版单元。
 
@@ -2220,7 +2268,9 @@ class Typesetting:
             ):
                 # 换行
                 if rtl_layout:
-                    self._finalize_rtl_line(typeset_units, line_start_index, box)
+                    self._finalize_rtl_line(
+                        typeset_units, line_start_index, box, rtl_align
+                    )
                 line_start_index = len(typeset_units)
                 current_x = box.x
                 if not current_line_heights:
@@ -2270,7 +2320,7 @@ class Typesetting:
             last_unit = relocated_unit
 
         if rtl_layout:
-            self._finalize_rtl_line(typeset_units, line_start_index, box)
+            self._finalize_rtl_line(typeset_units, line_start_index, box, rtl_align)
 
         return typeset_units, all_units_fit
 
@@ -2279,6 +2329,7 @@ class Typesetting:
         typeset_units: list[TypesettingUnit],
         line_start_index: int,
         box: Box,
+        align: str = "right",
     ) -> None:
         """Mirror one finished line into right-to-left visual order.
 
@@ -2329,6 +2380,17 @@ class Typesetting:
             for element in run:
                 element.shift(run_left + run_right - element.x - element.x2)
             index_ = run_end
+
+        # Anchored OCR paragraphs: the mirror right-aligned the line against
+        # box.x2; shift it back so the translated text hugs the edge the
+        # original was anchored to.
+        if align != "right" and elements:
+            dx = box.x - min(element.x for element in elements)
+            if align == "center":
+                dx /= 2
+            if abs(dx) > 0.01:
+                for element in elements:
+                    element.shift(dx)
 
         # Formula boxes may be stale after per-character shifts; refresh them
         # so debug rendering / later consumers see the true extent.

@@ -30,6 +30,7 @@ from babeldoc.format.pdf.document_il.utils.layout_helper import build_layout_ind
 from babeldoc.format.pdf.document_il.utils.layout_helper import calculate_iou_for_boxes
 from babeldoc.format.pdf.document_il.utils.layout_helper import get_char_unicode_string
 from babeldoc.format.pdf.document_il.utils.layout_helper import get_character_layout
+from babeldoc.format.pdf.document_il.utils.layout_helper import BULLET_POINT_PATTERN
 from babeldoc.format.pdf.document_il.utils.layout_helper import is_bullet_point
 from babeldoc.format.pdf.document_il.utils.layout_helper import (
     is_character_in_formula_layout,
@@ -486,6 +487,16 @@ class ParagraphFinder:
         if getattr(self.translation_config, "merge_alternating_line_numbers", True):
             self.merge_alternating_line_number_paragraphs(paragraphs)
 
+        # OCR sandwich pages: the injected text layer carries textual bullet
+        # markers and clean per-line geometry. Split items apart at those
+        # markers, then pull wrapped continuation lines back into their item
+        # (or heading/body block) so each logical paragraph translates and
+        # wraps as ONE unit — layout detection on raster slides is otherwise
+        # per-line and erratic.
+        if self.translation_config.ocr_workaround:
+            self.split_text_bullet_paragraphs(paragraphs)
+            self.merge_ocr_continuation_paragraphs(paragraphs)
+
         for paragraph in paragraphs:
             self.update_paragraph_data(paragraph, update_unicode=True)
 
@@ -824,6 +835,122 @@ class ParagraphFinder:
             if 0 <= gap <= max(20.0, line_height * 1.5):
                 return True
         return False
+
+    # ------------------------------------------------------------------
+    # OCR-workaround regrouping (scanned slides with an injected hOCR text
+    # layer): textual bullet markers split items apart, and wrapped
+    # continuation lines merge back into their logical paragraph.
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _line_starts_with_marker(cls, line: PdfLine) -> bool:
+        text = cls._line_text(line).lstrip()
+        if not text:
+            return False
+        if BULLET_POINT_PATTERN.match(text[0]):
+            return True
+        return bool(NUMBERED_ITEM_PATTERN.match(text))
+
+    def split_text_bullet_paragraphs(self, paragraphs: list[PdfParagraph]):
+        """Split paragraphs before every line that starts a new list item.
+
+        The OCR prep pass re-emits stripped bullet glyphs as text ("• ..."),
+        so on scanned slides item boundaries ARE textual — unlike vector
+        bullets, which split_list_item_paragraphs handles.
+        """
+        i = 0
+        while i < len(paragraphs):
+            paragraph = paragraphs[i]
+            comps = paragraph.pdf_paragraph_composition
+            if comps and len(comps) > 1:
+                split_at = None
+                for j in range(1, len(comps)):
+                    line = comps[j].pdf_line
+                    if line is not None and self._line_starts_with_marker(line):
+                        split_at = j
+                        break
+                if split_at is not None:
+                    new_paragraph = PdfParagraph(
+                        box=Box(0, 0, 0, 0),
+                        pdf_paragraph_composition=comps[split_at:],
+                        unicode="",
+                        debug_id=generate_base58_id(),
+                        layout_label=paragraph.layout_label,
+                        layout_id=paragraph.layout_id,
+                    )
+                    paragraph.pdf_paragraph_composition = comps[:split_at]
+                    self.update_paragraph_data(paragraph)
+                    self.update_paragraph_data(new_paragraph)
+                    paragraphs.insert(i + 1, new_paragraph)
+                    # The remainder is re-examined on the next iteration.
+            i += 1
+
+    def merge_ocr_continuation_paragraphs(self, paragraphs: list[PdfParagraph]):
+        """Merge wrapped continuation lines back into their paragraph.
+
+        Layout detection sees a raster slide, so a wrapped list item (or a
+        multi-line heading/body block) often lands in several per-line
+        regions and would be translated and typeset line by line — two font
+        sizes and two margins per item. Geometry decides instead: a line
+        much closer to the block above than sibling items are, that does not
+        start its own item, continues that block.
+        """
+        changed = True
+        while changed:
+            changed = False
+            for i, a in enumerate(paragraphs):
+                for j, b in enumerate(paragraphs):
+                    if i == j or not self._is_ocr_continuation(a, b):
+                        continue
+                    a.pdf_paragraph_composition.extend(
+                        b.pdf_paragraph_composition
+                    )
+                    self.update_paragraph_data(a)
+                    del paragraphs[j]
+                    changed = True
+                    break
+                if changed:
+                    break
+
+    def _is_ocr_continuation(self, a: PdfParagraph, b: PdfParagraph) -> bool:
+        if a.xobj_id != b.xobj_id:
+            return False
+        a_lines = self._paragraph_lines(a)
+        b_lines = self._paragraph_lines(b)
+        if not a_lines or not b_lines:
+            return False
+        if self._line_starts_with_marker(b_lines[0]):
+            return False
+        la, lb, fa = a_lines[-1].box, b_lines[0].box, a_lines[0].box
+        if any(
+            box is None or None in (box.x, box.y, box.x2, box.y2)
+            for box in (la, lb, fa)
+        ):
+            return False
+        ha, hb = la.y2 - la.y, lb.y2 - lb.y
+        if ha <= 0 or hb <= 0 or max(ha, hb) > 1.45 * min(ha, hb):
+            return False
+        # b directly below a: unrelated stacked blocks sit >= ~1.1 line
+        # heights apart, wrapped lines <= ~0.8 (headings may even overlap)
+        gap = la.y - lb.y2
+        if not (-0.8 * min(ha, hb) <= gap <= 0.85 * max(ha, hb)):
+            return False
+        overlap = min(la.x2, lb.x2) - max(la.x, lb.x)
+        if overlap < 0.5 * min(la.x2 - la.x, lb.x2 - lb.x):
+            return False
+        if self._line_starts_with_marker(a_lines[0]):
+            # a wrapped item line hangs under the item text, never under
+            # the marker itself (the marker is roughly a third of a line
+            # height wide)
+            return lb.x >= fa.x + 0.3 * hb
+        # plain blocks: shared left margin, centered stack, or an indented
+        # continuation
+        if abs(lb.x - fa.x) <= max(2.0, 0.25 * hb):
+            return True
+        mid_delta = abs((lb.x + lb.x2) - (fa.x + fa.x2)) / 2
+        if mid_delta <= 0.12 * max(la.x2 - la.x, lb.x2 - lb.x, fa.x2 - fa.x):
+            return True
+        return lb.x >= fa.x + 0.5 * hb
 
     def _group_characters_into_paragraphs(
         self, page: Page, layout_index, layout_map
