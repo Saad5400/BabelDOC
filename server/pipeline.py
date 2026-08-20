@@ -1,0 +1,253 @@
+"""The proven EN->AR translation pipeline behind each job.
+
+Digital PDFs:   babeldoc (arabic-rtl fork) directly.
+Scanned PDFs / garbage text layers:
+    ocrmypdf --force-ocr -l eng  ->  ocr_prep.py  ->  babeldoc
+    (--skip-scanned-detection --ocr-workaround)  ->  fix_layer_order.py
+Formats: translated (mono), alternating / side_by_side (babeldoc native dual).
+"""
+
+import asyncio
+import logging
+import shutil
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+from pypdf import PdfReader
+
+from server import config, jobs
+
+logger = logging.getLogger("doctranslate.pipeline")
+
+_warmup_lock = threading.Lock()
+_doc_layout_model = None
+
+# Overall progress bands (percent).
+_P_DETECT = 2.0
+_P_OCR = 8.0
+_P_PREP = 12.0
+_P_BABELDOC_END = 97.0
+
+
+def warmup() -> None:
+    """One-time heavy init: cache folders + layout model (downloads on first run)."""
+    global _doc_layout_model
+    with _warmup_lock:
+        if _doc_layout_model is not None:
+            return
+        import babeldoc.format.pdf.high_level as high_level
+        from babeldoc.docvision.doclayout import DocLayoutModel
+
+        high_level.init()
+        _doc_layout_model = DocLayoutModel.load_onnx()
+        logger.info("warmup complete (doc layout model loaded)")
+
+
+def _set_progress(job_id: str, percent: float, stage: str) -> None:
+    jobs.update_job(job_id, progress={"percent": round(min(percent, 100.0), 2),
+                                      "stage": stage})
+
+
+def count_pages(pdf_path: Path) -> int:
+    return len(PdfReader(str(pdf_path)).pages)
+
+
+def has_real_text_layer(pdf_path: Path, sample_pages: int = 8) -> bool:
+    """True when the PDF carries a usable digital text layer.
+
+    Scanned PDFs extract as empty; broken CID layers (no ToUnicode) extract as
+    garbage. Heuristic: a page counts as "real" when it yields >= 40 chars of
+    which at least half are letters/digits/common punctuation.
+    """
+    reader = PdfReader(str(pdf_path))
+    pages = reader.pages[:sample_pages]
+    real_pages = 0
+    for page in pages:
+        try:
+            text = (page.extract_text() or "").strip()
+        except Exception:  # noqa: BLE001 - malformed page = no text
+            text = ""
+        if len(text) < 40:
+            continue
+        sensible = sum(1 for c in text if c.isalnum() or c.isspace()
+                       or c in ".,;:!?()-'\"/%+=")
+        if sensible / len(text) >= 0.5:
+            real_pages += 1
+    return real_pages >= max(1, len(pages) // 2)
+
+
+def _run_cmd(argv: list[str], job_id: str, stage: str) -> None:
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=3600)
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "")[-1500:]
+        raise RuntimeError(f"{stage} failed (exit {proc.returncode}): {tail}")
+
+
+def _run_babeldoc(job_id: str, input_pdf: Path, out_dir: Path, *, lang_in: str,
+                  lang_out: str, fmt: str, scanned: bool, progress_base: float):
+    """Run the fork through its Python API; returns (TranslateResult, translator)."""
+    from babeldoc.format.pdf.high_level import async_translate
+    from babeldoc.format.pdf.translation_config import (
+        TranslationConfig,
+        WatermarkOutputMode,
+    )
+    from babeldoc.glossary import Glossary
+    from babeldoc.translator.translator import (
+        OpenAITranslator,
+        set_translate_rate_limiter,
+    )
+
+    if not config.OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+
+    translator = OpenAITranslator(
+        lang_in=lang_in,
+        lang_out=lang_out,
+        model=config.OPENAI_MODEL,
+        base_url=config.OPENAI_BASE_URL,
+        api_key=config.OPENAI_API_KEY,
+    )
+    set_translate_rate_limiter(4)
+
+    glossaries = []
+    if config.GLOSSARY_PATH.is_file():
+        glossary = Glossary.from_csv(config.GLOSSARY_PATH, lang_out)
+        if glossary.entries:
+            glossaries.append(glossary)
+
+    tc = TranslationConfig(
+        translator=translator,
+        input_file=str(input_pdf),
+        lang_in=lang_in,
+        lang_out=lang_out,
+        doc_layout_model=_doc_layout_model,
+        output_dir=str(out_dir),
+        no_dual=(fmt == "translated"),
+        no_mono=(fmt != "translated"),
+        use_alternating_pages_dual=(fmt == "alternating"),
+        watermark_output_mode=WatermarkOutputMode.NoWatermark,
+        skip_scanned_detection=scanned,
+        ocr_workaround=scanned,
+        glossaries=glossaries,
+        auto_extract_glossary=False,
+    )
+
+    span = _P_BABELDOC_END - progress_base
+    result_holder: dict = {}
+
+    async def consume() -> None:
+        async for event in async_translate(tc):
+            etype = event.get("type")
+            if etype in ("progress_start", "progress_update", "progress_end"):
+                overall = float(event.get("overall_progress") or 0.0)
+                _set_progress(job_id, progress_base + overall * span / 100.0,
+                              str(event.get("stage") or "translating"))
+            elif etype == "finish":
+                result_holder["result"] = event["translate_result"]
+                break  # the event stream does not terminate on its own
+            elif etype == "error":
+                result_holder["error"] = str(event.get("error"))
+                break
+
+    asyncio.run(consume())
+
+    if "error" in result_holder:
+        raise RuntimeError(f"babeldoc failed: {result_holder['error']}")
+    if "result" not in result_holder:
+        raise RuntimeError("babeldoc finished without producing a result")
+    return result_holder["result"], translator
+
+
+def _usage(translator, pages: int) -> dict:
+    prompt = int(translator.prompt_token_count.value)
+    completion = int(translator.completion_token_count.value)
+    cost = (prompt * config.PROMPT_USD_PER_1M / 1e6
+            + completion * config.COMPLETION_USD_PER_1M / 1e6
+            + pages * config.PAGE_OVERHEAD_USD)
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "cost_usd": round(cost, 6),
+    }
+
+
+def _set_pdf_title(pdf_path: Path, title: str) -> None:
+    try:
+        import pymupdf
+
+        doc = pymupdf.open(str(pdf_path))
+        meta = doc.metadata or {}
+        meta["title"] = title
+        doc.set_metadata(meta)
+        doc.saveIncr()
+        doc.close()
+    except Exception:  # noqa: BLE001 - cosmetic only
+        logger.warning("could not set PDF title on %s", pdf_path, exc_info=True)
+
+
+def run_job(job_id: str) -> None:
+    job = jobs.read_job(job_id)
+    if job is None:
+        raise RuntimeError("job vanished")
+    d = jobs.job_dir(job_id)
+    input_pdf = d / "input.pdf"
+    work = d / "work"
+    work.mkdir(exist_ok=True)
+    out_dir = work / "out"
+    out_dir.mkdir(exist_ok=True)
+    fmt = job["format"]
+    lang_in, lang_out = job["lang_in"], job["lang_out"]
+
+    _set_progress(job_id, 0.5, "analyzing")
+    pages = count_pages(input_pdf)
+    jobs.update_job(job_id, pages=pages)
+    scanned = not has_real_text_layer(input_pdf)
+    _set_progress(job_id, _P_DETECT, "scanned" if scanned else "digital")
+
+    babeldoc_input = input_pdf
+    if scanned:
+        ocr_pdf = work / "ocr.pdf"
+        prep_pdf = work / "prep.pdf"
+        _set_progress(job_id, _P_DETECT, "ocr")
+        _run_cmd(["ocrmypdf", "--force-ocr", "-l", "eng",
+                  str(input_pdf), str(ocr_pdf)], job_id, "ocrmypdf")
+        _set_progress(job_id, _P_OCR, "ocr_prep")
+        _run_cmd([sys.executable, str(config.OCR_PREP_SCRIPT),
+                  str(ocr_pdf), str(prep_pdf)], job_id, "ocr_prep")
+        babeldoc_input = prep_pdf
+        _set_progress(job_id, _P_PREP, "translating")
+        progress_base = _P_PREP
+    else:
+        progress_base = _P_DETECT
+
+    result, translator = _run_babeldoc(
+        job_id, babeldoc_input, out_dir, lang_in=lang_in, lang_out=lang_out,
+        fmt=fmt, scanned=scanned, progress_base=progress_base)
+
+    _set_progress(job_id, _P_BABELDOC_END, "finalizing")
+    if fmt == "translated":
+        produced = result.no_watermark_mono_pdf_path or result.mono_pdf_path
+    else:
+        produced = result.no_watermark_dual_pdf_path or result.dual_pdf_path
+    if not produced or not Path(produced).is_file():
+        raise RuntimeError("babeldoc produced no output PDF")
+    produced = Path(produced)
+
+    output_pdf = jobs.result_path(job_id)
+    if scanned and fmt == "translated":
+        # Move the translated /OCR-* layer above the page raster (belt-and-braces;
+        # a no-op after ocr_prep.py rebuilt the sandwich in the right order).
+        _run_cmd([sys.executable, str(config.FIX_LAYER_ORDER_SCRIPT),
+                  str(produced), str(output_pdf)], job_id, "fix_layer_order")
+    else:
+        shutil.copyfile(produced, output_pdf)
+
+    if job.get("title"):
+        _set_pdf_title(output_pdf, job["title"])
+
+    usage = _usage(translator, pages)
+    shutil.rmtree(work, ignore_errors=True)
+    jobs.update_job(job_id, status="done", usage=usage,
+                    progress={"percent": 100.0, "stage": "done"})

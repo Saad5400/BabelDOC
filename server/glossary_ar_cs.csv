@@ -1,0 +1,46 @@
+source,target,tgt_lng
+batch,batch,ar
+deadlock,deadlock,ar
+DevOps,DevOps,ar
+Git,Git,ar
+GitHub,GitHub,ar
+CI/CD,CI/CD,ar
+SGD,SGD,ar
+API,API,ar
+cache,cache,ar
+mutex,mutex,ar
+semaphore,semaphore,ar
+pipeline,pipeline,ar
+epoch,epoch,ar
+commit,commit,ar
+thread,thread,ar
+pitfalls,أخطاء شائعة,ar
+pitfall,خطأ شائع,ar
+regression,الانحدار,ar
+overfitting,فرط التخصيص (overfitting),ar
+underfitting,قصور التخصيص (underfitting),ar
+gradient descent,الانحدار التدرجي,ar
+machine learning,تعلم الآلة,ar
+deep learning,التعلم العميق,ar
+neural network,شبكة عصبية,ar
+learning rate,معدل التعلم,ar
+loss function,دالة الخسارة,ar
+operating system,نظام التشغيل,ar
+scheduling,الجدولة,ar
+concurrency,التزامن,ar
+synchronization,المزامنة,ar
+race condition,حالة تسابق,ar
+context switch,تبديل السياق,ar
+virtual memory,الذاكرة الافتراضية,ar
+kernel,النواة (kernel),ar
+algorithm,خوارزمية,ar
+data structures,هياكل البيانات,ar
+database,قاعدة بيانات,ar
+waterfall,نموذج الشلال (Waterfall),ar
+agile,Agile,ar
+framework,إطار عمل,ar
+version control,التحكم بالإصدارات,ar
+repository,مستودع,ar
+unit testing,اختبار الوحدات,ar
+debugging,تصحيح الأخطاء,ar
+throughput,الإنتاجية,ar
