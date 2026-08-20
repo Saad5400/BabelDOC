@@ -1,12 +1,15 @@
 import logging
 import random
 import re
+from pathlib import Path as FsPath
 
 import numpy as np
+import pymupdf
 
 from babeldoc.babeldoc_exception.BabelDOCException import ExtractTextError
 from babeldoc.format.pdf.document_il import Box
 from babeldoc.format.pdf.document_il import Document
+from babeldoc.format.pdf.document_il import GraphicState
 from babeldoc.format.pdf.document_il import Page
 from babeldoc.format.pdf.document_il import PdfCharacter
 from babeldoc.format.pdf.document_il import PdfLine
@@ -52,6 +55,127 @@ def generate_base58_id(length: int = 5) -> str:
     return "".join(random.choice(BASE58_ALPHABET) for _ in range(length))
 
 
+class MaskColorSampler:
+    """Sample OCR-workaround mask colors from the original page raster.
+
+    Plain white masks leave ugly white boxes on scanned slides where the
+    text sits on a colored fill (teal title cards, banners). Instead, fill
+    each mask with the dominant color of a thin ring just outside the mask
+    box: solid backgrounds match seamlessly, and white paper still yields
+    the paper's own near-white. If the ring disagrees with itself
+    (gradient / photo / box poking out of its card), fall back to the
+    dominant color INSIDE the box — for a text mask that is the local
+    background too, glyphs being the minority. White is never forced.
+
+    Also samples the dominant glyph ("ink") color inside the box so the
+    translated text can keep the original color (gold on teal) instead of
+    the flat OCR black. On near-white backgrounds only a clearly SATURATED
+    ink retints (teal/gold headings); anti-aliased grays stay black.
+    """
+
+    ZOOM = 1.5           # 108-dpi render is plenty for flat fills
+    RING_GAP_PT = 1.0    # gap between box edge and ring (skip AA halo)
+    RING_WIDTH_PT = 2.5  # sampled ring thickness
+    RING_SOLID_FRAC = 0.6  # ring agreement below this => use inner fallback
+    INK_DIST = 60        # channel distance from bg to count a pixel as ink
+    INK_MIN_FRAC = 0.02  # min ink pixel fraction to trust an ink color
+    INK_SAT_MIN = 40     # channel spread for an ink color to count as colored
+    NEAR_WHITE = 240     # near-white bg: only saturated ink retints the text
+
+    def __init__(self, pdf_path: str):
+        self.pdf = pymupdf.open(pdf_path)
+        self._cache: tuple | None = None  # (page_number, img, matrix)
+
+    def _page_raster(self, page_number: int):
+        if self._cache and self._cache[0] == page_number:
+            return self._cache[1], self._cache[2]
+        page = self.pdf[page_number]
+        pix = page.get_pixmap(
+            matrix=pymupdf.Matrix(self.ZOOM, self.ZOOM),
+            colorspace=pymupdf.csRGB,
+            alpha=False,
+        )
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+            pix.height, pix.width, pix.n
+        )[:, :, :3]
+        matrix = page.transformation_matrix * pymupdf.Matrix(self.ZOOM, self.ZOOM)
+        self._cache = (page_number, img, matrix)
+        return img, matrix
+
+    @staticmethod
+    def _dominant(pixels: np.ndarray):
+        """Modal 32-level color bucket as (fraction, mean rgb 0-255)."""
+        if pixels.size == 0:
+            return 0.0, None
+        q = (pixels // 32).astype(np.int32)
+        keys = q[:, 0] * 64 + q[:, 1] * 8 + q[:, 2]
+        counts = np.bincount(keys, minlength=512)
+        key = int(counts.argmax())
+        rgb = pixels[keys == key].mean(axis=0)
+        return counts[key] / len(pixels), tuple(float(c) for c in rgb)
+
+    def sample(self, page_number: int, x1: float, y1: float, x2: float, y2: float):
+        """(bg_rgb, ink_rgb | None) for a mask box in PDF user space."""
+        img, matrix = self._page_raster(page_number)
+        h, w = img.shape[:2]
+        p1 = pymupdf.Point(x1, y1) * matrix
+        p2 = pymupdf.Point(x2, y2) * matrix
+        px1, px2 = sorted((p1.x, p2.x))
+        py1, py2 = sorted((p1.y, p2.y))
+        gap = self.RING_GAP_PT * self.ZOOM
+        ring = (self.RING_GAP_PT + self.RING_WIDTH_PT) * self.ZOOM
+        ix1, iy1 = int(px1 - gap), int(py1 - gap)
+        ix2, iy2 = int(px2 + gap) + 1, int(py2 + gap) + 1
+        ox1, oy1 = max(0, int(px1 - ring)), max(0, int(py1 - ring))
+        ox2, oy2 = min(w, int(px2 + ring) + 1), min(h, int(py2 + ring) + 1)
+        inner = img[
+            max(0, int(py1)) : min(h, int(py2) + 1),
+            max(0, int(px1)) : min(w, int(px2) + 1),
+        ].reshape(-1, 3)
+        if ox2 <= ox1 or oy2 <= oy1:
+            return None, None
+        bands = [
+            img[oy1 : max(oy1, min(iy1, oy2)), ox1:ox2],  # above
+            img[min(max(iy2, oy1), oy2) : oy2, ox1:ox2],  # below
+            img[oy1:oy2, ox1 : max(ox1, min(ix1, ox2))],  # left
+            img[oy1:oy2, min(max(ix2, ox1), ox2) : ox2],  # right
+        ]
+        ring_px = np.concatenate([b.reshape(-1, 3) for b in bands])
+        frac, bg = self._dominant(ring_px)
+        if bg is None or frac < self.RING_SOLID_FRAC:
+            inner_frac, inner_bg = self._dominant(inner)
+            if inner_bg is not None and (bg is None or inner_frac > frac):
+                bg = inner_bg
+        if bg is None:
+            return None, None
+        ink = None
+        if len(inner):
+            dist = (
+                np.abs(inner.astype(np.int16) - np.array(bg, dtype=np.int16))
+                .max(axis=1)
+            )
+            ink_px = inner[dist > self.INK_DIST]
+            if len(ink_px) >= max(16, self.INK_MIN_FRAC * len(inner)):
+                _, candidate = self._dominant(ink_px)
+                if candidate is not None:
+                    saturated = (
+                        max(candidate) - min(candidate) >= self.INK_SAT_MIN
+                    )
+                    if saturated or min(bg) < self.NEAR_WHITE:
+                        ink = candidate
+        return bg, ink
+
+
+def solid_graphic_state(rgb) -> GraphicState:
+    """Fill+stroke GraphicState for an 0-255 rgb triple."""
+    r, g, b = (max(0.0, min(1.0, c / 255.0)) for c in rgb)
+    return GraphicState(
+        passthrough_per_char_instruction=(
+            f"{r:.4f} {g:.4f} {b:.4f} rg {r:.4f} {g:.4f} {b:.4f} RG"
+        ),
+    )
+
+
 class ParagraphFinder:
     stage_name = "Parse Paragraphs"
 
@@ -90,8 +214,49 @@ class ParagraphFinder:
             if is_isolated:
                 formula_layout.class_name = "isolate_formula"
 
+    def _get_mask_color_sampler(self) -> MaskColorSampler | None:
+        """Lazily open the original input PDF for mask-color sampling.
+
+        Only used for OCR-workaround masks; any failure falls back to the
+        historical plain-white masks.
+        """
+        if not hasattr(self, "_mask_color_sampler"):
+            self._mask_color_sampler = None
+            try:
+                path = self.translation_config.get_working_file_path("input.pdf")
+                if FsPath(path).exists():
+                    self._mask_color_sampler = MaskColorSampler(str(path))
+            except Exception:
+                logger.exception(
+                    "Failed to open original PDF for mask-color sampling; "
+                    "OCR-workaround masks fall back to white."
+                )
+        return self._mask_color_sampler
+
+    @staticmethod
+    def _tint_paragraph_text(paragraph: PdfParagraph, ink_rgb) -> None:
+        """Give the paragraph's (future translated) text the sampled glyph
+        color instead of the flat OCR-workaround black."""
+        state = solid_graphic_state(ink_rgb)
+        if paragraph.pdf_style is not None:
+            paragraph.pdf_style.graphic_state = state
+        for composition in paragraph.pdf_paragraph_composition or []:
+            chars = []
+            if composition.pdf_line:
+                chars = composition.pdf_line.pdf_character
+            elif composition.pdf_formula:
+                chars = composition.pdf_formula.pdf_character
+            elif composition.pdf_character:
+                chars = [composition.pdf_character]
+            elif composition.pdf_same_style_characters:
+                chars = composition.pdf_same_style_characters.pdf_character
+            for char in chars:
+                if char.pdf_style is not None:
+                    char.pdf_style.graphic_state = state
+
     def add_text_fill_background(self, page: Page):
         layout_map = {layout.id: layout for layout in page.page_layout}
+        sampler = self._get_mask_color_sampler()
         for paragraph in page.pdf_paragraph:
             layout_id = paragraph.layout_id
             if layout_id is None:
@@ -115,11 +280,29 @@ class ParagraphFinder:
             if layout_box.y2 > y2:
                 y2 = layout_box.y2
             assert x2 > x1 and y2 > y1
+            # OCR-workaround masks used to be plain white, which leaves white
+            # boxes on colored slide backgrounds. Sample the surrounding
+            # background color from the original raster instead; the sampled
+            # color of white paper stays (near-)white on its own.
+            fill_state = WHITE
+            if sampler is not None:
+                try:
+                    bg, ink = sampler.sample(page.page_number, x1, y1, x2, y2)
+                    if bg is not None:
+                        fill_state = solid_graphic_state(bg)
+                    if ink is not None:
+                        self._tint_paragraph_text(paragraph, ink)
+                except Exception:
+                    logger.exception(
+                        "Mask-color sampling failed for paragraph "
+                        f"{getattr(paragraph, 'debug_id', None)} on page "
+                        f"{page.page_number}; using a white mask."
+                    )
             page.pdf_rectangle.append(
                 PdfRectangle(
                     box=Box(x1, y1, x2, y2),
                     fill_background=True,
-                    graphic_state=WHITE,
+                    graphic_state=fill_state,
                     debug_info=False,
                     xobj_id=paragraph.xobj_id,
                 )
