@@ -1,0 +1,8 @@
+.git
+.github
+.venv
+docs
+examples
+mkdocs.yml
+**/__pycache__
+*.pyc
