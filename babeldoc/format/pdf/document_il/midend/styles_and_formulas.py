@@ -1,3 +1,4 @@
+import base64
 import math
 import re
 
@@ -41,12 +42,44 @@ from babeldoc.format.pdf.document_il.utils.spatial_analyzer import (
 from babeldoc.format.pdf.translation_config import TranslationConfig
 
 
+# Font-name heuristics for monospace/code fonts (checked against the base font
+# name, lowercased, after stripping any subset prefix like "ABCDEF+").
+# Kept deliberately conservative: these names essentially never appear as the
+# dominant font of a prose paragraph.
+CODE_FONT_NAME_PATTERN = re.compile(
+    r"(mono|courier|consol|menlo|typewriter|inconsolata|cmtt|"
+    r"lettergothic|prestige|ocr-?b|fira ?code|cascadia ?code|source ?code)",
+    re.IGNORECASE,
+)
+
+# Minimum share of non-space characters that must use a monospace font for a
+# paragraph to be treated as a code block. Inline code spans inside a prose
+# sentence stay well below this, so they don't flip the whole paragraph.
+CODE_PARAGRAPH_MONO_RATIO = 0.6
+
+# A paragraph that is almost entirely monospace is code (or a code-ish literal
+# such as program output) even without statement punctuation.
+CODE_PARAGRAPH_PURE_MONO_RATIO = 0.95
+
+# For mid-range mono ratios (0.6-0.95) require actual code syntax among the
+# monospace characters. Prose sentences that merely mention many identifiers
+# ("Book and Newspaper inherit pageCount ...") can exceed 60% monospace but
+# contain no statement punctuation, and must still be translated.
+CODE_SYNTAX_CHARS = frozenset(";{}=")
+
+# Ignore tiny paragraphs (page numbers etc.) to avoid noise.
+CODE_PARAGRAPH_MIN_CHARS = 4
+
+
 class StylesAndFormulas:
     stage_name = "Parse Formulas and Styles"
 
     def __init__(self, translation_config: TranslationConfig):
         self.translation_config = translation_config
         self.font_mapper = FontMapper(translation_config)
+        # Identities of PdfFormula objects created from code paragraphs.
+        # These must never be split or converted back to translatable text.
+        self._code_formula_ids: set[int] = set()
 
     def update_formula_data(self, formula: PdfFormula):
         update_formula_data(formula)
@@ -359,8 +392,233 @@ class StylesAndFormulas:
             if form in page.pdf_form:
                 page.pdf_form.remove(form)
 
+    @staticmethod
+    def _base_font_name(font_name: str | None) -> str:
+        """Return the lowercased base font name, decoding BASE64: names and
+        stripping any subset prefix (e.g. "ABCDEF+CourierNewPSMT")."""
+        if not font_name:
+            return ""
+        if font_name.startswith("BASE64:"):
+            try:
+                font_name_bytes = base64.b64decode(font_name[7:])
+                font_name = font_name_bytes.split(b"+")[-1].decode(
+                    "utf-8", errors="ignore"
+                )
+            except Exception:
+                return ""
+        return font_name.split("+")[-1].lower()
+
+    def _is_code_font(self, font) -> bool:
+        """A font is a code font if the PDF fixed-pitch flag is set or its
+        name matches common monospace family names."""
+        if font is None:
+            return False
+        if getattr(font, "monospace", None):
+            return True
+        return bool(CODE_FONT_NAME_PATTERN.search(self._base_font_name(font.name)))
+
+    def _build_code_font_ids(self, page: Page) -> tuple[set, dict]:
+        """Collect font_ids of monospace fonts at page level and per XObject."""
+        page_code_font_ids = set()
+        if page.pdf_font:
+            for font in page.pdf_font:
+                if self._is_code_font(font):
+                    page_code_font_ids.add(font.font_id)
+
+        xobj_code_font_ids = {}
+        if page.pdf_xobject:
+            for xobj in page.pdf_xobject:
+                current = page_code_font_ids.copy()
+                if xobj.pdf_font:
+                    for font in xobj.pdf_font:
+                        if self._is_code_font(font):
+                            current.add(font.font_id)
+                        else:
+                            current.discard(font.font_id)
+                xobj_code_font_ids[xobj.xobj_id] = current
+
+        return page_code_font_ids, xobj_code_font_ids
+
+    def detect_code_paragraphs(self, page: Page):
+        """Detect paragraphs dominated by a monospace font (source code) and
+        convert each into a single preserved formula composition.
+
+        Code must survive translation verbatim: untranslated, LTR, original
+        line order. Turning the whole paragraph into one PdfFormula reuses the
+        existing passthrough path (the translator skips paragraphs whose only
+        composition is a formula, and typesetting moves formulas as a unit
+        while keeping every character at its original relative position).
+        """
+        if not page.pdf_paragraph:
+            return
+
+        page_code_font_ids, xobj_code_font_ids = self._build_code_font_ids(page)
+        if not page_code_font_ids and not any(xobj_code_font_ids.values()):
+            return
+
+        # Pass 1: find code paragraph candidates.
+        code_paragraphs = []  # list of (paragraph, chars)
+        for paragraph in page.pdf_paragraph:
+            if not paragraph.pdf_paragraph_composition:
+                continue
+
+            if (
+                paragraph.xobj_id is not None
+                and paragraph.xobj_id in xobj_code_font_ids
+            ):
+                code_font_ids = xobj_code_font_ids[paragraph.xobj_id]
+            else:
+                code_font_ids = page_code_font_ids
+            if not code_font_ids:
+                continue
+
+            all_chars = []
+            total = 0
+            mono = 0
+            has_code_syntax = False
+            for composition in paragraph.pdf_paragraph_composition:
+                line = composition.pdf_line
+                if not line or not line.pdf_character:
+                    continue
+                for char in line.pdf_character:
+                    all_chars.append(char)
+                    if char.char_unicode is None or char.char_unicode.isspace():
+                        continue
+                    total += 1
+                    if (
+                        char.pdf_style
+                        and char.pdf_style.font_id in code_font_ids
+                    ):
+                        mono += 1
+                        if char.char_unicode in CODE_SYNTAX_CHARS:
+                            has_code_syntax = True
+
+            if total < CODE_PARAGRAPH_MIN_CHARS:
+                continue
+            ratio = mono / total
+            if ratio <= CODE_PARAGRAPH_MONO_RATIO:
+                continue
+            if ratio < CODE_PARAGRAPH_PURE_MONO_RATIO and not has_code_syntax:
+                continue
+
+            code_paragraphs.append((paragraph, all_chars))
+
+        if not code_paragraphs:
+            return
+
+        # Pass 2: merge code paragraphs that the paragraph finder split apart
+        # although they form one visual source line (e.g. `return ("x = "+x);`
+        # split at the string literal into `return ("x =` and `"+x);`).
+        # Left as separate paragraphs, each fragment would later be position-
+        # mirrored independently for RTL, visually swapping the fragments.
+        groups = self._group_adjacent_code_paragraphs(code_paragraphs)
+
+        paragraph_ids_to_remove = set()
+        for group in groups:
+            # Keep source order: left-to-right within the visual line.
+            group.sort(
+                key=lambda item: min(c.visual_bbox.box.x for c in item[1])
+            )
+            chars = []
+            for _paragraph, para_chars in group:
+                chars.extend(para_chars)
+
+            formula = PdfFormula(pdf_character=chars, line_id=0)
+            self.update_formula_data(formula)
+            self._code_formula_ids.add(id(formula))
+
+            keep_paragraph = group[0][0]
+            keep_paragraph.pdf_paragraph_composition = [
+                PdfParagraphComposition(pdf_formula=formula)
+            ]
+            for paragraph, _para_chars in group[1:]:
+                paragraph_ids_to_remove.add(id(paragraph))
+
+        if paragraph_ids_to_remove:
+            page.pdf_paragraph[:] = [
+                p
+                for p in page.pdf_paragraph
+                if id(p) not in paragraph_ids_to_remove
+            ]
+
+    # Maximum horizontal gap between two same-line code fragments for them to
+    # be considered one split source line: two character cells of the larger
+    # font (a lost inter-token space plus slack), never below 15pt. Distinct
+    # side-by-side code boxes sit far further apart than this.
+    CODE_FRAGMENT_MAX_GAP = 15.0
+    CODE_FRAGMENT_GAP_FONT_FACTOR = 2.0
+
+    @staticmethod
+    def _code_paragraph_bbox(chars) -> Box:
+        return Box(
+            x=min(c.visual_bbox.box.x for c in chars),
+            y=min(c.visual_bbox.box.y for c in chars),
+            x2=max(c.visual_bbox.box.x2 for c in chars),
+            y2=max(c.visual_bbox.box.y2 for c in chars),
+        )
+
+    def _group_adjacent_code_paragraphs(self, code_paragraphs):
+        """Group code paragraphs that lie on the same visual line and are
+        horizontally adjacent (union-find over pairwise adjacency)."""
+        n = len(code_paragraphs)
+        boxes = [self._code_paragraph_bbox(chars) for _p, chars in code_paragraphs]
+        font_sizes = [
+            max(
+                (
+                    c.pdf_style.font_size
+                    for c in chars
+                    if c.pdf_style and c.pdf_style.font_size
+                ),
+                default=0.0,
+            )
+            for _p, chars in code_paragraphs
+        ]
+        parent = list(range(n))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(i, j):
+            ri, rj = find(i), find(j)
+            if ri != rj:
+                parent[rj] = ri
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                a, b = boxes[i], boxes[j]
+                # Same xobj only.
+                if code_paragraphs[i][0].xobj_id != code_paragraphs[j][0].xobj_id:
+                    continue
+                # Same visual line: y overlap over the smaller height > 0.5.
+                overlap = min(a.y2, b.y2) - max(a.y, b.y)
+                min_height = min(a.y2 - a.y, b.y2 - b.y)
+                if min_height <= 0 or overlap / min_height <= 0.5:
+                    continue
+                # Horizontally adjacent or overlapping.
+                gap = max(a.x, b.x) - min(a.x2, b.x2)
+                max_gap = max(
+                    self.CODE_FRAGMENT_MAX_GAP,
+                    self.CODE_FRAGMENT_GAP_FONT_FACTOR
+                    * max(font_sizes[i], font_sizes[j]),
+                )
+                if gap <= max_gap:
+                    union(i, j)
+
+        grouped = {}
+        for idx, item in enumerate(code_paragraphs):
+            grouped.setdefault(find(idx), []).append((idx, item))
+        return [
+            [item for _idx, item in sorted(members)]
+            for _root, members in grouped.items()
+        ]
+
     def process_page(self, page: Page):
         """处理页面，包括公式识别和偏移量计算"""
+        self._code_formula_ids.clear()
+        self.detect_code_paragraphs(page)
         self.process_page_formulas(page)
         # self.process_page_offsets(page)
         self.process_comma_formulas(page)
@@ -949,6 +1207,9 @@ class StylesAndFormulas:
 
     def is_translatable_formula(self, formula: PdfFormula) -> bool:
         """判断公式是否只包含需要正常翻译的字符（数字、空格和英文逗号）"""
+        if id(formula) in self._code_formula_ids:
+            # Code paragraphs must stay verbatim.
+            return False
         if all(char.formula_layout_id for char in formula.pdf_character):
             return False
 
@@ -960,6 +1221,9 @@ class StylesAndFormulas:
     def should_split_formula(self, formula: PdfFormula) -> bool:
         """判断公式是否需要按逗号拆分（包含逗号且有其他特殊符号）"""
 
+        if id(formula) in self._code_formula_ids:
+            # Code paragraphs are preserved as one block; never split them.
+            return False
         if all(x.formula_layout_id for x in formula.pdf_character):
             return False
 

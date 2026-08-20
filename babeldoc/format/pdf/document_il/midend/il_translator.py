@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
 import threading
+import time
 from pathlib import Path
 from string import Template
 
@@ -51,8 +53,11 @@ ARABIC_STYLE_ADDENDUM = """
 ### Arabic Style Rules (target = Arabic)
 - Write clear, modern technical Arabic (فصحى معاصرة) in the register of a good university textbook: direct and natural, never bureaucratic, archaic, or stiffly literal.
 - ABSOLUTELY NO tashkeel/diacritics (فتحة، ضمة، كسرة، سكون، شدة، تنوين) unless the source text itself is diacritized. Write «أنظمة التشغيل - امتحان نهائي», NEVER «أَنْظِمَةُ التَّشْغِيلِ - اِمْتِحَانٌ نِهَائِيٌّ». This applies to titles, headers, and short labels too.
-- Keep well-known English technical terms in Latin script exactly as written: batch, deadlock, DevOps, Git, GitHub, CI/CD, SGD, API, cache, thread, mutex, semaphore, pipeline, epoch, commit, framework names, tool names, and similar. NEVER transliterate them into Arabic letters (write DevOps, never «ديف أوبس»; write Git, never «جيت»).
-- If the source sentence itself introduces or defines such a term, keep the term in English and let the surrounding Arabic explanation carry the meaning, e.g. «الـ deadlock هو حالة جمود تنتظر فيها كل عملية الأخرى».
+- For EVERY technical term, apply this decision procedure (the word examples below are illustrations of the procedure, not an enumeration):
+  (a) If a widely-used, natural Arabic term exists, use it (e.g. algorithm → «خوارزمية», array → «مصفوفة», variable → «متغير»).
+  (b) If the best Arabic rendering would be unnatural, ambiguous, or would change the meaning, TRANSLITERATE the English term into Arabic script following how Arabic-speaking practitioners of the field actually say it (e.g. method → «ميثود», plural «ميثودات»; class → «كلاس»; object → «أوبجكت»; constructor → «كونستركتور»). NEVER force a semantically wrong Arabic word just to avoid transliteration (e.g. «أساليب» for methods is WRONG; «ميثود» is right). On the FIRST occurrence of a transliterated term, you may add the English original in parentheses: «ميثود (method)».
+  (c) Keep Latin script ONLY for: acronyms (API, SGD, CI/CD), code identifiers and version strings, and product/tool/proper names (Git, GitHub, Docker, DevOps). Do not transliterate names — write Git, never «جيت»; write DevOps, never «ديف أوبس». Transliteration under (b) is for common-noun jargon used inside Arabic sentences, not for names.
+- When the source sentence introduces or defines a term that stays in Latin script under (c), let the surrounding Arabic explanation carry the meaning, e.g. «الـ API هو الواجهة التي تتخاطب عبرها البرامج».
 - Translate short standalone headers and labels into Arabic (CONTENTS → المحتويات, TOOL → الأداة, JOB → المهمة, VS → مقابل); do not leave small English UI-style labels untranslated unless they are proper nouns, code, or established technical terms as above.
 - Keep one space on each side of inline symbols like = + → < > when they connect words: write «التعلم = تحسين الأداء», never «التعلم=تحسين الأداء».
 - Prefer natural technical wording over dictionary-literal calques: pitfalls → «أخطاء شائعة» (not «مآزق»), overview → «نظرة عامة», best practices → «أفضل الممارسات».
@@ -68,7 +73,14 @@ _ARABIC_DIACRITICS_RE = re.compile(
 # Normalize spacing around inline connectors (= + arrows) that touch Arabic text.
 _ARABIC_OP_CANDIDATE_RE = re.compile("[ \t]*([=+\u2192\u2190])[ \t]*")
 _OP_CHARS = set("=+<>-\u2192\u2190")
-_STRAY_P_TAG_RE = re.compile(r"</?p\s*/?>")
+# Literal HTML tag pairs occasionally emitted by the model as text (e.g.
+# <code>...</code> wrapping a translated fragment, stray <p> tags). The name
+# list deliberately excludes placeholder shapes: <style id='N'>...</style> is
+# not listed, and <b1>/<b12> placeholders fail the (?![0-9A-Za-z]) guard.
+_STRAY_HTML_TAG_RE = re.compile(
+    r"</?(?:strong|span|code|pre|sub|sup|em|br|b|i|u|p)(?![0-9A-Za-z])\s*/?>",
+    re.IGNORECASE,
+)
 # CJK detection for guarding Arabic output against script leakage.
 CJK_CHARS_RE = re.compile("[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
 
@@ -110,14 +122,15 @@ def postprocess_arabic_translation(source_text: str, translated_text: str) -> st
 
     - Strips tashkeel unless the source itself was diacritized.
     - Normalizes spacing around inline operators touching Arabic letters.
-    - Removes stray <p> tags occasionally emitted by the model.
+    - Removes literal HTML tags (<code>, <p>, <b>, ...) occasionally emitted
+      by the model as visible text; placeholder shapes are preserved.
     """
     if not translated_text:
         return translated_text
     if not _has_arabic_diacritics(source_text):
         translated_text = _ARABIC_DIACRITICS_RE.sub("", translated_text)
     translated_text = _fix_arabic_operator_spacing(translated_text)
-    translated_text = _STRAY_P_TAG_RE.sub("", translated_text)
+    translated_text = _STRAY_HTML_TAG_RE.sub("", translated_text)
     return translated_text
 
 
@@ -439,6 +452,15 @@ class ILTranslator:
         self.add_content_filter_hint_lock = threading.Lock()
         self.docs = None
 
+        # Final-tier retry configuration: after the primary attempt fails,
+        # retry up to 2 more times (with exponential backoff; the last retry
+        # uses a simplified prompt).
+        self.max_translate_attempts = 3
+        # Observability: paragraphs that remain untranslated after ALL tiers,
+        # keyed by 0-based page number.
+        self.untranslated_by_page: dict[int, int] = {}
+        self.untranslated_lock = threading.Lock()
+
         # Pre-compile patterns for placeholder-like tokens that may be hallucinated by LLM.
         # We only consider the same shapes as our own formula & rich-text placeholders.
         self._formula_placeholder_pattern = re.compile(
@@ -498,6 +520,14 @@ class ILTranslator:
             logger.debug(f"save translate tracking to {path}")
             with Path(path).open("w", encoding="utf-8") as f:
                 f.write(tracker.to_json())
+
+        if not self.use_as_fallback:
+            untranslated_total = self.report_untranslated()
+            if untranslated_total:
+                logger.warning(
+                    f"Translation completed with {untranslated_total} "
+                    f"untranslated paragraph(s)."
+                )
 
     def find_title_paragraph(self, docs: Document) -> PdfParagraph | None:
         """Find the first paragraph with layout_label 'title' in the document.
@@ -1295,6 +1325,49 @@ class ILTranslator:
             xobj_id=-1,
         )
 
+    def _build_simple_retry_prompt(self, text: str) -> str:
+        """Minimal last-resort prompt used on the final retry tier.
+
+        Drops all structure/rules/glossary blocks: some failures are caused by
+        the model choking on the long rule-heavy prompt, so the last attempt
+        asks for a bare translation only.
+        """
+        script_rule = ""
+        if _is_arabic_lang(self.translation_config.lang_out):
+            script_rule = (
+                " The output may contain only Arabic script, Latin script, "
+                "digits, and punctuation - never Chinese/CJK characters."
+            )
+        return (
+            f"Translate the following text into {self.translation_config.lang_out}. "
+            "Keep any placeholders or tags (e.g. {v1}, <style id='1'>...</style>) "
+            f"exactly unchanged.{script_rule} "
+            "Output only the translation, nothing else.\n\n"
+            f"{text}"
+        )
+
+    def _record_untranslated(self, page: Page | None):
+        """Count a paragraph that remains untranslated after all retry tiers."""
+        page_number = getattr(page, "page_number", None) if page else None
+        key = page_number if page_number is not None else -1
+        with self.untranslated_lock:
+            self.untranslated_by_page[key] = self.untranslated_by_page.get(key, 0) + 1
+
+    def report_untranslated(self) -> int:
+        """Log one WARNING per page with untranslated paragraphs.
+
+        Returns the total number of untranslated paragraphs so callers can
+        fold it into their final summary line.
+        """
+        total = 0
+        with self.untranslated_lock:
+            items = sorted(self.untranslated_by_page.items())
+        for page_number, count in items:
+            total += count
+            page_label = page_number + 1 if page_number >= 0 else "unknown"
+            logger.warning(f"UNTRANSLATED page={page_label} paragraphs={count}")
+        return total
+
     def translate_paragraph(
         self,
         paragraph: PdfParagraph,
@@ -1307,7 +1380,14 @@ class ILTranslator:
         title_paragraph: TitleContextSnapshot | None = None,
         local_title_paragraph: TitleContextSnapshot | None = None,
     ):
-        """Translate a paragraph using pre and post processing functions."""
+        """Translate a paragraph using pre and post processing functions.
+
+        Retry ladder: attempt 1 uses the full prompt; on failure (exception or
+        the model echoing the source back), retry up to 2 more times with
+        exponential backoff; the final retry uses a simplified prompt. If all
+        attempts fail, the paragraph is recorded as untranslated so the run
+        summary can surface it (instead of silently keeping the source text).
+        """
         self.translation_config.raise_if_cancelled()
         with PbarContext(pbar):
             try:
@@ -1320,43 +1400,112 @@ class ILTranslator:
                 )
                 if text is None:
                     return
-                llm_translate_tracker = tracker.new_llm_translate_tracker()
-                # Perform translation
-                if self.support_llm_translate:
-                    llm_prompt = self.generate_prompt_for_llm(
-                        text,
-                        title_paragraph,
-                        local_title_paragraph,
-                        translate_input,
-                    )
-                    llm_translate_tracker.set_input(llm_prompt)
-                    translated_text = self.translate_engine.llm_translate(
-                        llm_prompt,
-                        rate_limit_params={
-                            "paragraph_token_count": paragraph_token_count
-                        },
-                    )
-                    llm_translate_tracker.set_output(translated_text)
-                else:
-                    translated_text = self.translate_engine.translate(
-                        text,
-                        rate_limit_params={
-                            "paragraph_token_count": paragraph_token_count
-                        },
-                    )
-                translated_text = re.sub(r"[. 。…，]{20,}", ".", translated_text)
 
-                # Post-translation processing
-                self.post_translate_paragraph(
-                    paragraph, tracker, translate_input, translated_text
+                input_token_count = self.calc_token_count(text)
+                last_error: str | None = None
+
+                for attempt in range(self.max_translate_attempts):
+                    self.translation_config.raise_if_cancelled()
+                    if attempt > 0:
+                        # Exponential backoff with jitter: ~1s, ~2s.
+                        time.sleep(2 ** (attempt - 1) + random.uniform(0, 0.5))
+
+                    llm_translate_tracker = tracker.new_llm_translate_tracker()
+                    try:
+                        # Perform translation
+                        if self.support_llm_translate:
+                            if attempt >= self.max_translate_attempts - 1:
+                                # Last tier: simplified prompt.
+                                llm_prompt = self._build_simple_retry_prompt(text)
+                            else:
+                                llm_prompt = self.generate_prompt_for_llm(
+                                    text,
+                                    title_paragraph,
+                                    local_title_paragraph,
+                                    translate_input,
+                                )
+                            llm_translate_tracker.set_input(llm_prompt)
+                            translated_text = self.translate_engine.llm_translate(
+                                llm_prompt,
+                                rate_limit_params={
+                                    "paragraph_token_count": paragraph_token_count
+                                },
+                            )
+                            llm_translate_tracker.set_output(translated_text)
+                        else:
+                            translated_text = self.translate_engine.translate(
+                                text,
+                                rate_limit_params={
+                                    "paragraph_token_count": paragraph_token_count
+                                },
+                            )
+                        translated_text = re.sub(
+                            r"[. 。…，]{20,}", ".", translated_text
+                        )
+
+                        # CJK guard (mirrors the batch-path check): never
+                        # apply Arabic output contaminated with CJK glyphs;
+                        # treat it as a failed attempt so the next tier runs.
+                        if _is_arabic_lang(
+                            self.translation_config.lang_out
+                        ) and CJK_CHARS_RE.search(translated_text):
+                            last_error = (
+                                "CJK characters leaked into Arabic translation"
+                            )
+                            llm_translate_tracker.set_error_message(last_error)
+                            logger.warning(
+                                f"Fallback translation attempt {attempt + 1}/"
+                                f"{self.max_translate_attempts}: CJK leak for "
+                                f"paragraph {paragraph.debug_id}, retrying."
+                            )
+                            continue
+
+                        # Post-translation processing
+                        applied = self.post_translate_paragraph(
+                            paragraph, tracker, translate_input, translated_text
+                        )
+                        if applied:
+                            return
+                        # Model echoed the source back. For short/code-like
+                        # inputs an identical output can be legitimate, so
+                        # only treat it as a failure worth retrying for
+                        # meaningful inputs (mirrors the batch-path check).
+                        if (
+                            input_token_count <= 10
+                            or self.translation_config.disable_same_text_fallback
+                        ):
+                            return
+                        last_error = "translation result identical to input"
+                        llm_translate_tracker.set_error_message(last_error)
+                        logger.warning(
+                            f"Fallback translation attempt {attempt + 1}/"
+                            f"{self.max_translate_attempts} returned source "
+                            f"unchanged for paragraph {paragraph.debug_id}."
+                        )
+                    except ContentFilterError as e:
+                        logger.warning(f"ContentFilterError: {e.message}")
+                        self.add_content_filter_hint(page, paragraph)
+                        return
+                    except Exception as e:
+                        last_error = str(e)
+                        llm_translate_tracker.set_error_message(last_error)
+                        logger.warning(
+                            f"Fallback translation attempt {attempt + 1}/"
+                            f"{self.max_translate_attempts} failed for paragraph "
+                            f"{paragraph.debug_id}: {e}"
+                        )
+
+                # All retry tiers exhausted: the paragraph keeps its source
+                # text. Record it so production output surfaces the loss.
+                self._record_untranslated(page)
+                logger.warning(
+                    f"Paragraph {paragraph.debug_id} remains untranslated after "
+                    f"{self.max_translate_attempts} attempts. Last error: {last_error}"
                 )
-            except ContentFilterError as e:
-                logger.warning(f"ContentFilterError: {e.message}")
-                self.add_content_filter_hint(page, paragraph)
-                return
             except Exception as e:
                 logger.exception(
                     f"Error translating paragraph. Paragraph: {paragraph.debug_id} ({paragraph.unicode}). Error: {e}. ",
                 )
+                self._record_untranslated(page)
                 # ignore error and continue
                 return

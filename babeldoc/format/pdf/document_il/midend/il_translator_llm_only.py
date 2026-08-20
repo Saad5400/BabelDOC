@@ -258,8 +258,10 @@ class ILTranslatorLLMOnly:
             logger.debug(f"save translate tracking to {path}")
             with Path(path).open("w", encoding="utf-8") as f:
                 f.write(tracker.to_json())
+        untranslated_total = self.il_translator.report_untranslated()
         logger.info(
-            f"Translation completed. Total: {self.total_count}, Successful: {self.ok_count}, Fallback: {self.fallback_count}"
+            f"Translation completed. Total: {self.total_count}, Successful: {self.ok_count}, "
+            f"Fallback: {self.fallback_count}, Untranslated: {untranslated_total}"
         )
 
     def _is_body_text_paragraph(self, paragraph: PdfParagraph) -> bool:
