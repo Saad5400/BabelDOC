@@ -25,7 +25,12 @@ Fixes fed to BabelDOC (--ocr-workaround):
 3. Staircase alignment: every bullet line on a page is stretched (via text
    matrix x-scale) to a common right margin, so BabelDOC's per-paragraph
    in-box RTL alignment lands every translated line on the same right edge.
-   Continuation lines (indented, no marker, small gap) join the group too.
+   Wave-5: wrapped continuation lines are wired to their parent item (tight
+   vertical gap, contained span) and share the group's font size; markers
+   the OCR missed are inferred from siblings, and every marker is re-emitted
+   as a textual "• " prefix so the translated RTL paragraph keeps its bullet
+   (BabelDOC's ocr_workaround regroup pass re-merges each group into ONE
+   paragraph that wraps as a unit).
 4. Sparse look: font-size hint is derived from real glyph heights
    (min(x_size, 1.35 * median word height)) instead of ocrmypdf's smaller
    guess, so translated text is typeset near the original size.
@@ -157,8 +162,7 @@ class Line:
         self.stretch_right = None
         self.dead = False
         self.marker_left = None     # x of a stripped bullet marker (mask must cover it)
-        self.extra_text = ""        # continuation-line text folded into this line
-        self.whiteout = []          # (x, y, x2, y2) px rects to paint white
+        self.group_root = None      # wrapped-paragraph root this line continues
         self.size_override = None   # cluster-normalized font size (pt)
 
     def alive_words(self):
@@ -340,10 +344,12 @@ def filter_words(lines, page_w_px, page_h_px, px_per_pt, raster):
                         and cratios.get(id(w), 0.0) >= 0.6 \
                         and not w.solid:
                     w.kill("graphic")
-        # a lone single-character line is almost always a stray stroke
+        # a lone surviving single-character is almost always a stray stroke
+        # (non-alphanumeric survivors like «&» are calligraphy shards no
+        # matter how confident tesseract is about them)
         alive = ln.alive_words()
-        if len(ln.words) == 1 and alive and len(alive[0].text) == 1 \
-                and alive[0].conf < 90:
+        if len(alive) == 1 and len(alive[0].text) == 1 \
+                and (alive[0].conf < 90 or not alive[0].text.isalnum()):
             alive[0].kill("stroke")
 
     # if a line lost half its words to graphic/corner kills, it IS the graphic
@@ -388,9 +394,85 @@ def filter_words(lines, page_w_px, page_h_px, px_per_pt, raster):
         if not changed:
             break
 
+    # pass 4 (wave-5): raster bullet detection — a compact ink dot in the
+    # whitespace strip just left of a line is a bullet marker even when
+    # tesseract missed or mangled the glyph (one item of a list otherwise
+    # loses its bullet while all its siblings keep theirs)
+    for ln in lines:
+        ws = ln.alive_words()
+        if ln.is_list or not ws:
+            continue
+        text_left = min(w.x for w in ws)
+        wy = min(w.y for w in ws)
+        wy2 = max(w.y2 for w in ws)
+        mx = find_marker_dot(raster, text_left, wy, wy2, ln.x_size)
+        if mx is not None:
+            ln.is_list = True
+            ln.marker_left = mx
+
     for ln in lines:
         if not ln.alive_words():
             ln.dead = True
+
+
+def find_marker_dot(raster, text_left, wy, wy2, x_size):
+    """x of a compact ink dot in the whitespace strip left of a line.
+
+    The strip reaches ~1.35 glyph heights left of the text, so page-margin
+    whitespace stays empty for continuation lines while a missed «▪»/«•»
+    shows up as a small, solid, well-separated ink blob. Anything large,
+    sparse or bleeding through the strip edges (braces, ornaments, colored
+    cards) is not a marker.
+    """
+    h = max(wy2 - wy, 8)
+    ref = max(x_size, 0.8 * h, 20)
+    x1 = max(0, int(text_left - 1.35 * ref))
+    x2 = max(0, int(text_left - 0.15 * ref))
+    y1 = max(0, int(wy - 0.15 * h))
+    y2 = min(raster.h, int(wy2 + 0.15 * h))
+    if x2 - x1 < 6 or y2 - y1 < 6:
+        return None
+    buf, n, stride = raster.buf, raster.n, raster.stride
+    cols = {}  # x -> [min_y, max_y, count]
+    for y in range(y1, y2, 2):
+        row = y * stride
+        for x in range(x1, min(x2, raster.w), 2):
+            i = row + x * n
+            if buf[i] >= WHITE_LVL and buf[i + 1] >= WHITE_LVL \
+                    and buf[i + 2] >= WHITE_LVL:
+                continue
+            col = cols.setdefault(x, [y, y, 0])
+            col[0], col[1] = min(col[0], y), max(col[1], y)
+            col[2] += 1
+    if not cols:
+        return None
+    # the marker is the RIGHTMOST connected ink run: braces/ornaments left
+    # of the list are separated from the dot by whitespace
+    xs = sorted(cols)
+    run = [xs[-1]]
+    for x in reversed(xs[:-1]):
+        if run[0] - x > 6:
+            break
+        run.insert(0, x)
+    bx, bx2 = run[0], run[-1]
+    by = min(cols[x][0] for x in run)
+    by2 = max(cols[x][1] for x in run)
+    count = sum(cols[x][2] for x in run)
+    if count < 3:
+        return None
+    dot_w, dot_h = bx2 - bx + 2, by2 - by + 2
+    if dot_w > 0.8 * h or dot_h > 0.8 * h or dot_w < 3 or dot_h < 3:
+        return None
+    # must be separated from the strip edges (edge contact = graphic bleed
+    # or the first glyph of the text itself)
+    if bx <= x1 + 2 or bx2 >= x2 - 3 or by <= y1 + 2 or by2 >= y2 - 3:
+        return None
+    if count * 4 / (dot_w * dot_h) < 0.15:  # sparse speckle, not a glyph
+        return None
+    center = (by + by2) / 2
+    if not (wy + 0.1 * h <= center <= wy2 - 0.1 * h):
+        return None
+    return bx
 
 
 def line_metrics(ln, px_per_pt):
@@ -406,55 +488,80 @@ def line_metrics(ln, px_per_pt):
 
 
 def assign_stretch(lines, px_per_pt):
-    """Fold continuation lines into their parent (single translated paragraph,
-    white-out of the orphan raster), then give all list lines on a page a
-    common right margin per left-x cluster and a common font size."""
-    alive = [ln for ln in lines if not ln.dead]
+    """Wire wrapped continuation lines to their parent line, infer bullet
+    markers the OCR missed from siblings, then give every list group on the
+    page a common right margin and font size per left-x cluster.
 
-    # continuations: a non-list line directly below a list line, with a
-    # vertical gap < 1.2 line heights and horizontal containment. Fold its
-    # text into the parent and paint its raster area white: BabelDOC's YOLO
-    # layout puts it in a separate region, which otherwise yields a stray
-    # one-word paragraph AND leaves the English visible.
+    Continuation lines stay where they are (one Tj each): BabelDOC's
+    ocr_workaround regroup pass re-merges each group into ONE paragraph that
+    wraps as a unit. The job here is consistent geometry only: group-uniform
+    size, marker prefixes, and a shared right edge for sibling items.
+    """
+    alive = sorted((ln for ln in lines if not ln.dead), key=lambda ln: ln.y)
+
+    # word-extent vertical bounds: tesseract's line boxes routinely bleed
+    # into the neighbouring line, word boxes don't
+    def wbounds(ln):
+        ws = ln.alive_words()
+        return min(w.y for w in ws), max(w.y2 for w in ws)
+
+    # continuations: the next line of a wrapped paragraph sits closer to its
+    # parent (<= one glyph height between ink extents) than a following
+    # separate block does, starts inside the parent's horizontal span, is
+    # not itself a list item, and matches the parent's size
     for ln in alive:
-        if ln.is_list or ln.dead:
+        if ln.is_list:
             continue
+        top, _ = wbounds(ln)
+        parent = best_bot = None
         for prev in alive:
-            if prev is ln or not prev.is_list or prev.dead:
+            if prev is ln:
                 continue
-            lh = max(prev.x_size, ln.x_size, 1)
-            if 0 <= ln.y - prev.y2 < 1.2 * lh and prev.x - 40 <= ln.x <= prev.x2:
-                pad = 0.15 * lh
-                prev.extra_text += " " + " ".join(w.text for w in ln.alive_words())
-                prev.whiteout.append(
-                    (ln.x - pad, ln.y - pad, ln.x2 + pad, ln.y2 + pad))
-                ln.dead = True
-                break
+            _, pbot = wbounds(prev)
+            if pbot > top:
+                continue
+            if best_bot is None or pbot > best_bot:
+                if prev.x - 40 <= ln.x <= prev.x2:
+                    parent, best_bot = prev, pbot
+        if parent is None:
+            continue
+        lh = max(parent.x_size, ln.x_size, 1)
+        if min(parent.x_size, ln.x_size) <= 0.6 * lh:
+            continue
+        if top - best_bot <= 1.0 * lh:
+            ln.group_root = parent.group_root or parent
 
-    # cluster surviving list lines by left x (within 25 pt)
+    def group_of(root):
+        return [root] + [ln for ln in alive if ln.group_root is root]
+
+    # cluster list-item group roots by their marker x (fallback: text left,
+    # within 25 pt), then give each cluster a shared right margin and one
+    # font size (groups included)
     tol = 25 * px_per_pt
     clusters = []
     for ln in alive:
-        if not ln.is_list or ln.dead:
+        if ln.group_root is not None or not ln.is_list:
             continue
-        left = min(w.x for w in ln.alive_words())
+        left = ln.marker_left if ln.marker_left is not None \
+            else min(w.x for w in ln.alive_words())
         placed = False
         for cl in clusters:
             if abs(cl["left"] - left) <= tol:
-                cl["lines"].append(ln)
+                cl["roots"].append(ln)
                 placed = True
                 break
         if not placed:
-            clusters.append({"left": left, "lines": [ln]})
+            clusters.append({"left": left, "roots": [ln]})
     for cl in clusters:
-        if len(cl["lines"]) < 2:
-            continue
-        right = max(max(w.x2 for w in ln.alive_words()) for ln in cl["lines"])
-        sizes = sorted(line_metrics(ln, px_per_pt)[3] for ln in cl["lines"])
+        members = [ln for r in cl["roots"] for ln in group_of(r)]
+        right = max(max(w.x2 for w in ln.alive_words()) for ln in members)
+        sizes = sorted(line_metrics(ln, px_per_pt)[3] for ln in members)
         med_size = sizes[len(sizes) // 2]
-        for ln in cl["lines"]:
-            ln.stretch_right = right
+        for ln in members:
             ln.size_override = med_size
+        if len(cl["roots"]) >= 2:
+            for r in cl["roots"]:
+                r.stretch_right = right
 
 
 def strip_existing_text(doc, page):
@@ -497,17 +604,15 @@ def build_page_ops(lines, page_h_pt, px_per_pt, font, visible=False):
         if ln.marker_left is not None:
             left = min(left, ln.marker_left)  # mask must cover the raster dot
         target_right = ln.stretch_right if ln.stretch_right else right
-        for wo in ln.whiteout:
-            x, y, x2, y2 = (v / px_per_pt for v in wo)
-            ops.append(
-                f"q 1 1 1 rg {x:.2f} {page_h_pt - y2:.2f} "
-                f"{x2 - x:.2f} {y2 - y:.2f} re f Q"
-            )
-        text = " ".join(w.text for w in ln.alive_words()) + ln.extra_text
+        text = " ".join(w.text for w in ln.alive_words())
         # keep latin-1 only (junk already stripped; be safe for Tj encoding)
         text = text.encode("latin-1", "ignore").decode("latin-1")
         if not text.strip():
             continue
+        if ln.is_list:
+            # re-emit the stripped marker: the translated RTL paragraph then
+            # carries its bullet (visually on the right)
+            text = "• " + text
         natural = font.text_length(text, fontsize=size_pt)
         if natural <= 0:
             continue
@@ -517,9 +622,11 @@ def build_page_ops(lines, page_h_pt, px_per_pt, font, visible=False):
         y_pt = page_h_pt - baseline / px_per_pt
         mode = 0 if visible else 3
         color = "1 0 0 rg " if visible else ""
+        # helv is WinAnsi-encoded: the bullet glyph lives at 0x95
+        payload = text.replace("•", "\x95")
         ops.append(
             f"BT {color}/helv {size_pt:.2f} Tf {mode} Tr "
-            f"{sx:.4f} 0 0 1 {x_pt:.2f} {y_pt:.2f} Tm ({esc_pdf(text)}) Tj ET"
+            f"{sx:.4f} 0 0 1 {x_pt:.2f} {y_pt:.2f} Tm ({esc_pdf(payload)}) Tj ET"
         )
     return "\n".join(ops)
 
