@@ -130,6 +130,13 @@ MULTI_SPACE_REGEX = regex.compile(r"[  ]{2,}")
 # left-to-right reading of the math snippet inside an RTL sentence.
 NEUTRAL_OPERATOR_CHARS = set("=<>+±×÷≈≠≤≥~∼*/-−")
 
+# Bracket pairs that attach to a Latin identifier: an opening bracket
+# immediately following a strong-LTR character (identifier or digit run)
+# belongs to that run — "myCircle.getArea()", "Clone()", "list[0]" must
+# travel as ONE left-to-right run, brackets staying on the identifier's
+# logical side instead of drifting to the RTL edge of the line.
+LTR_ATTACHED_BRACKET_PAIRS = {"(": ")", "[": "]", "{": "}"}
+
 # Characters replaced by their bidi-mirrored counterpart when they are part of
 # a right-to-left visual run.
 BIDI_MIRROR_MAP = {
@@ -2432,11 +2439,44 @@ class Typesetting:
         - a neutral operator (=, >, <, +, -, ...) directly preceding a digit
           run stays with it, so math snippets like "> 10" read left-to-right
           as one cluster;
+        - a bracket group whose opening bracket directly follows a strong-LTR
+          character is claimed by that LTR run ("getArea()", "list[0]"), so
+          edge brackets never migrate to the RTL side of the identifier;
         - any other neutral (RTL/LTR boundaries, line edges) takes the
           paragraph direction (RTL).
         """
         count = len(classes)
         resolved = list(classes)
+        # Pre-pass: bracket groups attached to a Latin identifier / digit run.
+        index_ = 0
+        while index_ < count:
+            open_ch = elements[index_].text
+            close_ch = LTR_ATTACHED_BRACKET_PAIRS.get(open_ch)
+            if close_ch is None or index_ == 0 or resolved[index_ - 1] != "L":
+                index_ += 1
+                continue
+            depth = 0
+            match_ = index_
+            while match_ < count:
+                text = elements[match_].text
+                if text == open_ch:
+                    depth += 1
+                elif text == close_ch:
+                    depth -= 1
+                    if depth == 0:
+                        break
+                match_ += 1
+            if match_ < count and all(
+                classes[k] != "R" for k in range(index_ + 1, match_)
+            ):
+                # The whole group (brackets and interior neutrals) joins the
+                # identifier's LTR run; interior strong-L stays L anyway.
+                for k in range(index_, match_ + 1):
+                    if resolved[k] == "N":
+                        resolved[k] = "L"
+                index_ = match_ + 1
+            else:
+                index_ += 1
         for i, cls in enumerate(classes):
             if cls != "N":
                 continue

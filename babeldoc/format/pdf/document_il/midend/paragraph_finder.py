@@ -36,6 +36,9 @@ from babeldoc.format.pdf.document_il.utils.layout_helper import (
     is_character_in_formula_layout,
 )
 from babeldoc.format.pdf.document_il.utils.layout_helper import is_text_layout
+from babeldoc.format.pdf.document_il.midend.styles_and_formulas import (
+    build_code_font_ids,
+)
 from babeldoc.format.pdf.document_il.utils.paragraph_helper import is_cid_paragraph
 from babeldoc.format.pdf.document_il.utils.style_helper import INDIGO
 from babeldoc.format.pdf.document_il.utils.style_helper import WHITE
@@ -487,6 +490,15 @@ class ParagraphFinder:
         if getattr(self.translation_config, "merge_alternating_line_numbers", True):
             self.merge_alternating_line_number_paragraphs(paragraphs)
 
+        # Wave 5b (digital decks): a bold label line, an indented monospace
+        # code line and an italic "e.g." line often share one layout box and
+        # would be translated as one blob and re-wrapped, scrambling the
+        # label -> code hierarchy. Keep style-distinct lines as separate
+        # paragraphs. The OCR path has its own regroup pass and a flat text
+        # layer without style structure, so this is digital-only.
+        if not self.translation_config.ocr_workaround:
+            self.split_style_boundary_paragraphs(page, paragraphs)
+
         # OCR sandwich pages: the injected text layer carries textual bullet
         # markers and clean per-line geometry. Split items apart at those
         # markers, then pull wrapped continuation lines back into their item
@@ -835,6 +847,131 @@ class ParagraphFinder:
             if 0 <= gap <= max(20.0, line_height * 1.5):
                 return True
         return False
+
+    # ------------------------------------------------------------------
+    # Style-boundary splitting (wave 5b, digital decks only): keep lines
+    # whose dominant style (font family / bold / italic / mono) differs
+    # from the previous line's as separate paragraphs, so a label line, a
+    # code line and a note line each typeset on their own line in the
+    # original vertical order instead of being merged into one wrapped
+    # (and, for RTL, scrambled) paragraph.
+    # ------------------------------------------------------------------
+
+    # A line's dominant font must cover at least this share of its
+    # non-space characters to count as "the" style of the line.
+    STYLE_SPLIT_DOMINANCE = 0.6
+    # Both-lines-mono threshold above which a style change is code-internal
+    # (bold keywords inside a code block) and must NOT split: the block has
+    # to stay whole for the verbatim code-passthrough to catch it.
+    STYLE_SPLIT_PURE_MONO = 0.9
+    # A line at least this mono-heavy marks a code context, where a leading
+    # styled run ("e.g.", a label) starts a new logical line.
+    STYLE_SPLIT_CODE_CONTEXT = 0.6
+
+    @staticmethod
+    def _line_style_signature(
+        line: PdfLine, code_font_ids: set
+    ) -> tuple[str | None, str | None, float] | None:
+        """(dominant_font_id | None, first_char_font_id, mono_ratio).
+
+        The dominant font is None when no single font reaches
+        STYLE_SPLIT_DOMINANCE. Returns None for lines without styled text.
+        """
+        counts: dict[str, int] = {}
+        total = 0
+        mono = 0
+        prefix_font: str | None = None
+        for char in line.pdf_character:
+            unicode_ = char.char_unicode
+            if unicode_ is None or unicode_.isspace():
+                continue
+            style = char.pdf_style
+            font_id = style.font_id if style else None
+            if font_id is None:
+                continue
+            if prefix_font is None:
+                prefix_font = font_id
+            counts[font_id] = counts.get(font_id, 0) + 1
+            total += 1
+            if font_id in code_font_ids:
+                mono += 1
+        if not total:
+            return None
+        dominant, count = max(counts.items(), key=lambda kv: kv[1])
+        if count / total < ParagraphFinder.STYLE_SPLIT_DOMINANCE:
+            dominant = None
+        return dominant, prefix_font, mono / total
+
+    @classmethod
+    def _is_style_boundary(cls, sig_a, sig_b) -> bool:
+        """Do consecutive lines a and b belong to different logical lines?"""
+        if sig_a is None or sig_b is None:
+            return False
+        dom_a, prefix_a, mono_a = sig_a
+        dom_b, prefix_b, mono_b = sig_b
+        if mono_a >= cls.STYLE_SPLIT_PURE_MONO and mono_b >= cls.STYLE_SPLIT_PURE_MONO:
+            # Solid code block (a bold keyword line is still code): keep it
+            # whole so the code-paragraph passthrough preserves it verbatim.
+            return False
+        if dom_a is not None and dom_b is not None and dom_a != dom_b:
+            # Bold label line vs monospace code line, italic vs regular ...
+            return True
+        if (
+            mono_a >= cls.STYLE_SPLIT_CODE_CONTEXT
+            or mono_b >= cls.STYLE_SPLIT_CODE_CONTEXT
+        ) and prefix_a != prefix_b:
+            # Code context: a leading styled run ("e.g.," before an inline
+            # snippet) starts a new logical line even when the dominant
+            # font matches the code line above.
+            return True
+        return False
+
+    def split_style_boundary_paragraphs(
+        self, page: Page, paragraphs: list[PdfParagraph]
+    ):
+        page_code_font_ids, xobj_code_font_ids = build_code_font_ids(page)
+        i = 0
+        while i < len(paragraphs):
+            paragraph = paragraphs[i]
+            comps = paragraph.pdf_paragraph_composition
+            if comps and len(comps) > 1:
+                code_font_ids = page_code_font_ids
+                if (
+                    paragraph.xobj_id is not None
+                    and paragraph.xobj_id in xobj_code_font_ids
+                ):
+                    code_font_ids = xobj_code_font_ids[paragraph.xobj_id]
+                split_at = None
+                prev_sig = None
+                for j, comp in enumerate(comps):
+                    line = comp.pdf_line
+                    if line is None:
+                        continue
+                    sig = self._line_style_signature(line, code_font_ids)
+                    if (
+                        j > 0
+                        and prev_sig is not None
+                        and self._is_style_boundary(prev_sig, sig)
+                    ):
+                        split_at = j
+                        break
+                    prev_sig = sig
+                if split_at is not None:
+                    new_paragraph = PdfParagraph(
+                        box=Box(0, 0, 0, 0),
+                        pdf_paragraph_composition=comps[split_at:],
+                        unicode="",
+                        debug_id=generate_base58_id(),
+                        layout_label=paragraph.layout_label,
+                        layout_id=paragraph.layout_id,
+                    )
+                    paragraph.pdf_paragraph_composition = comps[:split_at]
+                    self.update_paragraph_data(paragraph)
+                    self.update_paragraph_data(new_paragraph)
+                    paragraphs.insert(i + 1, new_paragraph)
+                    # The remainder is re-examined on the next iteration,
+                    # so chains of styled lines split one by one.
+            i += 1
 
     # ------------------------------------------------------------------
     # OCR-workaround regrouping (scanned slides with an injected hOCR text

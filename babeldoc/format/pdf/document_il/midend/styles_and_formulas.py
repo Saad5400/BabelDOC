@@ -71,6 +71,55 @@ CODE_SYNTAX_CHARS = frozenset(";{}=")
 CODE_PARAGRAPH_MIN_CHARS = 4
 
 
+def base_font_name(font_name: str | None) -> str:
+    """Return the lowercased base font name, decoding BASE64: names and
+    stripping any subset prefix (e.g. "ABCDEF+CourierNewPSMT")."""
+    if not font_name:
+        return ""
+    if font_name.startswith("BASE64:"):
+        try:
+            font_name_bytes = base64.b64decode(font_name[7:])
+            font_name = font_name_bytes.split(b"+")[-1].decode(
+                "utf-8", errors="ignore"
+            )
+        except Exception:
+            return ""
+    return font_name.split("+")[-1].lower()
+
+
+def is_code_font(font) -> bool:
+    """A font is a code font if the PDF fixed-pitch flag is set or its
+    name matches common monospace family names."""
+    if font is None:
+        return False
+    if getattr(font, "monospace", None):
+        return True
+    return bool(CODE_FONT_NAME_PATTERN.search(base_font_name(font.name)))
+
+
+def build_code_font_ids(page: Page) -> tuple[set, dict]:
+    """Collect font_ids of monospace fonts at page level and per XObject."""
+    page_code_font_ids = set()
+    if page.pdf_font:
+        for font in page.pdf_font:
+            if is_code_font(font):
+                page_code_font_ids.add(font.font_id)
+
+    xobj_code_font_ids = {}
+    if page.pdf_xobject:
+        for xobj in page.pdf_xobject:
+            current = page_code_font_ids.copy()
+            if xobj.pdf_font:
+                for font in xobj.pdf_font:
+                    if is_code_font(font):
+                        current.add(font.font_id)
+                    else:
+                        current.discard(font.font_id)
+            xobj_code_font_ids[xobj.xobj_id] = current
+
+    return page_code_font_ids, xobj_code_font_ids
+
+
 class StylesAndFormulas:
     stage_name = "Parse Formulas and Styles"
 
@@ -394,50 +443,13 @@ class StylesAndFormulas:
 
     @staticmethod
     def _base_font_name(font_name: str | None) -> str:
-        """Return the lowercased base font name, decoding BASE64: names and
-        stripping any subset prefix (e.g. "ABCDEF+CourierNewPSMT")."""
-        if not font_name:
-            return ""
-        if font_name.startswith("BASE64:"):
-            try:
-                font_name_bytes = base64.b64decode(font_name[7:])
-                font_name = font_name_bytes.split(b"+")[-1].decode(
-                    "utf-8", errors="ignore"
-                )
-            except Exception:
-                return ""
-        return font_name.split("+")[-1].lower()
+        return base_font_name(font_name)
 
     def _is_code_font(self, font) -> bool:
-        """A font is a code font if the PDF fixed-pitch flag is set or its
-        name matches common monospace family names."""
-        if font is None:
-            return False
-        if getattr(font, "monospace", None):
-            return True
-        return bool(CODE_FONT_NAME_PATTERN.search(self._base_font_name(font.name)))
+        return is_code_font(font)
 
     def _build_code_font_ids(self, page: Page) -> tuple[set, dict]:
-        """Collect font_ids of monospace fonts at page level and per XObject."""
-        page_code_font_ids = set()
-        if page.pdf_font:
-            for font in page.pdf_font:
-                if self._is_code_font(font):
-                    page_code_font_ids.add(font.font_id)
-
-        xobj_code_font_ids = {}
-        if page.pdf_xobject:
-            for xobj in page.pdf_xobject:
-                current = page_code_font_ids.copy()
-                if xobj.pdf_font:
-                    for font in xobj.pdf_font:
-                        if self._is_code_font(font):
-                            current.add(font.font_id)
-                        else:
-                            current.discard(font.font_id)
-                xobj_code_font_ids[xobj.xobj_id] = current
-
-        return page_code_font_ids, xobj_code_font_ids
+        return build_code_font_ids(page)
 
     def detect_code_paragraphs(self, page: Page):
         """Detect paragraphs dominated by a monospace font (source code) and
