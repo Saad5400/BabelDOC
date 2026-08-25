@@ -31,10 +31,16 @@ than `JOB_TTL_HOURS` are deleted on each submit.
   `fix_layer_order.py` (mono output only; a no-op safety net after `ocr_prep.py`).
 - **Formats**: `translated` = babeldoc mono; `alternating` and `side_by_side` =
   babeldoc's two native dual modes.
-- **Usage**: real token counters from the translator;
-  `cost_usd = prompt·PROMPT_USD_PER_1M/1e6 + completion·COMPLETION_USD_PER_1M/1e6 + pages·PAGE_OVERHEAD_USD`.
+- **Usage**: `cost_usd` is the **provider's own reported cost**, summed over
+  every call of the job (`usage: {include: true}` on each request; see
+  `server/cost.py`), never a locally computed figure. It is `null` when the
+  endpoint reported no cost at all — the caller treats that as "charge nothing,
+  log loudly", which is the right failure for money that cannot be
+  substantiated. `generation_ids` lets a finished job be reconciled against the
+  provider afterwards, and `priced_calls`/`calls` is the coverage of `cost_usd`,
+  so a partially-priced run reads as partial rather than as cheap.
   Note: babeldoc caches translations — resubmitting identical content reports
-  near-zero tokens (that is real spend, not a bug).
+  near-zero tokens and near-zero cost (that is real spend, not a bug).
 
 ## Environment
 
@@ -43,12 +49,9 @@ than `JOB_TTL_HOURS` are deleted on each submit.
 | `DOCTRANSLATE_TOKEN` | — (required) | Shared secret for `/v1` |
 | `OPENAI_API_KEY` | — (required) | LLM key (OpenRouter) |
 | `OPENAI_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible endpoint |
-| `OPENAI_MODEL` | `google/gemini-2.5-flash` | Translation model |
+| `OPENAI_MODEL` | `google/gemini-3.1-flash-lite` | Translation model |
 | `DATA_DIR` | `/data` | Job storage (volume) |
 | `JOB_TTL_HOURS` | `24` | Job retention |
-| `PROMPT_USD_PER_1M` | `0.30` | Pricing knob |
-| `COMPLETION_USD_PER_1M` | `2.50` | Pricing knob |
-| `PAGE_OVERHEAD_USD` | `0.001` | Per-page overhead in `cost_usd` |
 
 ## Run locally
 
