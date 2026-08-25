@@ -165,37 +165,59 @@ def _run_babeldoc(job_id: str, input_pdf: Path, out_dir: Path, *, lang_in: str,
 def _usage(translator) -> dict:
     """This job's REAL spend, as reported by the provider.
 
-    `cost_usd` is None when the endpoint reported no cost on any call. That is
-    deliberate: the caller (catodemy's RunDocumentTranslation) treats a missing
-    cost as "charge nothing, log loudly", which is the right failure for money
-    we cannot substantiate. The old behaviour — computing a plausible number
-    from a hardcoded rate table — turned that same situation into a silent,
-    unreconcilable charge on a user's balance.
+    Three outcomes, kept distinct because they mean different things to the
+    caller's money path:
 
-    `generation_ids` is what makes a finished job auditable against the
-    provider afterwards; `priced_calls`/`calls` is the coverage of `cost_usd`,
-    so a partially-priced run is visibly partial instead of quietly cheap.
+    - `calls == 0` — babeldoc served the whole document from its translation
+      cache, so no request was ever made and the run cost NOTHING. That is
+      certain knowledge, not missing information, so `cost_usd` is 0.0 with
+      `cost_source: "cache"`. Reporting null here (as this did at first) filed a
+      genuinely free run under the same signal as billing drift and logged a
+      warning for a completely normal event.
+    - some call reported a cost — `cost_usd` is the provider's own summed
+      figure, `cost_source: "provider"`. `priced_calls`/`calls` is its coverage,
+      so a partially-priced run is visibly partial rather than quietly cheap.
+    - calls were made but NONE reported a cost — genuinely unknown. `cost_usd`
+      is None and this is the one case that warrants a warning: the caller
+      (catodemy's RunDocumentTranslation) treats a missing cost as "charge
+      nothing, log loudly", which is the right failure for money we cannot
+      substantiate. The old behaviour — computing a plausible number from a
+      hardcoded rate table — turned that same situation into a silent,
+      unreconcilable charge on a user's balance.
+
+    `generation_ids` is what makes a finished job auditable against the provider
+    afterwards.
     """
     spend = translator.spend()
+    calls, priced = spend["calls"], spend["priced_calls"]
 
-    if spend["cost_usd"] is None:
+    if calls == 0:
+        # Fully cached: free, and known to be free.
+        cost_usd, source = 0.0, "cache"
+        logger.info("no provider calls (translation cache hit); this run was free")
+    elif priced == 0:
+        cost_usd, source = None, None
         logger.warning(
-            "no provider cost reported for any of %s call(s); usage.cost_usd is null",
-            spend["calls"],
+            "none of %s call(s) reported a cost; usage.cost_usd is null and "
+            "the caller will not charge for this run",
+            calls,
         )
-    elif spend["priced_calls"] != spend["calls"]:
-        logger.warning(
-            "only %s of %s call(s) reported a cost; usage.cost_usd understates the run",
-            spend["priced_calls"], spend["calls"],
-        )
+    else:
+        cost_usd, source = spend["cost_usd"], "provider"
+
+        if priced != calls:
+            logger.warning(
+                "only %s of %s call(s) reported a cost; usage.cost_usd understates the run",
+                priced, calls,
+            )
 
     return {
         "prompt_tokens": int(translator.prompt_token_count.value),
         "completion_tokens": int(translator.completion_token_count.value),
-        "cost_usd": spend["cost_usd"],
-        "cost_source": "provider" if spend["cost_usd"] is not None else None,
-        "calls": spend["calls"],
-        "priced_calls": spend["priced_calls"],
+        "cost_usd": cost_usd,
+        "cost_source": source,
+        "calls": calls,
+        "priced_calls": priced,
         "generation_ids": spend["generation_ids"],
     }
 
