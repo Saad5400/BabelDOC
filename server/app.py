@@ -8,9 +8,9 @@ import subprocess
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 
-from server import config, jobs
+from server import compose, config, jobs
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
@@ -79,6 +79,39 @@ async def create_job(
                           lang_in=lang_in, lang_out=lang_out, fmt=format,
                           title=title)
     return {"job_id": job["job_id"], "status": job["status"]}
+
+
+@app.post("/v1/compose", dependencies=[Depends(require_token)])
+async def compose_dual(
+    original: UploadFile = File(...),
+    translated: UploadFile = File(...),
+    format: str = Form(...),
+):
+    """Stateless dual builder: original + translated (mono) in, dual PDF out."""
+    if format not in compose.COMPOSE_FORMATS:
+        raise HTTPException(status_code=422,
+                            detail=f"format must be one of {compose.COMPOSE_FORMATS}")
+    parts = {"original": await original.read(),
+             "translated": await translated.read()}
+    for name, pdf_bytes in parts.items():
+        if len(pdf_bytes) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"{name} too large")
+        if not pdf_bytes.startswith(b"%PDF-"):
+            raise HTTPException(status_code=422, detail=f"{name} is not a PDF")
+
+    try:
+        result = compose.compose_dual(parts["original"], parts["translated"],
+                                      format)
+    except compose.ComposeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    stem = (original.filename or "document.pdf").rsplit(".", 1)[0]
+    if not stem.isascii() or '"' in stem:  # raw header value must stay latin-1
+        stem = "document"
+    return Response(
+        content=result, media_type="application/pdf",
+        headers={"Content-Disposition":
+                 f'attachment; filename="{stem}.{format}.pdf"'})
 
 
 def _get_job_or_404(job_id: str) -> dict:
