@@ -4,13 +4,14 @@ Run: uvicorn server.app:app --host 0.0.0.0 --port 8000
 """
 
 import hmac
+import shutil
 import subprocess
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 
-from server import compose, config, jobs
+from server import compose, config, convert, jobs
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
@@ -50,6 +51,11 @@ def healthz():
         "babeldoc": babeldoc_version,
         "tesseract": _cmd_version(["tesseract", "--version"]),
         "ocrmypdf": _cmd_version(["ocrmypdf", "--version"]),
+        # Presence, not `--version`: soffice builds its user profile on the
+        # first run, which can outlast a health check's patience — and a slow
+        # answer here would report the whole engine degraded over a binary the
+        # translation path does not even use.
+        "libreoffice": shutil.which("soffice") or "missing",
     }
     ok = all(v != "missing" for v in versions.values())
     return JSONResponse(status_code=200 if ok else 503,
@@ -112,6 +118,42 @@ async def compose_dual(
         content=result, media_type="application/pdf",
         headers={"Content-Disposition":
                  f'attachment; filename="{stem}.{format}.pdf"'})
+
+
+@app.post("/v1/convert", dependencies=[Depends(require_token)])
+async def convert_to_pdf(file: UploadFile = File(...)):
+    """Stateless normaliser: an office document in, its PDF rendering out.
+
+    The translation pipeline is PDF-only, and so is the dual-format compose
+    that pairs an original with its translation — so a .pptx has to become a
+    PDF before anything else can touch it. The caller keeps what comes back and
+    uses it as the original from that point on.
+    """
+    filename = file.filename or "document"
+
+    if not convert.is_convertible(filename):
+        raise HTTPException(
+            status_code=422,
+            detail=f"cannot convert this file type; supported: "
+                   f"{', '.join(convert.CONVERTIBLE_EXTENSIONS)}")
+
+    data = await file.read()
+
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="file too large")
+
+    try:
+        pdf_bytes = convert.office_to_pdf(data, filename)
+    except convert.ConvertError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    stem = filename.rsplit(".", 1)[0]
+    if not stem.isascii() or '"' in stem:  # raw header value must stay latin-1
+        stem = "document"
+
+    return Response(
+        content=pdf_bytes, media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{stem}.pdf"'})
 
 
 def _get_job_or_404(job_id: str) -> dict:
