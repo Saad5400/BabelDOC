@@ -94,15 +94,17 @@ def _run_babeldoc(job_id: str, input_pdf: Path, out_dir: Path, *, lang_in: str,
         WatermarkOutputMode,
     )
     from babeldoc.glossary import Glossary
-    from babeldoc.translator.translator import (
-        OpenAITranslator,
-        set_translate_rate_limiter,
-    )
+    from babeldoc.translator.translator import set_translate_rate_limiter
+
+    from server.cost import CostTrackingTranslator
 
     if not config.OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is not configured")
 
-    translator = OpenAITranslator(
+    # CostTrackingTranslator is a plain OpenAITranslator that also asks the
+    # provider what each call cost, so the job's usage is the provider's own
+    # figure rather than a locally computed one.
+    translator = CostTrackingTranslator(
         lang_in=lang_in,
         lang_out=lang_out,
         model=config.OPENAI_MODEL,
@@ -160,16 +162,41 @@ def _run_babeldoc(job_id: str, input_pdf: Path, out_dir: Path, *, lang_in: str,
     return result_holder["result"], translator
 
 
-def _usage(translator, pages: int) -> dict:
-    prompt = int(translator.prompt_token_count.value)
-    completion = int(translator.completion_token_count.value)
-    cost = (prompt * config.PROMPT_USD_PER_1M / 1e6
-            + completion * config.COMPLETION_USD_PER_1M / 1e6
-            + pages * config.PAGE_OVERHEAD_USD)
+def _usage(translator) -> dict:
+    """This job's REAL spend, as reported by the provider.
+
+    `cost_usd` is None when the endpoint reported no cost on any call. That is
+    deliberate: the caller (catodemy's RunDocumentTranslation) treats a missing
+    cost as "charge nothing, log loudly", which is the right failure for money
+    we cannot substantiate. The old behaviour — computing a plausible number
+    from a hardcoded rate table — turned that same situation into a silent,
+    unreconcilable charge on a user's balance.
+
+    `generation_ids` is what makes a finished job auditable against the
+    provider afterwards; `priced_calls`/`calls` is the coverage of `cost_usd`,
+    so a partially-priced run is visibly partial instead of quietly cheap.
+    """
+    spend = translator.spend()
+
+    if spend["cost_usd"] is None:
+        logger.warning(
+            "no provider cost reported for any of %s call(s); usage.cost_usd is null",
+            spend["calls"],
+        )
+    elif spend["priced_calls"] != spend["calls"]:
+        logger.warning(
+            "only %s of %s call(s) reported a cost; usage.cost_usd understates the run",
+            spend["priced_calls"], spend["calls"],
+        )
+
     return {
-        "prompt_tokens": prompt,
-        "completion_tokens": completion,
-        "cost_usd": round(cost, 6),
+        "prompt_tokens": int(translator.prompt_token_count.value),
+        "completion_tokens": int(translator.completion_token_count.value),
+        "cost_usd": spend["cost_usd"],
+        "cost_source": "provider" if spend["cost_usd"] is not None else None,
+        "calls": spend["calls"],
+        "priced_calls": spend["priced_calls"],
+        "generation_ids": spend["generation_ids"],
     }
 
 
@@ -247,7 +274,7 @@ def run_job(job_id: str) -> None:
     if job.get("title"):
         _set_pdf_title(output_pdf, job["title"])
 
-    usage = _usage(translator, pages)
+    usage = _usage(translator)
     shutil.rmtree(work, ignore_errors=True)
     jobs.update_job(job_id, status="done", usage=usage,
                     progress={"percent": 100.0, "stage": "done"})
