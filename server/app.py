@@ -3,6 +3,7 @@
 Run: uvicorn server.app:app --host 0.0.0.0 --port 8000
 """
 
+import dataclasses
 import hmac
 import json
 import shutil
@@ -141,11 +142,15 @@ async def overlay(
     original: UploadFile = File(...),
     sidecar: UploadFile = File(...),
     style: str = Form("interlinear"),
-    scale: float = Form(interlinear.OverlayOptions.scale),
-    min_font_size: float = Form(interlinear.OverlayOptions.min_font_size),
-    max_font_size: float = Form(interlinear.OverlayOptions.max_font_size),
-    color: str = Form(interlinear.OverlayOptions.color),
-    align: str = Form(interlinear.OverlayOptions.align),
+    # Unset means "whatever this style is tuned for" — the two layouts want
+    # different type sizes and clearances (interlinear.OverlayOptions.defaults),
+    # so a shared literal default here would quietly impose one on the other.
+    scale: float | None = Form(None),
+    min_font_size: float | None = Form(None),
+    max_font_size: float | None = Form(None),
+    gap: float | None = Form(None),
+    color: str | None = Form(None),
+    align: str | None = Form(None),
 ):
     """Stateless layout builder for the layouts that need the translated TEXT.
 
@@ -176,9 +181,13 @@ async def overlay(
                             detail=f"sidecar is not valid JSON: {exc}") from exc
 
     try:
-        options = interlinear.OverlayOptions(
-            scale=scale, min_font_size=min_font_size, max_font_size=max_font_size,
-            color=color, align=align)
+        options = dataclasses.replace(
+            interlinear.OverlayOptions.defaults(style),
+            **{key: value for key, value in
+               (("scale", scale), ("min_font_size", min_font_size),
+                ("max_font_size", max_font_size), ("gap", gap),
+                ("color", color), ("align", align))
+               if value is not None})
         result, report = interlinear.render_overlay(original_bytes, parsed,
                                                     style=style, options=options)
     except interlinear.OverlayError as exc:
