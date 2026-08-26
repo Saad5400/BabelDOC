@@ -12,7 +12,11 @@ wrapper included, is public).
 | `POST` | `/v1/jobs` | token | Submit a PDF. Multipart: `file` (pdf, ≤100 MB); fields `lang_in` (default `en`), `lang_out` (default `ar`), `format` = `translated` \| `alternating` \| `side_by_side` (default `translated`), optional `title` (stamped into the result's PDF metadata). Returns `202 {"job_id", "status": "queued"}`. |
 | `GET` | `/v1/jobs/{id}` | token | `{"status": "queued|running|done|failed", "progress": {"percent", "stage"}, "pages", "format", "usage": {...} (when done), "error" (when failed)}` |
 | `GET` | `/v1/jobs/{id}/result` | token | The output PDF (`409` until `done`). |
-| `GET` | `/healthz` | open | `200 {"status":"ok","versions":{babeldoc,tesseract,ocrmypdf}}`; `503 degraded` if a binary is missing. Deploy health check. |
+| `GET` | `/v1/jobs/{id}/sidecar` | token | The run's **translation sidecar** — its translated text as data (`409` until `done`, `404` when the run produced none). See below. |
+| `POST` | `/v1/compose` | token | Stateless dual builder. Multipart `original` + `translated` PDFs, field `format` = `alternating` \| `side_by_side`. Returns the composed PDF. Pure page shuffling — no LLM, no job, no charge. |
+| `POST` | `/v1/overlay` | token | Stateless **overlay** builder. Multipart `original` PDF + `sidecar` JSON, field `style` = `interlinear`, optional `scale`, `min_font_size`, `max_font_size`, `color` (hex), `align`. Returns the overlaid PDF plus `X-Overlay-Pages` / `X-Overlay-Drawn` / `X-Overlay-Skipped`. No LLM, no job, no charge. |
+| `POST` | `/v1/convert` | token | Stateless office-to-PDF normaliser (LibreOffice). Multipart `file` (docx/pptx/…). Returns the PDF. |
+| `GET` | `/healthz` | open | `200 {"status":"ok","versions":{babeldoc,tesseract,ocrmypdf,libreoffice}}`; `503 degraded` if a binary is missing. Deploy health check. |
 
 Auth: header `X-Internal-Token` must equal env `DOCTRANSLATE_TOKEN`
 (`401` otherwise; `503` if the env is unset — the service refuses to run open).
@@ -41,6 +45,33 @@ than `JOB_TTL_HOURS` are deleted on each submit.
   so a partially-priced run reads as partial rather than as cheap.
   Note: babeldoc caches translations — resubmitting identical content reports
   near-zero tokens and near-zero cost (that is real spend, not a bug).
+
+## One translation, many layouts
+
+A translation costs money; a layout does not. Two of the three ways to rebuild a
+layout after the fact are already here — `/v1/compose` shuffles pages, and
+`/v1/overlay` needs to know what the translation actually *says*, which is what
+the sidecar is for.
+
+- **Sidecar** (`babeldoc/format/pdf/document_il/midend/translation_sidecar.py`):
+  every **mono** run writes `DATA_DIR/jobs/{id}/sidecar.json` — per page, the
+  page frame; per paragraph, its box in the ORIGINAL page, its source text, its
+  own source LINE boxes, the translation, and the source font size. It is
+  captured in the one window where all of that is true at once: after
+  `ILTranslator` (which overwrites the source text in place) and before
+  `Typesetting` (which starts moving the boxes). Coordinates are unrotated PDF
+  user space, so they map straight onto the untouched original.
+  Fetch it with the result and keep it: it is what makes every later layout
+  free. Native dual runs write none (their geometry is the dual page's).
+- **`interlinear`** (`server/interlinear.py`): the original page untouched, with
+  each paragraph's translation drawn small in the whitespace directly above it.
+  Sized to the band it is given, spread down the paragraph's own source lines
+  when one band cannot hold it legibly (which is what makes a slide's merged
+  bullet list work), and SKIPPED rather than drawn over the reader's document
+  when there is no room — `X-Overlay-Skipped` reports how often that happened.
+  Arabic is shaped and bidi-resolved by PyMuPDF's Story engine; the gloss font
+  is BabelDOC's own, subset per document (a deck would otherwise carry one
+  15 MB font copy per gloss).
 
 ## Environment
 

@@ -217,11 +217,21 @@ class TranslationConfig:
         metadata_extra_data: str | None = None,
         term_pool_max_workers: int | None = None,
         disable_same_text_fallback: bool = False,
+        # The translation SIDECAR (fork): where to write this run's
+        # translated text as data, so later layouts can be rebuilt from
+        # it without paying for the translation again. None = don't.
+        # Single-part runs only: a SPLIT run writes none, because its
+        # parts would overwrite one file with part-local page numbers.
+        # See document_il/midend/translation_sidecar.py.
+        translation_sidecar_path: str | Path | None = None,
     ):
         self.translator = translator
         self.term_extraction_translator = term_extraction_translator or translator
         initial_user_glossaries = list(glossaries) if glossaries else []
 
+        self.translation_sidecar_path = (
+            Path(translation_sidecar_path) if translation_sidecar_path else None
+        )
         self.input_file = input_file
         self.lang_in = lang_in
         self.lang_out = lang_out

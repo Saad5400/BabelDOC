@@ -4,6 +4,7 @@ Run: uvicorn server.app:app --host 0.0.0.0 --port 8000
 """
 
 import hmac
+import json
 import shutil
 import subprocess
 from contextlib import asynccontextmanager
@@ -11,7 +12,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 
-from server import compose, config, convert, jobs
+from server import compose, config, convert, interlinear, jobs
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
@@ -87,6 +88,26 @@ async def create_job(
     return {"job_id": job["job_id"], "status": job["status"]}
 
 
+def _pdf_attachment(filename: str | None, suffix: str = "") -> dict[str, str]:
+    """The `Content-Disposition` for a PDF built out of `filename`.
+
+    Shared by the three stateless builders, which differ only in what they add
+    to the stem. The header value is written raw, so it has to stay latin-1: a
+    stem that is not plain ASCII (or that carries a quote of its own) is
+    REPLACED rather than escaped. Nothing depends on it — every caller stores
+    the bytes under its own name — so this only decides what a browser save or
+    a curl would call the file.
+    """
+    stem = (filename or "document.pdf").rsplit(".", 1)[0]
+
+    if not stem.isascii() or '"' in stem:
+        stem = "document"
+
+    name = ".".join(part for part in (stem, suffix, "pdf") if part)
+
+    return {"Content-Disposition": f'attachment; filename="{name}"'}
+
+
 @app.post("/v1/compose", dependencies=[Depends(require_token)])
 async def compose_dual(
     original: UploadFile = File(...),
@@ -111,13 +132,69 @@ async def compose_dual(
     except compose.ComposeError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    stem = (original.filename or "document.pdf").rsplit(".", 1)[0]
-    if not stem.isascii() or '"' in stem:  # raw header value must stay latin-1
-        stem = "document"
+    return Response(content=result, media_type="application/pdf",
+                    headers=_pdf_attachment(original.filename, format))
+
+
+@app.post("/v1/overlay", dependencies=[Depends(require_token)])
+async def overlay(
+    original: UploadFile = File(...),
+    sidecar: UploadFile = File(...),
+    style: str = Form("interlinear"),
+    scale: float = Form(interlinear.OverlayOptions.scale),
+    min_font_size: float = Form(interlinear.OverlayOptions.min_font_size),
+    max_font_size: float = Form(interlinear.OverlayOptions.max_font_size),
+    color: str = Form(interlinear.OverlayOptions.color),
+    align: str = Form(interlinear.OverlayOptions.align),
+):
+    """Stateless layout builder for the layouts that need the translated TEXT.
+
+    /v1/compose rebuilds the duals by shuffling two finished PDFs; this rebuilds
+    the ones that have to know what each paragraph says and where it belongs,
+    from the run's sidecar. Like compose, it is stateless, LLM-free and
+    therefore free: one paid translation, any number of layouts.
+    """
+    if style not in interlinear.OVERLAY_STYLES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"style must be one of {interlinear.OVERLAY_STYLES}")
+
+    original_bytes = await original.read()
+    sidecar_bytes = await sidecar.read()
+
+    for name, data in (("original", original_bytes), ("sidecar", sidecar_bytes)):
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"{name} too large")
+
+    if not original_bytes.startswith(b"%PDF-"):
+        raise HTTPException(status_code=422, detail="original is not a PDF")
+
+    try:
+        parsed = json.loads(sidecar_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=422,
+                            detail=f"sidecar is not valid JSON: {exc}") from exc
+
+    try:
+        options = interlinear.OverlayOptions(
+            scale=scale, min_font_size=min_font_size, max_font_size=max_font_size,
+            color=color, align=align)
+        result, report = interlinear.render_overlay(original_bytes, parsed,
+                                                    style=style, options=options)
+    except interlinear.OverlayError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     return Response(
         content=result, media_type="application/pdf",
-        headers={"Content-Disposition":
-                 f'attachment; filename="{stem}.{format}.pdf"'})
+        headers={
+            **_pdf_attachment(original.filename, style),
+            # The fit is not all-or-nothing: a caller that sees most of a
+            # document skipped knows the layout did not suit it, instead of
+            # shipping a near-empty overlay as a success.
+            "X-Overlay-Pages": str(report["pages"]),
+            "X-Overlay-Drawn": str(report["drawn"]),
+            "X-Overlay-Skipped": str(report["skipped"]),
+        })
 
 
 @app.post("/v1/convert", dependencies=[Depends(require_token)])
@@ -147,13 +224,8 @@ async def convert_to_pdf(file: UploadFile = File(...)):
     except convert.ConvertError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    stem = filename.rsplit(".", 1)[0]
-    if not stem.isascii() or '"' in stem:  # raw header value must stay latin-1
-        stem = "document"
-
-    return Response(
-        content=pdf_bytes, media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{stem}.pdf"'})
+    return Response(content=pdf_bytes, media_type="application/pdf",
+                    headers=_pdf_attachment(filename))
 
 
 def _get_job_or_404(job_id: str) -> dict:
@@ -178,6 +250,27 @@ def get_job(job_id: str):
     if job["status"] == "failed":
         body["error"] = job["error"]
     return body
+
+
+@app.get("/v1/jobs/{job_id}/sidecar", dependencies=[Depends(require_token)])
+def get_sidecar(job_id: str):
+    """The run's translated text as data — the input to /v1/overlay.
+
+    404 rather than an empty document when a run produced none (a native dual
+    run, or one from before sidecars existed): the caller has to be able to
+    tell "no sidecar" from "a sidecar with nothing in it", because only the
+    first means the layouts built from it are simply unavailable for this run.
+    """
+    job = _get_job_or_404(job_id)
+    if job["status"] != "done":
+        raise HTTPException(status_code=409,
+                            detail=f"job is {job['status']}, not done")
+    path = jobs.sidecar_path(job_id)
+    if not path.is_file():
+        raise HTTPException(status_code=404,
+                            detail="this run produced no translation sidecar")
+    return FileResponse(path, media_type="application/json",
+                        filename=f"{job_id}.sidecar.json")
 
 
 @app.get("/v1/jobs/{job_id}/result", dependencies=[Depends(require_token)])

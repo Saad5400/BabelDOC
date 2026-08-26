@@ -9,10 +9,9 @@ the path explicitly):
 from io import BytesIO
 
 import pytest
-from fastapi.testclient import TestClient
 from pypdf import PdfReader, PdfWriter
 
-TOKEN = "test-token"
+from server.conftest import TOKEN
 
 # Distinguishable page sizes (points).
 LETTER = (612.0, 792.0)   # original: 3 pages
@@ -62,20 +61,6 @@ def original_pdf() -> bytes:
 @pytest.fixture(scope="module")
 def translated_pdf() -> bytes:
     return _pdf([A4] * 2)
-
-
-@pytest.fixture()
-def client(monkeypatch, tmp_path):
-    from server import app as app_module
-    from server import config
-
-    monkeypatch.setattr(config, "DOCTRANSLATE_TOKEN", TOKEN)
-    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
-    # The compose endpoint is stateless; keep the job worker (and its heavy
-    # babeldoc import) out of these tests.
-    monkeypatch.setattr(app_module.jobs, "start_worker", lambda: None)
-    with TestClient(app_module.app) as c:
-        yield c
 
 
 def _post(client, original, translated, fmt, token=TOKEN):
