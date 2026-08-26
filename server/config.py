@@ -35,3 +35,9 @@ OCR_PREP_SCRIPT = SERVER_DIR / "ocr_prep.py"
 FIX_LAYER_ORDER_SCRIPT = SERVER_DIR / "fix_layer_order.py"
 
 VALID_FORMATS = ("translated", "alternating", "side_by_side")
+
+# Every mono run also emits a translation SIDECAR (its translated text as
+# data), from which layouts that need to know what the translation SAYS are
+# rebuilt later for free — see server/interlinear.py. Off for native dual
+# runs, whose IL boxes are the dual page's, not the original's.
+SIDECAR_FORMATS = ("translated",)

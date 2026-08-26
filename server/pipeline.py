@@ -5,6 +5,9 @@ Scanned PDFs / garbage text layers:
     ocrmypdf --force-ocr -l eng  ->  ocr_prep.py  ->  babeldoc
     (--skip-scanned-detection --ocr-workaround)  ->  fix_layer_order.py
 Formats: translated (mono), alternating / side_by_side (babeldoc native dual).
+A mono run also emits a translation sidecar (jobs.sidecar_path) — the
+translated text as data, which /v1/overlay turns into further layouts
+without paying for the translation twice.
 """
 
 import asyncio
@@ -86,7 +89,8 @@ def _run_cmd(argv: list[str], job_id: str, stage: str) -> None:
 
 
 def _run_babeldoc(job_id: str, input_pdf: Path, out_dir: Path, *, lang_in: str,
-                  lang_out: str, fmt: str, scanned: bool, progress_base: float):
+                  lang_out: str, fmt: str, scanned: bool, progress_base: float,
+                  sidecar_path: Path | None = None):
     """Run the fork through its Python API; returns (TranslateResult, translator)."""
     from babeldoc.format.pdf.high_level import async_translate
     from babeldoc.format.pdf.translation_config import (
@@ -134,6 +138,7 @@ def _run_babeldoc(job_id: str, input_pdf: Path, out_dir: Path, *, lang_in: str,
         ocr_workaround=scanned,
         glossaries=glossaries,
         auto_extract_glossary=False,
+        translation_sidecar_path=sidecar_path,
     )
 
     span = _P_BABELDOC_END - progress_base
@@ -271,9 +276,18 @@ def run_job(job_id: str) -> None:
     else:
         progress_base = _P_DETECT
 
+    # The sidecar rides along with mono runs (SIDECAR_FORMATS): the run that is
+    # already being paid for is the only place the translated text and the
+    # ORIGINAL page's geometry are both in hand, and writing them down is what
+    # lets later layouts (server/interlinear.py) be rebuilt for free instead of
+    # re-translating. It is written straight into the job dir so it survives
+    # the work-dir cleanup below and can be fetched like the result.
+    sidecar = jobs.sidecar_path(job_id) if fmt in config.SIDECAR_FORMATS else None
+
     result, translator = _run_babeldoc(
         job_id, babeldoc_input, out_dir, lang_in=lang_in, lang_out=lang_out,
-        fmt=fmt, scanned=scanned, progress_base=progress_base)
+        fmt=fmt, scanned=scanned, progress_base=progress_base,
+        sidecar_path=sidecar)
 
     _set_progress(job_id, _P_BABELDOC_END, "finalizing")
     if fmt == "translated":

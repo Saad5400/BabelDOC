@@ -29,6 +29,7 @@ from babeldoc.format.pdf.document_il.backend.pdf_creater import SAVE_PDF_STAGE_N
 from babeldoc.format.pdf.document_il.backend.pdf_creater import SUBSET_FONT_STAGE_NAME
 from babeldoc.format.pdf.document_il.backend.pdf_creater import PDFCreater
 from babeldoc.format.pdf.document_il.backend.pdf_creater import reproduce_cmap
+from babeldoc.format.pdf.document_il.midend import translation_sidecar
 from babeldoc.format.pdf.document_il.midend.add_debug_information import (
     AddDebugInformation,
 )
@@ -576,6 +577,16 @@ def do_translate(
                                 # Create a copy of config for this part
                                 part_config = copy.copy(translation_config)
                                 part_config.skip_clean = True
+                                # No sidecar per part: every part would write
+                                # the SAME file with its OWN page numbers
+                                # (0-based within the part), so what survived
+                                # would describe the last part while claiming
+                                # to describe the document — and a renderer
+                                # would draw that part's text over the wrong
+                                # pages. A split run offers NO sidecar rather
+                                # than a wrong one; absence is an ordinary
+                                # answer to its readers.
+                                part_config.translation_sidecar_path = None
                                 should_translate_pages = []
                                 for page in range(
                                     split_point.start_page, split_point.end_page + 1
@@ -994,6 +1005,14 @@ def _do_translate_single(
             docs
         )
 
+    # The SOURCE text, before ILTranslator overwrites paragraph.unicode with
+    # the translation in place. Only collected when a sidecar was asked for.
+    sidecar_sources = (
+        translation_sidecar.snapshot_source(docs)
+        if translation_config.translation_sidecar_path
+        else None
+    )
+
     if not translation_config.skip_translation:
         if support_llm_translate:
             il_translator = ILTranslatorLLMOnly(translate_engine, translation_config)
@@ -1005,6 +1024,19 @@ def _do_translate_single(
         logger.debug(f"finish ILTranslator from {temp_pdf_path}")
     else:
         logger.info("skip ILTranslator")
+
+    # THE window: paragraph.unicode is now the translation, and paragraph.box
+    # is still the box in the ORIGINAL page — Typesetting below starts moving
+    # and growing both. Writing the sidecar anywhere else would capture a
+    # layout for text that no longer matches it.
+    if translation_config.translation_sidecar_path:
+        translation_sidecar.write_sidecar(
+            docs,
+            translation_config.translation_sidecar_path,
+            lang_in=translation_config.lang_in,
+            lang_out=translation_config.lang_out,
+            sources=sidecar_sources,
+        )
 
     if translation_config.debug:
         xml_converter.write_json(

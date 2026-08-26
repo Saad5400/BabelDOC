@@ -15,12 +15,10 @@ import zipfile
 from io import BytesIO
 
 import pytest
-from fastapi.testclient import TestClient
 from pypdf import PdfReader
 
 from server import convert
-
-TOKEN = "test-token"
+from server.conftest import TOKEN
 
 needs_soffice = pytest.mark.skipif(
     shutil.which("soffice") is None and shutil.which("libreoffice") is None,
@@ -86,20 +84,6 @@ def _pptx(slide_text: str) -> bytes:
         archive.writestr("ppt/_rels/presentation.xml.rels", pres_rels)
         archive.writestr("ppt/slides/slide1.xml", slide)
     return buffer.getvalue()
-
-
-@pytest.fixture()
-def client(monkeypatch, tmp_path):
-    from server import app as app_module
-    from server import config
-
-    monkeypatch.setattr(config, "DOCTRANSLATE_TOKEN", TOKEN)
-    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
-    # /v1/convert is stateless; keep the job worker (and its heavy babeldoc
-    # import) out of these tests.
-    monkeypatch.setattr(app_module.jobs, "start_worker", lambda: None)
-    with TestClient(app_module.app) as c:
-        yield c
 
 
 def test_extension_gate_rejects_what_it_cannot_open():

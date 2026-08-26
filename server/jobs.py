@@ -90,6 +90,15 @@ def result_path(job_id: str) -> Path:
     return job_dir(job_id) / "output.pdf"
 
 
+def sidecar_path(job_id: str) -> Path:
+    """The run's translation sidecar — its translated text as data.
+
+    Lives beside the result and dies with it on the same TTL sweep: the caller
+    is expected to take a durable copy, exactly as it does with the PDF.
+    """
+    return job_dir(job_id) / "sidecar.json"
+
+
 def cleanup_expired() -> int:
     """Delete job dirs older than JOB_TTL_HOURS. Never touches the running job."""
     cutoff = time.time() - config.JOB_TTL_HOURS * 3600

@@ -3,3 +3,6 @@ uvicorn>=0.30
 python-multipart>=0.0.9
 ocrmypdf>=16.0
 pypdf>=4.0
+# Subsets the 15 MB gloss font down to the glyphs one overlay actually uses
+# (server/interlinear.py) — without it an interlinear PDF is ~100x its size.
+fonttools>=4.50
