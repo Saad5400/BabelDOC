@@ -13,7 +13,7 @@ wrapper included, is public).
 | `GET` | `/v1/jobs/{id}` | token | `{"status": "queued|running|done|failed", "progress": {"percent", "stage"}, "pages", "format", "usage": {...} (when done), "error" (when failed)}` |
 | `GET` | `/v1/jobs/{id}/result` | token | The output PDF (`409` until `done`). |
 | `GET` | `/v1/jobs/{id}/sidecar` | token | The run's **translation sidecar** — its translated text as data (`409` until `done`, `404` when the run produced none). See below. |
-| `POST` | `/v1/compose` | token | Stateless dual builder. Multipart `original` + `translated` PDFs, field `format` = `alternating` \| `side_by_side`. Returns the composed PDF. Pure page shuffling — no LLM, no job, no charge. |
+| `POST` | `/v1/compose` | token | Stateless dual builder. Multipart `original` + `translated` PDFs, field `format` = `alternating` \| `side_by_side`, optional `sidecar` JSON (see **Vocab pages**). Returns the composed PDF. Pure page shuffling (plus the vocab render when the sidecar carries one) — no LLM, no job, no charge. |
 | `POST` | `/v1/overlay` | token | Stateless **overlay** builder. Multipart `original` PDF + `sidecar` JSON, field `style` = `interlinear` \| `interlinear_compact`, optional `scale`, `min_font_size`, `max_font_size`, `gap`, `color` (hex), `align`, `plate_color` (hex), `plate_opacity`, `plate_padding` (each defaults to the tuning of the style asked for). Returns the overlaid PDF plus `X-Overlay-Pages` / `X-Overlay-Drawn` / `X-Overlay-Skipped` (and `X-Overlay-Raster-Drawn` / `X-Overlay-Raster-Skipped` for glosses inside embedded images). No LLM, no job, no charge. |
 | `POST` | `/v1/convert` | token | Stateless office-to-PDF normaliser (LibreOffice). Multipart `file` (docx/pptx/…). Returns the PDF. |
 | `GET` | `/healthz` | open | `200 {"status":"ok","versions":{babeldoc,tesseract,ocrmypdf,libreoffice}}`; `503 degraded` if a binary is missing. Deploy health check. |
@@ -96,6 +96,51 @@ the sidecar is for.
   comes back on `X-Overlay-Raster-Drawn` / `X-Overlay-Raster-Skipped`, and the
   plate is tunable via `plate_color` / `plate_opacity` / `plate_padding`.
 
+## Vocab pages («كلمات هذه الصفحة»)
+
+The readers are not native English speakers, and most of what stops them is
+ordinary English ("declared", "scope", "evolved", "custom"), not just deep
+technical terms. After a **mono** run, one extra LLM pass over the run's
+sidecar (`server/vocab.py`) picks each page's NEW English words and short
+phrases — a deliberately generous bar (when in doubt, include; only trivial
+function words and pure code identifiers stay out), first occurrence only (a
+word introduced on page 3 never comes back on page 7), ≤20 words/page and
+≤400/document; a document over ~30k source words is split into page-aligned
+chunk calls that carry the already-introduced list. The entries land in the
+sidecar under a top-level **`"vocab"`** key
+(`{"<page_number>": [{w, ar, note?}]}`, string keys matching the sidecar's
+0-based `page_number`; `{}` when nothing made the cut; absent on runs from
+before this feature — consumers must tolerate both), and
+`server/vocab_pages.py` renders each page's words as one compact RTL page —
+tight rows of bold English word — Arabic meaning — optional muted note, two
+columns past six entries — **inserted IMMEDIATELY AFTER that page's content**,
+never deferred to the end. Pages without new words get nothing.
+
+Because the mono result is now interleaved, the pipeline also records where
+the content pages ended up, as a top-level
+**`"artifact_layout": {"content_pages": [i0, i1, ...]}`** (index of content
+page N in the baked mono; written only when pages were really inserted). The
+same insertion rule rides the free layouts:
+
+- **`/v1/overlay`** inserts each page's vocab page right after that original
+  page whenever the sidecar it received carries `"vocab"` (the report gains a
+  `vocab_pages` count).
+- **`/v1/compose`** accepts an optional multipart `sidecar` part. It first
+  takes the translated CONTENT pages back out — via `artifact_layout` when
+  the sidecar carries one (exact: the baked-in vocab pages and any appendix
+  tail are dropped), else by trimming everything past the sidecar's
+  `total_pages` — assembles the dual, then inserts each vocab page after its
+  pair: after the (original, translated) pair of page N for `alternating`,
+  after wide page N for `side_by_side`. Without a sidecar, compose is also
+  tolerant of a translated PDF that is *longer* than the original: the extra
+  tail pages are appended whole at the end (alternating and side-by-side
+  alike) instead of being paired against blanks.
+
+Everything is best-effort: any failure logs and the artifact ships without
+the vocab layer, never degraded and never failed. Kill switch:
+`VOCAB_PAGES=0` disables the extraction call and every insertion on all three
+paths — behavior is byte-identical to before the feature.
+
 ## Environment
 
 | Env | Default | Meaning |
@@ -106,6 +151,7 @@ the sidecar is for.
 | `OPENAI_MODEL` | `google/gemini-3.1-flash-lite` | Translation model |
 | `DATA_DIR` | `/data` | Job storage (volume) |
 | `JOB_TTL_HOURS` | `24` | Job retention |
+| `VOCAB_PAGES` | `1` | «كلمات هذه الصفحة» per-page vocabulary pages; `0` disables extraction and every insertion |
 
 ## Run locally
 

@@ -10,10 +10,22 @@ import shutil
 import subprocess
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi import Depends
+from fastapi import FastAPI
+from fastapi import File
+from fastapi import Form
+from fastapi import Header
+from fastapi import HTTPException
+from fastapi import UploadFile
+from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse
+from fastapi.responses import Response
 
-from server import compose, config, convert, interlinear, jobs
+from server import compose
+from server import config
+from server import convert
+from server import interlinear
+from server import jobs
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
@@ -114,8 +126,17 @@ async def compose_dual(
     original: UploadFile = File(...),
     translated: UploadFile = File(...),
     format: str = Form(...),
+    sidecar: UploadFile | None = File(None),
 ):
-    """Stateless dual builder: original + translated (mono) in, dual PDF out."""
+    """Stateless dual builder: original + translated (mono) in, dual PDF out.
+
+    `sidecar` is optional: send the run's sidecar JSON and, when it carries
+    the "vocab" entries the mono run selected, each page's «كلمات هذه الصفحة»
+    page is rendered into the dual right after that page's pair (and the
+    translated input's own baked-in vocab pages are taken back out via the
+    sidecar's artifact_layout, so nothing appears twice). Without it,
+    behavior is exactly as before.
+    """
     if format not in compose.COMPOSE_FORMATS:
         raise HTTPException(status_code=422,
                             detail=f"format must be one of {compose.COMPOSE_FORMATS}")
@@ -127,9 +148,20 @@ async def compose_dual(
         if not pdf_bytes.startswith(b"%PDF-"):
             raise HTTPException(status_code=422, detail=f"{name} is not a PDF")
 
+    sidecar_data = None
+    if sidecar is not None:
+        sidecar_bytes = await sidecar.read()
+        if len(sidecar_bytes) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="sidecar too large")
+        try:
+            sidecar_data = json.loads(sidecar_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=422,
+                                detail=f"sidecar is not valid JSON: {exc}") from exc
+
     try:
         result = compose.compose_dual(parts["original"], parts["translated"],
-                                      format)
+                                      format, sidecar=sidecar_data)
     except compose.ComposeError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

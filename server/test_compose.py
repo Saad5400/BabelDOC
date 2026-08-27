@@ -6,10 +6,12 @@ the path explicitly):
     pytest server/test_compose.py
 """
 
+import json
 from io import BytesIO
 
 import pytest
-from pypdf import PdfReader, PdfWriter
+from pypdf import PdfReader
+from pypdf import PdfWriter
 
 from server.conftest import TOKEN
 
@@ -124,14 +126,26 @@ def test_alternating_keeps_page_order_of_text(client):
     assert "TRANSMARK" in pages[1].extract_text()
 
 
-def test_shorter_original_is_padded(client, original_pdf, translated_pdf):
+def test_a_longer_translated_appends_its_tail_instead_of_pairing_blanks(
+        client, original_pdf, translated_pdf):
     # Swap the inputs: original (2 pages) shorter than translated (3 pages).
+    # A mono result may end with appended appendix pages of its own, so the
+    # tail is kept whole at the end rather than interleaved against blanks.
     resp = _post(client, translated_pdf, original_pdf, "alternating")
     assert resp.status_code == 200
     pages = _pages(resp)
-    assert len(pages) == 6
-    assert _size(pages[4]) == LETTER  # blank pad sized like the translated twin
-    assert _size(pages[5]) == LETTER
+    assert len(pages) == 5  # 2 pairs + 1 tail page
+    assert [_size(p) for p in pages[:4]] == [A4, LETTER, A4, LETTER]
+    assert _size(pages[4]) == LETTER  # the translated tail page itself
+
+
+def test_side_by_side_appends_the_translated_tail_full_width(
+        client, original_pdf, translated_pdf):
+    resp = _post(client, translated_pdf, original_pdf, "side_by_side")
+    assert resp.status_code == 200
+    pages = _pages(resp)
+    assert len(pages) == 3  # 2 pairs + 1 tail page
+    assert _size(pages[2]) == LETTER  # whole, at its own size
 
 
 def test_bad_format_is_422(client, original_pdf, translated_pdf):
@@ -157,3 +171,185 @@ def test_non_pdf_is_422(client, original_pdf):
 def test_missing_token_is_401(client, original_pdf, translated_pdf):
     resp = _post(client, original_pdf, translated_pdf, "alternating", token=None)
     assert resp.status_code == 401
+
+
+# --------------------------------------------------------------------------
+# The optional sidecar part: «كلمات هذه الصفحة» pages interleaved into the dual
+# --------------------------------------------------------------------------
+
+VOCAB = {"0": [{"w": "declared", "ar": "يُصرَّح عنه"}],
+         "1": [{"w": "evolved", "ar": "تطوَّر", "note": "تغيَّر مع الوقت"}]}
+
+
+def _sidecar_json(total_pages, vocab=None, artifact_layout=None):
+    data = {"version": 1, "lang_in": "en", "lang_out": "ar",
+            "total_pages": total_pages,
+            "pages": [{"page_number": i, "mediabox": [0, 0, *A4],
+                       "blocks": [], "obstacles": []}
+                      for i in range(total_pages)]}
+    if vocab is not None:
+        data["vocab"] = vocab
+    if artifact_layout is not None:
+        data["artifact_layout"] = artifact_layout
+    return json.dumps(data)
+
+
+def _post_with_sidecar(client, original, translated, fmt, sidecar):
+    return client.post(
+        "/v1/compose",
+        headers={"X-Internal-Token": TOKEN},
+        files={"original": ("orig.pdf", original, "application/pdf"),
+               "translated": ("trans.pdf", translated, "application/pdf"),
+               "sidecar": ("sidecar.json", sidecar, "application/json")},
+        data={"format": fmt},
+    )
+
+
+def _page_text(response, index):
+    """Text of one page of the response PDF, via pymupdf.
+
+    pymupdf, not pypdf: the vocab pages carry a subset font whose spans
+    pypdf's extractor reads only partially.
+    """
+    import pymupdf
+
+    doc = pymupdf.open(stream=BytesIO(response.content), filetype="pdf")
+    try:
+        return doc[index].get_text()
+    finally:
+        doc.close()
+
+
+def test_alternating_puts_each_vocab_page_after_its_pair(client):
+    original, translated = _pdf([LETTER] * 2), _pdf([A4] * 2)
+    resp = _post_with_sidecar(client, original, translated, "alternating",
+                              _sidecar_json(2, vocab=VOCAB))
+    assert resp.status_code == 200
+    pages = _pages(resp)
+    # o0 t0 v0 o1 t1 v1
+    assert len(pages) == 6
+    assert [_size(p) for p in pages] == [LETTER, A4, A4, LETTER, A4, A4]
+    assert "declared" in _page_text(resp, 2)
+    assert "evolved" in _page_text(resp, 5)
+
+
+def test_side_by_side_puts_each_vocab_page_after_its_wide_page(client):
+    original, translated = _pdf([LETTER] * 2), _pdf([A4] * 2)
+    resp = _post_with_sidecar(client, original, translated, "side_by_side",
+                              _sidecar_json(2, vocab=VOCAB))
+    assert resp.status_code == 200
+    pages = _pages(resp)
+    # wide0 v0 wide1 v1 — the vocab page is sized like the wide page before it.
+    assert len(pages) == 4
+    wide = (2 * max(LETTER[0], A4[0]), max(LETTER[1], A4[1]))
+    assert [_size(p) for p in pages] == [wide] * 4
+    assert "declared" in _page_text(resp, 1)
+    assert "evolved" in _page_text(resp, 3)
+
+
+def test_a_sidecar_without_vocab_changes_nothing(client, original_pdf,
+                                                 translated_pdf):
+    plain = _post(client, original_pdf, translated_pdf, "alternating")
+    with_sidecar = _post_with_sidecar(client, original_pdf, translated_pdf,
+                                      "alternating", _sidecar_json(2))
+    assert with_sidecar.status_code == 200
+    assert len(_pages(with_sidecar)) == len(_pages(plain))
+
+
+def test_an_empty_vocab_inserts_nothing(client, original_pdf, translated_pdf):
+    resp = _post_with_sidecar(client, original_pdf, translated_pdf,
+                              "alternating", _sidecar_json(2, vocab={}))
+    assert resp.status_code == 200
+    assert len(_pages(resp)) == 6  # exactly the plain alternating output
+
+
+def test_artifact_layout_takes_the_content_pages_back_out_exactly(client):
+    # A baked mono as the pipeline now writes it: content page 0, its vocab
+    # page (odd size marks it), content page 1, plus a baked appendix tail
+    # (another odd size). The sidecar records where the content pages sit;
+    # the dual must rebuild from JUST those and render the vocab fresh.
+    original = _pdf([LETTER] * 2)
+    translated = _pdf([A4, (400.0, 400.0), A4, (500.0, 500.0)])
+    resp = _post_with_sidecar(
+        client, original, translated, "alternating",
+        _sidecar_json(2, vocab=VOCAB,
+                      artifact_layout={"content_pages": [0, 2]}))
+    assert resp.status_code == 200
+    pages = _pages(resp)
+    sizes = [_size(p) for p in pages]
+    assert (400.0, 400.0) not in sizes  # the baked vocab page was dropped
+    assert (500.0, 500.0) not in sizes  # the baked appendix tail was dropped
+    assert len(pages) == 6
+    assert sizes == [LETTER, A4, A4, LETTER, A4, A4]
+    assert "declared" in _page_text(resp, 2)  # rendered fresh, right place
+    assert "evolved" in _page_text(resp, 5)
+
+
+def test_a_pre_feature_sidecar_still_tail_trims_by_total_pages(client):
+    # No "vocab", no "artifact_layout" — a sidecar from before this feature,
+    # sent with a translated input that carries a baked tail past
+    # total_pages. The tail is dropped, nothing is interleaved.
+    original = _pdf([LETTER] * 2)
+    translated = _pdf([A4] * 2 + [(500.0, 500.0)])
+    resp = _post_with_sidecar(client, original, translated, "alternating",
+                              _sidecar_json(2))
+    assert resp.status_code == 200
+    pages = _pages(resp)
+    assert (500.0, 500.0) not in [_size(p) for p in pages]
+    assert len(pages) == 4
+    assert [_size(p) for p in pages] == [LETTER, A4, LETTER, A4]
+
+
+def test_a_crafted_artifact_layout_is_refused_whole(client):
+    # Duplicated / non-increasing positions would double pages; the layout is
+    # ignored and the total_pages tail-trim takes over.
+    original = _pdf([LETTER] * 2)
+    translated = _pdf([A4] * 2 + [(500.0, 500.0)])
+    resp = _post_with_sidecar(
+        client, original, translated, "alternating",
+        _sidecar_json(2, artifact_layout={"content_pages": [0, 0]}))
+    assert resp.status_code == 200
+    pages = _pages(resp)
+    assert (500.0, 500.0) not in [_size(p) for p in pages]
+    assert [_size(p) for p in pages[:4]] == [LETTER, A4, LETTER, A4]
+
+
+def test_the_vocab_kill_switch_disables_the_insert(client, monkeypatch):
+    from server import config
+    monkeypatch.setattr(config, "VOCAB_PAGES", False)
+
+    original, translated = _pdf([LETTER] * 2), _pdf([A4] * 2)
+    resp = _post_with_sidecar(client, original, translated, "alternating",
+                              _sidecar_json(2, vocab=VOCAB))
+    assert resp.status_code == 200
+    assert len(_pages(resp)) == 4  # pairs only, no vocab pages
+
+
+def test_vocab_for_a_page_neither_side_has_is_skipped(client):
+    original, translated = _pdf([LETTER] * 2), _pdf([A4] * 2)
+    resp = _post_with_sidecar(
+        client, original, translated, "alternating",
+        _sidecar_json(2, vocab={"9": [{"w": "lost", "ar": "ضائع"}],
+                                "junk": [{"w": "lost", "ar": "ضائع"}]}))
+    assert resp.status_code == 200
+    assert len(_pages(resp)) == 4
+
+
+def test_an_unknown_sidecar_key_is_tolerated(client):
+    # A sidecar from a pipeline with more passes than this one (a deep-terms
+    # "glossary", say): unknown top-level keys are data for someone else,
+    # never an error and never extra pages here.
+    original, translated = _pdf([LETTER] * 2), _pdf([A4] * 2)
+    sidecar = json.loads(_sidecar_json(2, vocab=VOCAB))
+    sidecar["glossary"] = [{"term": "Wrapping", "arabic": "التغليف",
+                            "explanation": "شرح", "page": 1, "quote": None}]
+    resp = _post_with_sidecar(client, original, translated, "alternating",
+                              json.dumps(sidecar))
+    assert resp.status_code == 200
+    assert len(_pages(resp)) == 6  # o0 t0 v0 o1 t1 v1 — nothing more
+
+
+def test_a_malformed_sidecar_is_422(client, original_pdf, translated_pdf):
+    resp = _post_with_sidecar(client, original_pdf, translated_pdf,
+                              "alternating", "{not json")
+    assert resp.status_code == 422
