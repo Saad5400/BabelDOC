@@ -30,6 +30,15 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 # (and added a $0.001/page surcharge no provider charges), and that number went
 # straight to a user's credit balance.
 
+# «كلمات هذه الصفحة» — the per-page vocabulary layer: each page's NEW English
+# words and short phrases, explained in Arabic on a compact page inserted right
+# after it (first occurrence only). On by default; VOCAB_PAGES=0 (or
+# false/no/off) kills the whole feature: the extraction pass after a mono run
+# AND every insertion (mono result, /v1/overlay, /v1/compose). See
+# server/vocab.py and server/vocab_pages.py.
+VOCAB_PAGES = (os.environ.get("VOCAB_PAGES", "1").strip().lower()
+               not in ("0", "false", "no", "off"))
+
 GLOSSARY_PATH = SERVER_DIR / "glossary_ar_cs.csv"
 OCR_PREP_SCRIPT = SERVER_DIR / "ocr_prep.py"
 IMAGE_PREP_SCRIPT = SERVER_DIR / "image_prep.py"
