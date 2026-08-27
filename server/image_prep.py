@@ -29,6 +29,7 @@ Usage: image_prep.py in.pdf out.pdf regions.json [--dpi 300] [--debug dbg.pdf]
 """
 
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -549,6 +550,40 @@ def rect_to_pdf_space(rect, inv_ptm):
 # driver
 
 
+# One line of a code screenshot, as OCR sees it: statement punctuation,
+# comment markers, declaration keywords, empty call parens, or a UML
+# attribute's `name: type` suffix.
+CODE_LINE = re.compile(
+    r"[;{}]"
+    r"|\(\s*\)"
+    r"|//|/\*|\*/"
+    r"|^\s*(public|private|protected|static|void|int|double|float|class"
+    r"|return|new|import|package)\b"
+    r"|\b\w+\s*:\s*(int|double|float|void|string|char|bool|boolean)\b",
+    re.IGNORECASE,
+)
+CODE_MIN_LINES = 2       # fewer code-ish lines than this never kills a region
+CODE_LINE_FRAC = 0.4     # ...nor a region where they are a minority
+
+
+def region_is_code(lines):
+    """Is this region a code screenshot / UML card rather than a diagram?
+
+    Judged on the lines that SURVIVED filtering, so a photo caption next to
+    junk does not tip the scale. Killing the whole region (not just the code
+    lines) is deliberate: translating a screenshot's prose comments while
+    masking half its statements produces exactly the shredded hybrid this
+    guard exists to prevent.
+    """
+    texts = [" ".join(w.text for w in ln.alive_words())
+             for ln in lines if not ln.dead]
+    texts = [t for t in texts if t.strip()]
+    if len(texts) < CODE_MIN_LINES:
+        return False
+    hits = sum(1 for t in texts if CODE_LINE.search(t))
+    return hits >= CODE_MIN_LINES and hits / len(texts) >= CODE_LINE_FRAC
+
+
 def prep_document(src, dst, regions_path, dpi=DPI, dbg_path=None):
     doc = pymupdf.open(src)
     dbg = pymupdf.open(src) if dbg_path else None
@@ -594,6 +629,13 @@ def prep_document(src, dst, regions_path, dpi=DPI, dbg_path=None):
                         (page.rect.y1 - CORNER_Y * page.rect.height - clip.y0) * px_per_pt,
                     )
                 filter_region_words(lines, raster, bands)
+
+                if region_is_code(lines):
+                    # A code screenshot (or a UML card, which is identifier
+                    # soup). Policy says code stays verbatim, and a masked,
+                    # half-translated screenshot is strictly worse than the
+                    # untouched original — so the whole region opts out.
+                    continue
 
                 ops = build_region_ops(lines, clip, px_per_pt, inv_ptm, font)
                 if not ops:
