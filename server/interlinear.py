@@ -2170,13 +2170,18 @@ def render_compact(original_bytes: bytes, sidecar: dict,
 
 def render_overlay(original_bytes: bytes, sidecar: Any,
                    style: str = "interlinear",
-                   options: OverlayOptions | None = None) -> tuple[bytes, dict]:
+                   options: OverlayOptions | None = None,
+                   vocab: bool = True) -> tuple[bytes, dict]:
     """Draw `style` over the original PDF from its translation sidecar.
 
     Returns the PDF bytes and a small report — pages touched, glosses drawn,
     glosses that had nowhere to go, with the raster lane's counts on their own
     keys — so a caller can tell a good fit from a document that quietly got
     nothing.
+
+    `vocab=False` is the caller opting out of the «كلمات هذه الصفحة» layer
+    for this render: the sidecar's "vocab" is simply not attached. The
+    config.VOCAB_PAGES kill switch keeps overriding everything to off.
     """
     if style not in OVERLAY_STYLES:
         raise OverlayError(f"style must be one of {OVERLAY_STYLES}")
@@ -2204,7 +2209,8 @@ def render_overlay(original_bytes: bytes, sidecar: Any,
         # page-fonts machinery, which imports this module for the subsetter.
         vocab_added = 0
 
-        if config.VOCAB_PAGES and isinstance(sidecar.get("vocab"), dict):
+        if (config.VOCAB_PAGES and vocab
+                and isinstance(sidecar.get("vocab"), dict)):
             from server import vocab_pages
 
             anchors = {}

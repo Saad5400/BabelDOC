@@ -332,11 +332,18 @@ def _insert_vocab_pages(composed: bytes, sidecar: dict, fmt: str,
 
 
 def compose_dual(original_bytes: bytes, translated_bytes: bytes,
-                 fmt: str, sidecar: dict | None = None) -> bytes:
+                 fmt: str, sidecar: dict | None = None,
+                 vocab: bool = True) -> bytes:
     """Build the requested dual variant; raises ComposeError on bad input.
 
     `sidecar` is optional and changes nothing when absent — see the module
     docstring for what a sidecar adds.
+
+    `vocab=False` is the caller opting out of the «كلمات هذه الصفحة» layer
+    for THIS download: the baked-in vocab is still taken back out exactly as
+    always (the sidecar's artifact_layout describes the input either way),
+    but no fresh strips are drawn afterwards — the dual comes back clean.
+    The config.VOCAB_PAGES kill switch keeps overriding everything to off.
     """
     if fmt not in COMPOSE_FORMATS:
         raise ComposeError(f"format must be one of {COMPOSE_FORMATS}")
@@ -380,7 +387,7 @@ def compose_dual(original_bytes: bytes, translated_bytes: bytes,
     composed = out.getvalue()
 
     # The vocab strips live in the body, on each pair's unit. Best-effort.
-    if config.VOCAB_PAGES and vocab_ok and isinstance(sidecar, dict):
+    if config.VOCAB_PAGES and vocab and vocab_ok and isinstance(sidecar, dict):
         try:
             composed = _insert_vocab_pages(composed, sidecar, fmt,
                                            len(original.pages),
@@ -390,3 +397,4 @@ def compose_dual(original_bytes: bytes, translated_bytes: bytes,
                              "returning the dual without them")
 
     return composed
+

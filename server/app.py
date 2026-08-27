@@ -30,6 +30,23 @@ from server import jobs
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
 
+def _parse_flag(value: str, name: str) -> bool:
+    """A form field carrying a boolean: "1"/"0" (or "true"/"false").
+
+    The Laravel caller sends "1"/"0"; the tolerant spellings cost nothing.
+    Anything else is a typo'd request, refused rather than guessed at.
+    """
+    lowered = (value or "").strip().lower()
+
+    if lowered in ("1", "true"):
+        return True
+    if lowered in ("0", "false"):
+        return False
+
+    raise HTTPException(status_code=422,
+                        detail=f"{name} must be 1 or 0")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     jobs.start_worker()
@@ -127,6 +144,7 @@ async def compose_dual(
     translated: UploadFile = File(...),
     format: str = Form(...),
     sidecar: UploadFile | None = File(None),
+    vocab: str = Form("1"),
 ):
     """Stateless dual builder: original + translated (mono) in, dual PDF out.
 
@@ -136,7 +154,12 @@ async def compose_dual(
     translated input's own baked-in vocab pages are taken back out via the
     sidecar's artifact_layout, so nothing appears twice). Without it,
     behavior is exactly as before.
+
+    `vocab=0` opts this download out of the vocab layer: the baked-in vocab
+    still comes back out (that is undoing what the input carries, not adding
+    a feature), but no fresh strips go in.
     """
+    want_vocab = _parse_flag(vocab, "vocab")
     if format not in compose.COMPOSE_FORMATS:
         raise HTTPException(status_code=422,
                             detail=f"format must be one of {compose.COMPOSE_FORMATS}")
@@ -161,7 +184,8 @@ async def compose_dual(
 
     try:
         result = compose.compose_dual(parts["original"], parts["translated"],
-                                      format, sidecar=sidecar_data)
+                                      format, sidecar=sidecar_data,
+                                      vocab=want_vocab)
     except compose.ComposeError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -186,6 +210,7 @@ async def overlay(
     plate_color: str | None = Form(None),
     plate_opacity: float | None = Form(None),
     plate_padding: float | None = Form(None),
+    vocab: str = Form("1"),
 ):
     """Stateless layout builder for the layouts that need the translated TEXT.
 
@@ -193,7 +218,11 @@ async def overlay(
     the ones that have to know what each paragraph says and where it belongs,
     from the run's sidecar. Like compose, it is stateless, LLM-free and
     therefore free: one paid translation, any number of layouts.
+
+    `vocab=0` opts this render out of the «كلمات هذه الصفحة» strips the
+    sidecar's "vocab" would otherwise add to the overlay pages.
     """
+    want_vocab = _parse_flag(vocab, "vocab")
     if style not in interlinear.OVERLAY_STYLES:
         raise HTTPException(
             status_code=422,
@@ -227,7 +256,8 @@ async def overlay(
                 ("plate_padding", plate_padding))
                if value is not None})
         result, report = interlinear.render_overlay(original_bytes, parsed,
-                                                    style=style, options=options)
+                                                    style=style, options=options,
+                                                    vocab=want_vocab)
     except interlinear.OverlayError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

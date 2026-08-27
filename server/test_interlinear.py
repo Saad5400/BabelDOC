@@ -912,3 +912,50 @@ def test_the_vocab_kill_switch_disables_the_insert(monkeypatch):
 
     assert report["vocab_pages"] == 0
     assert len(_page_texts(result)) == 1
+
+
+def test_vocab_false_opts_one_render_out_of_the_strips():
+    # The caller's per-download opt-out: same sidecar, same glosses, but the
+    # «كلمات هذه الصفحة» strip stays off and the page keeps its size.
+    original = _page_pdf([(60, 300, 500, 340, "Software change is inevitable")])
+    sidecar = _sidecar([{"box": (60, 300, 400, 314), "target": AR_ONE}])
+    sidecar["vocab"] = VOCAB
+
+    result, report = interlinear.render_overlay(
+        original, sidecar, style=interlinear.COMPACT_STYLE, vocab=False)
+
+    assert report["drawn"] == 1  # the glosses themselves are untouched
+    assert report["vocab_pages"] == 0
+    normalized = unicodedata.normalize("NFKC", _page_texts(result)[0])
+    assert "حتمي" not in normalized
+    plain, _ = _render(original,
+                       _sidecar([{"box": (60, 300, 400, 314),
+                                  "target": AR_ONE}]))
+    assert _page_heights(result)[0] == _page_heights(plain)[0]
+
+
+def test_endpoint_vocab_0_skips_the_strips(client):
+    original = _page_pdf([(60, 300, 500, 340, "Software change is inevitable")])
+    sidecar = _sidecar([{"box": (60, 300, 400, 314), "target": AR_ONE}])
+    sidecar["vocab"] = VOCAB
+
+    resp = _post(client, original, sidecar, vocab="0")
+
+    assert resp.status_code == 200
+    normalized = unicodedata.normalize("NFKC",
+                                       " ".join(_page_texts(resp.content)))
+    assert "حتمي" not in normalized
+
+    with_vocab = _post(client, original, sidecar)  # the default stays on
+    assert with_vocab.status_code == 200
+    assert (_page_heights(resp.content)[0]
+            < _page_heights(with_vocab.content)[0])
+
+
+def test_endpoint_refuses_a_junk_vocab_value(client):
+    original = _page_pdf([(60, 300, 500, 340, "x")])
+    resp = _post(client, original,
+                 _sidecar([{"box": (60, 300, 400, 314), "target": AR_ONE}]),
+                 vocab="maybe")
+
+    assert resp.status_code == 422
