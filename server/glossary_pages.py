@@ -80,10 +80,16 @@ def _font_path(font_file: str) -> Path:
         return Path(path)
 
 
-class _CardFonts:
-    """The two subset faces plus the stylesheet the cards are set in."""
+class PageFonts:
+    """The two subset faces plus a stylesheet — regular as `gloss`, bold as
+    `glossbold`, `extra_css` appended after the shared base rules.
 
-    def __init__(self, texts: list[str]) -> None:
+    Shared with `server/vocab_pages.py`, whose rows are set in the same two
+    faces and have the same 15 MB-per-copy problem to solve; each appendix
+    style brings only its own rules.
+    """
+
+    def __init__(self, texts: list[str], extra_css: str = "") -> None:
         self.archive = pymupdf.Archive()
         self.archive.add(subset_font_bytes(_font_path(FONT_FILE), texts),
                          "gloss.ttf")
@@ -93,6 +99,15 @@ class _CardFonts:
             "@font-face {font-family: gloss; src: url(gloss.ttf);}"
             "@font-face {font-family: glossbold; src: url(gloss-bold.ttf);}"
             "body {margin: 0; font-family: gloss;}"
+            + extra_css
+        )
+
+
+class _CardFonts(PageFonts):
+    """The glossary cards' stylesheet on top of the shared faces."""
+
+    def __init__(self, texts: list[str]) -> None:
+        super().__init__(texts, (
             f"div.title {{font-family: glossbold; font-size: 24px;"
             f" color: {_TITLE_COLOR};}}"
             f"div.term {{font-family: glossbold; font-size: 20px;"
@@ -101,7 +116,7 @@ class _CardFonts:
             " line-height: 1.9;}"
             f"div.source {{font-size: 13px; color: {_SOURCE_COLOR};"
             " margin-top: 7px;}"
-        )
+        ))
 
 
 def _escape(text: str) -> str:
@@ -153,8 +168,12 @@ def _usable(entry: object) -> bool:
             and str(entry.get("explanation") or "").strip() != "")
 
 
-def _measure(html: str, fonts: _CardFonts, width: float) -> float:
-    """The height `html` needs at `width` (one Story.place pass)."""
+def measure(html: str, fonts: PageFonts, width: float) -> float:
+    """The height `html` needs at `width` (one Story.place pass).
+
+    Shared with `server/vocab_pages.py` — measuring is how both renderers
+    decide their page breaks.
+    """
     story = pymupdf.Story(html=html, user_css=fonts.css, archive=fonts.archive)
     _, filled = story.place(pymupdf.Rect(0, 0, width, 100_000))
 
@@ -208,7 +227,7 @@ def append_glossary_pages(doc: pymupdf.Document, entries: list,
     added = 1
 
     title = _title_html()
-    title_height = _measure(title, fonts, content_width)
+    title_height = measure(title, fonts, content_width)
     page.insert_htmlbox(
         pymupdf.Rect(_MARGIN_X, _MARGIN_TOP, width - _MARGIN_X,
                      _MARGIN_TOP + title_height + 2),
@@ -217,7 +236,7 @@ def append_glossary_pages(doc: pymupdf.Document, entries: list,
 
     for card in cards:
         html = _card_html(card)
-        text_height = _measure(html, fonts, text_width)
+        text_height = measure(html, fonts, text_width)
         card_height = text_height + 2 * _CARD_PAD
 
         if y + card_height > bottom and y > _MARGIN_TOP:
