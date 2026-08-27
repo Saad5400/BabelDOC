@@ -117,7 +117,7 @@ def test_gloss_lands_in_the_band_above_its_paragraph():
 
     pdf, report = _render(original, sidecar)
 
-    assert report == {"pages": 1, "drawn": 1, "skipped": 0}
+    assert report == {"pages": 1, "drawn": 1, "skipped": 0, "glossary_pages": 0}
 
     arabic = [rect for rect, text in _drawn_spans(pdf) if _is_arabic(text)]
     assert arabic, "no Arabic was drawn"
@@ -276,7 +276,7 @@ def test_a_merged_bullet_list_is_spread_over_its_own_lines():
 
     pdf, report = _render(original, sidecar)
 
-    assert report == {"pages": 1, "drawn": 1, "skipped": 0}
+    assert report == {"pages": 1, "drawn": 1, "skipped": 0, "glossary_pages": 0}
     # One gloss band per bullet, each above its own bullet — not one lump.
     bands = sorted({round(rect.y0, 1) for rect, text in _drawn_spans(pdf)
                     if _is_arabic(text)})
@@ -397,7 +397,7 @@ def test_a_paragraph_at_the_very_top_is_skipped_not_pushed_off_the_page():
 
     pdf, report = _render(original, sidecar)
 
-    assert report == {"pages": 1, "drawn": 0, "skipped": 1}
+    assert report == {"pages": 1, "drawn": 0, "skipped": 1, "glossary_pages": 0}
     assert not [rect for rect, text in _drawn_spans(pdf) if _is_arabic(text)]
 
 
@@ -422,7 +422,7 @@ def test_a_stroked_frame_frees_its_inside_but_keeps_its_edge():
     pdf, report = _render(framed.getvalue(), sidecar)
 
     # Drawn — the inside of the frame was free all along…
-    assert report == {"pages": 1, "drawn": 1, "skipped": 0}
+    assert report == {"pages": 1, "drawn": 1, "skipped": 0, "glossary_pages": 0}
 
     # …and still clear of the edge the frame actually drew.
     glosses = [rect for rect, text in _drawn_spans(pdf) if _is_arabic(text)]
@@ -441,6 +441,59 @@ def test_an_ltr_target_language_is_glossed_too():
     assert report["drawn"] == 1
     assert "Software change is inevitable" in "".join(
         text for _rect, text in _drawn_spans(pdf))
+
+
+def _glossary_sidecar():
+    sidecar = _sidecar([{"box": (60, 300, 400, 314), "target": AR_ONE}])
+    sidecar["glossary"] = [{"term": "Wrapping", "arabic": "التغليف",
+                            "explanation": "شرح ودّي قصير للمصطلح.",
+                            "page": 1, "quote": "wrapper classes"}]
+
+    return sidecar
+
+
+def test_a_glossary_bearing_sidecar_appends_the_terms_pages():
+    original = _page_pdf([(60, 300, 500, 340, "Software change is inevitable")])
+
+    pdf, report = _render(original, _glossary_sidecar())
+
+    assert report["drawn"] == 1
+    assert report["glossary_pages"] == 1
+
+    doc = pymupdf.open(stream=BytesIO(pdf), filetype="pdf")
+    try:
+        assert doc.page_count == 2  # the original page + the appended glossary
+        assert "Wrapping" in doc[1].get_text()
+    finally:
+        doc.close()
+
+
+def test_the_glossary_kill_switch_covers_the_overlay(monkeypatch):
+    from server import config
+
+    monkeypatch.setattr(config, "GLOSSARY_PAGES", False)
+    original = _page_pdf([(60, 300, 500, 340, "Software change is inevitable")])
+
+    pdf, report = _render(original, _glossary_sidecar())
+
+    assert report["glossary_pages"] == 0
+    doc = pymupdf.open(stream=BytesIO(pdf), filetype="pdf")
+    try:
+        assert doc.page_count == 1
+    finally:
+        doc.close()
+
+
+def test_a_junk_glossary_never_fails_the_overlay():
+    original = _page_pdf([(60, 300, 500, 340, "Software change is inevitable")])
+    sidecar = _sidecar([{"box": (60, 300, 400, 314), "target": AR_ONE}])
+    sidecar["glossary"] = "not even a list"
+
+    pdf, report = _render(original, sidecar)
+
+    assert report["drawn"] == 1
+    assert report["glossary_pages"] == 0
+    assert pdf.startswith(b"%PDF-")
 
 
 def test_a_future_sidecar_version_is_refused():

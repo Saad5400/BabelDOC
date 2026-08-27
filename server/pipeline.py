@@ -11,6 +11,7 @@ without paying for the translation twice.
 """
 
 import asyncio
+import json
 import logging
 import shutil
 import subprocess
@@ -20,7 +21,8 @@ from pathlib import Path
 
 from pypdf import PdfReader
 
-from server import config, jobs
+from server import config
+from server import jobs
 
 logger = logging.getLogger("doctranslate.pipeline")
 
@@ -93,10 +95,8 @@ def _run_babeldoc(job_id: str, input_pdf: Path, out_dir: Path, *, lang_in: str,
                   sidecar_path: Path | None = None):
     """Run the fork through its Python API; returns (TranslateResult, translator)."""
     from babeldoc.format.pdf.high_level import async_translate
-    from babeldoc.format.pdf.translation_config import (
-        TranslationConfig,
-        WatermarkOutputMode,
-    )
+    from babeldoc.format.pdf.translation_config import TranslationConfig
+    from babeldoc.format.pdf.translation_config import WatermarkOutputMode
     from babeldoc.glossary import Glossary
     from babeldoc.translator.translator import set_translate_rate_limiter
 
@@ -241,6 +241,65 @@ def _set_pdf_title(pdf_path: Path, title: str) -> None:
         logger.warning("could not set PDF title on %s", pdf_path, exc_info=True)
 
 
+def _append_glossary(output_pdf: Path, sidecar_path: Path) -> None:
+    """The «شرح المصطلحات» step: pick the run's hard terms, record them in the
+    sidecar, append the styled pages to the result.
+
+    Best-effort at every seam — the paid translation is already on disk and
+    NOTHING here may lose it. A failure logs and the job finishes exactly as it
+    did before this feature existed. The entries are written into the sidecar
+    (top-level "glossary" key, [] when nothing made the cut) even when no pages
+    can be appended, so /v1/overlay and /v1/compose can render the same pages
+    later without a second LLM call.
+    """
+    from server import terms
+
+    try:
+        sidecar_data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - no sidecar, no glossary
+        logger.exception("glossary: could not read the sidecar; skipping")
+        return
+
+    try:
+        entries = terms.extract_terms(sidecar_data)  # [] on failure, by contract
+    except Exception:  # noqa: BLE001 - belt and braces on that contract
+        logger.exception("glossary: extract_terms broke its never-raise "
+                         "contract; skipping")
+        return
+
+    sidecar_data["glossary"] = entries
+    try:
+        sidecar_path.write_text(json.dumps(sidecar_data, ensure_ascii=False),
+                                encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        logger.exception("glossary: could not write entries into the sidecar")
+
+    if not entries:
+        return
+
+    try:
+        import pymupdf
+
+        from server import glossary_pages
+
+        doc = pymupdf.open(str(output_pdf))
+        try:
+            added = glossary_pages.append_glossary_pages(doc, entries)
+            if not added:
+                return
+            # A full save (not incremental): garbage=4 folds the per-box
+            # copies of the subset card font into one. Via a sibling temp
+            # file — pymupdf cannot rewrite the file it has open.
+            tmp = output_pdf.with_name(output_pdf.name + ".glossary.tmp")
+            doc.save(str(tmp), garbage=4, deflate=True)
+        finally:
+            doc.close()
+        tmp.replace(output_pdf)
+    except Exception:  # noqa: BLE001 - the appendix must never lose the run
+        logger.exception("glossary: appending pages failed; the result ships "
+                         "without them")
+
+
 def run_job(job_id: str) -> None:
     job = jobs.read_job(job_id)
     if job is None:
@@ -306,6 +365,14 @@ def run_job(job_id: str) -> None:
                   str(produced), str(output_pdf)], job_id, "fix_layer_order")
     else:
         shutil.copyfile(produced, output_pdf)
+
+    # «شرح المصطلحات»: one LLM pass over the sidecar picks the document's
+    # genuinely hard terms, the entries land in the sidecar ("glossary" key)
+    # and the styled pages are appended to the result. Mono runs only — the
+    # sidecar is the input, and only mono runs have one.
+    if sidecar is not None and sidecar.is_file() and config.GLOSSARY_PAGES:
+        _set_progress(job_id, 98.0, "glossary")
+        _append_glossary(output_pdf, sidecar)
 
     if job.get("title"):
         _set_pdf_title(output_pdf, job["title"])
