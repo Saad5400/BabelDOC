@@ -224,6 +224,13 @@ class TranslationConfig:
         # parts would overwrite one file with part-local page numbers.
         # See document_il/midend/translation_sidecar.py.
         translation_sidecar_path: str | Path | None = None,
+        # Phrase-pair alignment (fork): ask the LLM translator to also
+        # segment each translation into aligned source↔target phrases,
+        # captured into the sidecar ("pairs" on its blocks) with the page
+        # rects of each phrase on both sides. False = never requested, the
+        # prompt and the sidecar are exactly as before.
+        # See document_il/midend/phrase_pairs.py.
+        capture_phrase_pairs: bool = True,
     ):
         self.translator = translator
         self.term_extraction_translator = term_extraction_translator or translator
@@ -232,6 +239,12 @@ class TranslationConfig:
         self.translation_sidecar_path = (
             Path(translation_sidecar_path) if translation_sidecar_path else None
         )
+        self.capture_phrase_pairs = bool(capture_phrase_pairs)
+        # Runtime store, filled by ILTranslatorLLMOnly as paragraphs come
+        # back: id(paragraph) → validated pairs. Keyed by identity because
+        # the IL dataclasses are slotted (no ad-hoc attributes) and the
+        # paragraph objects live in `docs` until well past the sidecar write.
+        self.phrase_pair_store: dict[int, list[dict]] = {}
         self.input_file = input_file
         self.lang_in = lang_in
         self.lang_out = lang_out

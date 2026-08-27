@@ -21,6 +21,7 @@ from babeldoc.format.pdf.document_il.midend.il_translator import (
 from babeldoc.format.pdf.document_il.midend.il_translator import (
     DocumentTranslateTracker,
 )
+from babeldoc.format.pdf.document_il.midend import phrase_pairs
 from babeldoc.format.pdf.document_il.midend.il_translator import ILTranslator
 from babeldoc.format.pdf.document_il.midend.il_translator import PageTranslateTracker
 from babeldoc.format.pdf.document_il.midend.il_translator import (
@@ -90,7 +91,7 @@ Output:
     "output": "{v1}<style id='2'>$example_hello</style>$example_world"
     }
 ]
-
+$phrase_pairs_block
 $contextual_hints_block
 
 $glossary_tables_block
@@ -99,6 +100,46 @@ $glossary_tables_block
 
 $json_input_str"""
 )
+
+
+# Appended to the prompt only when at least one item in the batch is marked
+# "want_pairs" (a paragraph whose input carries no placeholder scaffolding —
+# {v1}, <style id='N'> — so its phrases are literal substrings of both texts).
+# The rules here are the exact contract phrase_pairs.validate_pairs enforces;
+# pairs that break it are discarded per paragraph, never repaired.
+PHRASE_PAIRS_PROMPT_BLOCK = """
+## Phrase Pairs
+For every input item that has "want_pairs": true, ALSO add a "pairs" field to that output item: an ordered JSON array of {"s": <source phrase>, "t": <translated phrase>} objects segmenting BOTH texts completely.
+- Split into 2-8 phrases; longer sentences get more phrases.
+- Concatenating all "s" values with single spaces must reproduce the item's "input" exactly; concatenating all "t" values must reproduce your "output" exactly.
+- Split ONLY between whole words. NEVER split inside a word.
+- Keep the phrase ORDER identical on both sides: the first pair is the start of the input AND the start of the output. When the languages reorder words, use larger phrases so the order still matches.
+- Items without "want_pairs" must NOT get a "pairs" field.
+
+### Phrase pairs example
+Input:
+[
+    {
+    "id": 0,
+    "input": "We can not create two local variables with the same name",
+    "layout_label": "text",
+    "want_pairs": true
+    }
+]
+Output:
+[
+    {
+    "id": 0,
+    "output": "لا يمكننا إنشاء متغيرين محليين بالاسم نفسه",
+    "pairs": [
+        {"s": "We can not", "t": "لا يمكننا"},
+        {"s": "create", "t": "إنشاء"},
+        {"s": "two local variables", "t": "متغيرين محليين"},
+        {"s": "with the same name", "t": "بالاسم نفسه"}
+    ]
+    }
+]
+"""
 
 
 class BatchParagraph:
@@ -155,6 +196,19 @@ class ILTranslatorLLMOnly:
         self.ok_count = 0
         self.fallback_count = 0
         self.total_count = 0
+
+        # Phrase-pair alignment (see phrase_pairs.py). Off when the config
+        # says so — and off whenever no sidecar was asked for, because the
+        # sidecar is the only place pairs can land: asking would spend prompt
+        # tokens on answers nobody keeps. Paragraphs whose input carries
+        # placeholders never take part, and the fallback translator
+        # (il_translator) never produces pairs at all.
+        self.capture_phrase_pairs = bool(
+            getattr(translation_config, "capture_phrase_pairs", False)
+            and getattr(translation_config, "translation_sidecar_path", None)
+        )
+        self.pairs_kept = 0
+        self.pairs_discarded = 0
 
     def calc_token_count(self, text: str) -> int:
         try:
@@ -263,6 +317,14 @@ class ILTranslatorLLMOnly:
             f"Translation completed. Total: {self.total_count}, Successful: {self.ok_count}, "
             f"Fallback: {self.fallback_count}, Untranslated: {untranslated_total}"
         )
+        if self.capture_phrase_pairs and (self.pairs_kept or self.pairs_discarded):
+            # Once per document, as promised: discards are normal (the model
+            # missegments, the Arabic post-processor rewrites) and only worth
+            # a single summary line, never a per-paragraph drumbeat.
+            logger.info(
+                f"Phrase pairs: kept {self.pairs_kept}, "
+                f"discarded {self.pairs_discarded}"
+            )
 
     def _is_body_text_paragraph(self, paragraph: PdfParagraph) -> bool:
         """判断正文段落（当前仅 layout_label == 'text'）。
@@ -695,6 +757,12 @@ class ILTranslatorLLMOnly:
                     and self.translation_config.add_formula_placehold_hint
                 ):
                     obj["formula_placeholders_hint"] = placeholders_hint
+                # Pairs are only requested for inputs that are pure text: a
+                # {v1} or <style id='N'> placeholder is not a phrase of
+                # either language, and reconciling it against the source
+                # characters is exactly the complexity this feature refuses.
+                if self.capture_phrase_pairs and not ti.placeholders:
+                    obj["want_pairs"] = True
                 json_format_input.append(obj)
 
             json_format_input_str = json.dumps(
@@ -710,6 +778,9 @@ class ILTranslatorLLMOnly:
                 title_paragraph=title_paragraph,
                 local_title_paragraph=local_title_paragraph,
                 batch_text_for_glossary_matching=batch_text_for_glossary_matching,
+                include_phrase_pairs=any(
+                    obj.get("want_pairs") for obj in json_format_input
+                ),
             )
 
             for llm_translate_tracker in llm_translate_trackers:
@@ -738,6 +809,14 @@ class ILTranslatorLLMOnly:
                 item["id"]: item.get("output", item.get("input"))
                 for item in parsed_output
             }
+            # The raw pairs riding on each item, shape-checked only; the
+            # strict validation waits until the translation has actually been
+            # applied (the Arabic post-processor may still rewrite it).
+            pairs_results = {
+                item["id"]: phrase_pairs.pairs_from_item(item)
+                for item in parsed_output
+                if isinstance(item, dict) and "id" in item
+            }
 
             if len(translation_results) != len(inputs):
                 raise Exception(
@@ -746,6 +825,9 @@ class ILTranslatorLLMOnly:
 
             for id_, output in translation_results.items():
                 should_fallback = True
+                # Fetch by the RAW key: id_ is re-typed to int below, but
+                # pairs_results is keyed exactly like translation_results.
+                raw_pairs = pairs_results.get(id_)
                 try:
                     if not isinstance(output, str):
                         logger.warning(
@@ -821,13 +903,20 @@ class ILTranslatorLLMOnly:
                             llm_translate_tracker.set_placeholder_full_match()
                             continue
                     # Apply the translation to the paragraph
-                    self.il_translator.post_translate_paragraph(
+                    applied = self.il_translator.post_translate_paragraph(
                         inputs[id_][2],
                         inputs[id_][3],
                         translate_input,
                         translated_text,
                     )
                     should_fallback = False
+                    if applied:
+                        self._capture_phrase_pairs(
+                            paragraph=inputs[id_][2],
+                            translate_input=translate_input,
+                            source_text=input_unicode,
+                            raw_pairs=raw_pairs,
+                        )
                     if pbar:
                         pbar.advance(1)
                 except Exception as e:
@@ -900,12 +989,49 @@ class ILTranslatorLLMOnly:
                     local_title_paragraph=local_title_paragraph,
                 )
 
+    def _capture_phrase_pairs(
+        self,
+        paragraph: PdfParagraph,
+        translate_input,
+        source_text: str,
+        raw_pairs: list[dict] | None,
+    ) -> None:
+        """Validate one paragraph's pairs and file them for the sidecar.
+
+        Called only after the translation was APPLIED, so `paragraph.unicode`
+        is the final target text (post-processing included) — the text the
+        sidecar will report, and therefore the text the "t" phrases must
+        segment. Any violation discards the pairs for this paragraph alone;
+        the translation itself is already safe. Never raises: pairs are a
+        bonus, and a bug here must not cost a paid paragraph its fallback
+        accounting.
+        """
+        try:
+            if not self.capture_phrase_pairs or translate_input.placeholders:
+                return
+            store = getattr(self.translation_config, "phrase_pair_store", None)
+            if store is None:
+                return
+
+            validated = phrase_pairs.validate_pairs(
+                raw_pairs, source_text, paragraph.unicode or ""
+            )
+            if validated:
+                store[id(paragraph)] = validated
+                self.pairs_kept += 1
+            else:
+                self.pairs_discarded += 1
+        except Exception:  # noqa: BLE001 - see docstring
+            self.pairs_discarded += 1
+            logger.exception("phrase pairs: capture failed; discarding")
+
     def _build_llm_prompt(
         self,
         json_input_str: str,
         title_paragraph: TitleContextSnapshot | None,
         local_title_paragraph: TitleContextSnapshot | None,
         batch_text_for_glossary_matching: str,
+        include_phrase_pairs: bool = False,
     ) -> str:
         """Build LLM prompt using a single template for easier maintenance."""
         # Build role block, honoring custom_system_prompt if provided.
@@ -1008,6 +1134,9 @@ class ILTranslatorLLMOnly:
             style_addendum_block=style_addendum_block,
             example_hello=example_hello,
             example_world=example_world,
+            phrase_pairs_block=(
+                PHRASE_PAIRS_PROMPT_BLOCK if include_phrase_pairs else ""
+            ),
         )
 
     def _clean_json_output(self, llm_output: str) -> str:
