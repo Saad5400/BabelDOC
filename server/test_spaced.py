@@ -220,7 +220,8 @@ def test_a_tight_list_gets_every_gloss_and_the_page_grows():
     pdf, report = _render(builder)
 
     assert report == {"pages": 1, "drawn": 5, "skipped": 0,
-                      "raster_drawn": 0, "raster_skipped": 0}
+                      "raster_drawn": 0, "raster_skipped": 0,
+                      "vocab_pages": 0}
     assert _page_size(pdf)[1] > PAGE[1]
     assert len(_gloss_lines(pdf)) == 5
 
@@ -326,7 +327,8 @@ def test_lines_whose_font_boxes_overlap_are_still_told_apart():
     pdf, report = _render(builder)
 
     assert report == {"pages": 1, "drawn": 2, "skipped": 0,
-                      "raster_drawn": 0, "raster_skipped": 0}
+                      "raster_drawn": 0, "raster_skipped": 0,
+                      "vocab_pages": 0}
 
     latin = sorted((rect for rect, _text in _latin(pdf)), key=lambda r: r.y0)
     arabic = _gloss_lines(pdf)
@@ -381,7 +383,8 @@ def test_a_filled_panel_is_opened_up_rather_than_stepped_around():
     pdf, report = _render(builder)
 
     assert report == {"pages": 1, "drawn": 4, "skipped": 0,
-                      "raster_drawn": 0, "raster_skipped": 0}
+                      "raster_drawn": 0, "raster_skipped": 0,
+                      "vocab_pages": 0}
 
     doc = pymupdf.open(stream=BytesIO(pdf), filetype="pdf")
 

@@ -21,7 +21,8 @@ from pathlib import Path
 
 from pypdf import PdfReader
 
-from server import config, jobs
+from server import config
+from server import jobs
 
 logger = logging.getLogger("doctranslate.pipeline")
 
@@ -95,10 +96,8 @@ def _run_babeldoc(job_id: str, input_pdf: Path, out_dir: Path, *, lang_in: str,
                   image_text_regions: Path | None = None):
     """Run the fork through its Python API; returns (TranslateResult, translator)."""
     from babeldoc.format.pdf.high_level import async_translate
-    from babeldoc.format.pdf.translation_config import (
-        TranslationConfig,
-        WatermarkOutputMode,
-    )
+    from babeldoc.format.pdf.translation_config import TranslationConfig
+    from babeldoc.format.pdf.translation_config import WatermarkOutputMode
     from babeldoc.glossary import Glossary
     from babeldoc.translator.translator import set_translate_rate_limiter
 
@@ -244,6 +243,100 @@ def _set_pdf_title(pdf_path: Path, title: str) -> None:
         logger.warning("could not set PDF title on %s", pdf_path, exc_info=True)
 
 
+def _write_sidecar(sidecar_path: Path, data: dict) -> None:
+    try:
+        sidecar_path.write_text(json.dumps(data, ensure_ascii=False),
+                                encoding="utf-8")
+    except Exception:  # noqa: BLE001 - the sidecar update is best-effort
+        logger.exception("could not write the updated sidecar")
+
+
+def _insert_vocab(output_pdf: Path, sidecar_path: Path) -> None:
+    """The «كلمات هذه الصفحة» step: pick each page's new English words, record
+    them in the sidecar, interleave the compact vocab pages into the result —
+    page N's words IMMEDIATELY after page N, never deferred to the end.
+
+    A sidecar may carry a deep-terms list under its "glossary" key (nothing on
+    this branch writes one, but a sidecar that has it is honoured); those
+    terms are this pass's exclusion list, so no word is ever explained twice.
+    An appendix tail the result may already carry simply shifts back as body
+    pages are inserted, staying at the very end.
+
+    The baked layout is recorded in the sidecar as
+    `"artifact_layout": {"content_pages": [...]}` — where each translated
+    content page ended up in the mono file — which is what lets /v1/compose
+    later take the content pages back out EXACTLY instead of tail-trimming.
+    Written only when pages were really inserted: an untouched mono is still
+    described perfectly by `total_pages`.
+
+    Best-effort at every seam: the paid translation is already on disk and
+    NOTHING here may lose it. A failure logs and the job finishes exactly as
+    it did before this feature existed.
+    """
+    from server import vocab
+
+    try:
+        sidecar_data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - no sidecar, no vocab
+        logger.exception("vocab: could not read the sidecar; skipping")
+        return
+
+    exclude = [entry.get("term")
+               for entry in sidecar_data.get("glossary") or []
+               if isinstance(entry, dict) and entry.get("term")]
+
+    try:
+        entries = vocab.extract_vocab(sidecar_data, exclude=exclude)
+    except Exception:  # noqa: BLE001 - belt and braces on the {} contract
+        logger.exception("vocab: extract_vocab broke its never-raise "
+                         "contract; skipping")
+        return
+
+    sidecar_data["vocab"] = entries
+    _write_sidecar(sidecar_path, sidecar_data)
+
+    if not entries:
+        return
+
+    content = sidecar_data.get("total_pages")
+
+    if not isinstance(content, int) or isinstance(content, bool) or content <= 0:
+        content = len(sidecar_data.get("pages") or [])
+
+    try:
+        import pymupdf
+
+        from server import vocab_pages
+
+        doc = pymupdf.open(str(output_pdf))
+        try:
+            content = min(content, doc.page_count) or doc.page_count
+            added = vocab_pages.interleave_vocab(
+                doc, entries, {number: number for number in range(content)})
+            if not added:
+                return
+            # A full save (not incremental): garbage=4 folds the per-box
+            # copies of the subset row font into one. Via a sibling temp
+            # file — pymupdf cannot rewrite the file it has open.
+            tmp = output_pdf.with_name(output_pdf.name + ".vocab.tmp")
+            doc.save(str(tmp), garbage=4, deflate=True)
+        finally:
+            doc.close()
+        tmp.replace(output_pdf)
+    except Exception:  # noqa: BLE001 - the vocab layer must never lose the run
+        logger.exception("vocab: inserting pages failed; the result ships "
+                         "without them")
+        return
+
+    # Only now — the mono on disk really carries the interleaved layout.
+    positions, shift = [], 0
+    for number in range(content):
+        positions.append(number + shift)
+        shift += added.get(number, 0)
+    sidecar_data["artifact_layout"] = {"content_pages": positions}
+    _write_sidecar(sidecar_path, sidecar_data)
+
+
 def run_job(job_id: str) -> None:
     job = jobs.read_job(job_id)
     if job is None:
@@ -329,6 +422,14 @@ def run_job(job_id: str) -> None:
                   str(produced), str(output_pdf)], job_id, "fix_layer_order")
     else:
         shutil.copyfile(produced, output_pdf)
+
+    # «كلمات هذه الصفحة»: one lighter LLM pass over the sidecar picks each
+    # page's new general-English words, records them in the sidecar ("vocab"
+    # key) and interleaves the compact vocab pages into the result. Mono runs
+    # only — the sidecar is the input, and only mono runs have one.
+    if sidecar is not None and sidecar.is_file() and config.VOCAB_PAGES:
+        _set_progress(job_id, 98.0, "vocab")
+        _insert_vocab(output_pdf, sidecar)
 
     if job.get("title"):
         _set_pdf_title(output_pdf, job["title"])
