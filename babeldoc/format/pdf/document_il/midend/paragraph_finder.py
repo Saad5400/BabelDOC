@@ -1195,26 +1195,32 @@ class ParagraphFinder:
     ) -> list[PdfParagraph]:
         """One region's characters -> its label paragraphs.
 
-        Line-thread the region's characters into visual lines, split lines at
+        Bucket the region's characters into lines BY BASELINE, split lines at
         large horizontal gaps (side-by-side labels), then merge adjacent
         lines that geometrically continue each other (a wrapped label) using
         the scanned lane's continuation rule. Each resulting paragraph is
         tagged with its region and stripped of render order so it layers
         exactly like the scanned lane: mask below, translated text on top.
+
+        Baselines, not line-threading: every char of one injected image_prep
+        run shares its box.y exactly (one Tj, one Tm), while a large label's
+        ink-tight glyph boxes can OVERLAP the next line's by a point or two
+        (23 pt caps on a 22 pt pitch). Threading needs a zero-collision
+        scanline between lines, so that overlap welded «Product»/«features»
+        into one "line" whose x-sort interleaved the two words' characters.
         """
-        carrier = PdfParagraph(
-            box=Box(0, 0, 0, 0),
-            pdf_paragraph_composition=[
-                PdfParagraphComposition(pdf_character=char) for char in chars
-            ],
-            unicode="",
-            debug_id=generate_base58_id(),
-        )
-        self._split_paragraph_into_lines(carrier, set())
+        buckets: list[tuple[float, list[PdfCharacter]]] = []
+        for char in sorted(chars, key=lambda c: -c.box.y):
+            for baseline, members in buckets:
+                if abs(char.box.y - baseline) <= 0.5:
+                    members.append(char)
+                    break
+            else:
+                buckets.append((char.box.y, [char]))
 
         paragraphs: list[PdfParagraph] = []
-        for composition in carrier.pdf_paragraph_composition:
-            line = composition.pdf_line
+        for _baseline, members in buckets:
+            line = self.create_line(members).pdf_line
             if line is None or not line.pdf_character:
                 continue
             for piece in self._split_image_text_line_at_gaps(line):
