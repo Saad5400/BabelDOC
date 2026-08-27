@@ -81,6 +81,8 @@ from typing import Any
 import numpy
 import pymupdf
 
+from server import config
+
 logger = logging.getLogger("doctranslate.interlinear")
 
 # Serialises MuPDF's global glyph-height switch — see {@link _text_ink}.
@@ -276,7 +278,7 @@ class _GlossFont:
 
     def __init__(self, texts: list[str], options: OverlayOptions) -> None:
         self.archive = pymupdf.Archive()
-        self.archive.add(self._font_bytes(texts), "gloss.ttf")
+        self.archive.add(subset_font_bytes(_font_path(), texts), "gloss.ttf")
         self.css = (
             "@font-face {font-family: gloss; src: url(gloss.ttf);}"
             " body {margin: 0;}"
@@ -284,38 +286,41 @@ class _GlossFont:
             f" line-height: {options.line_height};}}"
         )
 
-    @staticmethod
-    def _font_bytes(texts: list[str]) -> bytes:
-        source = _font_path()
 
-        try:
-            from fontTools import subset
-        except ImportError:
-            # Correct, just fat and slow. Never a reason to refuse the render.
-            logger.warning("fontTools is unavailable; embedding the full gloss "
-                           "font (large output)")
-            return source.read_bytes()
+def subset_font_bytes(source: Path, texts: list[str]) -> bytes:
+    """`source` subset to what `texts` need — or whole, never refused.
 
-        try:
-            options = subset.Options()
-            options.layout_features = ["*"]
-            options.name_IDs = ["*"]
-            options.notdef_outline = True
-            options.drop_tables += ["DSIG"]
+    Shared with `server/page_fonts.py`, which sets the appendix pages in the
+    same face (plus its bold) and has the same 15 MB problem to solve.
+    """
+    try:
+        from fontTools import subset
+    except ImportError:
+        # Correct, just fat and slow. Never a reason to refuse the render.
+        logger.warning("fontTools is unavailable; embedding the full gloss "
+                       "font (large output)")
+        return source.read_bytes()
 
-            font = subset.load_font(str(source), options)
-            subsetter = subset.Subsetter(options=options)
-            subsetter.populate(unicodes=_subset_codepoints(texts))
-            subsetter.subset(font)
+    try:
+        options = subset.Options()
+        options.layout_features = ["*"]
+        options.name_IDs = ["*"]
+        options.notdef_outline = True
+        options.drop_tables += ["DSIG"]
 
-            buffer = BytesIO()
-            subset.save_font(font, buffer, options)
+        font = subset.load_font(str(source), options)
+        subsetter = subset.Subsetter(options=options)
+        subsetter.populate(unicodes=_subset_codepoints(texts))
+        subsetter.subset(font)
 
-            return buffer.getvalue()
-        except Exception:  # noqa: BLE001 - subsetting is an optimisation
-            logger.exception("subsetting the gloss font failed; using it whole")
+        buffer = BytesIO()
+        subset.save_font(font, buffer, options)
 
-            return source.read_bytes()
+        return buffer.getvalue()
+    except Exception:  # noqa: BLE001 - subsetting is an optimisation
+        logger.exception("subsetting the gloss font failed; using it whole")
+
+        return source.read_bytes()
 
 
 def _subset_codepoints(texts: list[str]) -> set[int]:
@@ -2189,6 +2194,38 @@ def render_overlay(original_bytes: bytes, sidecar: Any,
     doc, report = build(original_bytes, sidecar, layout)
 
     try:
+        # A sidecar that carries "vocab" (server/vocab.py wrote it after the
+        # mono run) gets the same «كلمات هذه الصفحة» pages the mono result
+        # has: each original page is followed by its own new-words page —
+        # whichever lane (spaced or compact) built it. Best-effort: an
+        # overlay must not fail over its vocab layer. Lazy import —
+        # vocab_pages draws on the shared page-fonts machinery, which imports
+        # this module for the font subsetter.
+        vocab_added = 0
+
+        if config.VOCAB_PAGES and isinstance(sidecar.get("vocab"), dict):
+            from server import vocab_pages
+
+            anchors = {}
+
+            for key in sidecar["vocab"]:
+                try:
+                    number = int(key)
+                except (TypeError, ValueError):
+                    continue
+
+                if 0 <= number < doc.page_count:
+                    anchors[number] = number
+
+            try:
+                vocab_added = sum(vocab_pages.interleave_vocab(
+                    doc, sidecar["vocab"], anchors).values())
+            except Exception:  # noqa: BLE001 - the vocab layer is optional
+                logger.exception("interlinear: inserting vocab pages failed; "
+                                 "returning the overlay without them")
+
+        report["vocab_pages"] = vocab_added
+
         out = BytesIO()
         # garbage=4 is what collapses the one-font-copy-per-box the Story
         # engine leaves behind into a single embedded subset.

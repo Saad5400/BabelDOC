@@ -10,13 +10,33 @@ Conventions:
 - alternating: original page 1, translated page 1, original page 2, ...
 - side_by_side: one double-width page per pair, translated half on the
   RIGHT (Arabic/RTL readers scan right-first).
-- Page-count mismatch: the shorter document is padded with blanks sized
-  like the twin page, so every pair stays aligned.
+- Original longer: the translated side is padded with blanks sized like the
+  twin page, so every pair stays aligned.
+- Translated longer: the extra TAIL pages are appended whole at the end
+  rather than paired with blanks — a mono result may carry appended appendix
+  pages of its own, and an appendix page facing a blank reads as a mistake.
+
+SIDECAR: a caller may also send the run's sidecar. When it carries the
+"vocab" entries server/vocab.py selected, each content page's «كلمات هذه
+الصفحة» page is rendered fresh and inserted right after that page's unit in
+the dual — and the translated input's own baked-in extra pages are taken
+back out first: exactly, via the sidecar's "artifact_layout" when the mono
+was interleaved, else by trimming everything past the page count the sidecar
+records. Without a sidecar the tail-append rule above keeps an
+appendix-tailed mono usable as-is.
 """
 
+import logging
 from io import BytesIO
 
-from pypdf import PageObject, PdfReader, PdfWriter, Transformation
+from pypdf import PageObject
+from pypdf import PdfReader
+from pypdf import PdfWriter
+from pypdf import Transformation
+
+from server import config
+
+logger = logging.getLogger("doctranslate.compose")
 
 COMPOSE_FORMATS = ("alternating", "side_by_side")
 
@@ -48,23 +68,29 @@ def _size(page: PageObject) -> tuple[float, float]:
     return float(box.width), float(box.height)
 
 
-def _pairs(original: PdfReader, translated: PdfReader):
-    """Yield (original_page, translated_page) with None past the shorter end."""
-    for i in range(max(len(original.pages), len(translated.pages))):
-        yield (original.pages[i] if i < len(original.pages) else None,
-               translated.pages[i] if i < len(translated.pages) else None)
+def _split(original: PdfReader,
+           translated_pages: list[PageObject]) -> tuple[list, list]:
+    """`translated_pages` as (body paired with the original, appended tail)."""
+    count = len(original.pages)
+    return list(translated_pages[:count]), list(translated_pages[count:])
 
 
-def _alternating(original: PdfReader, translated: PdfReader) -> PdfWriter:
+def _alternating(original: PdfReader,
+                 translated_pages: list[PageObject]) -> PdfWriter:
     writer = PdfWriter()
-    for orig, trans in _pairs(original, translated):
-        # A missing page becomes a blank sized like its twin (one of the two
-        # always exists — both inputs are non-empty).
-        twin_w, twin_h = _size(orig if orig is not None else trans)
-        writer.add_page(orig if orig is not None else
-                        PageObject.create_blank_page(width=twin_w, height=twin_h))
-        writer.add_page(trans if trans is not None else
-                        PageObject.create_blank_page(width=twin_w, height=twin_h))
+    body, tail = _split(original, translated_pages)
+    for index, orig in enumerate(original.pages):
+        trans = body[index] if index < len(body) else None
+        writer.add_page(orig)
+        # A missing translated page becomes a blank sized like its twin.
+        if trans is not None:
+            writer.add_page(trans)
+        else:
+            twin_w, twin_h = _size(orig)
+            writer.add_page(PageObject.create_blank_page(width=twin_w,
+                                                         height=twin_h))
+    for page in tail:
+        writer.add_page(page)
     return writer
 
 
@@ -81,30 +107,181 @@ def _merge_into_half(target: PageObject, source: PageObject,
         source, Transformation().scale(scale).translate(tx, ty))
 
 
-def _side_by_side(original: PdfReader, translated: PdfReader) -> PdfWriter:
+def _side_by_side(original: PdfReader,
+                  translated_pages: list[PageObject]) -> PdfWriter:
     writer = PdfWriter()
-    for orig, trans in _pairs(original, translated):
+    body, tail = _split(original, translated_pages)
+    for index, orig in enumerate(original.pages):
+        trans = body[index] if index < len(body) else None
         sizes = [_size(p) for p in (orig, trans) if p is not None]
         half_width = max(w for w, _ in sizes)
         height = max(h for _, h in sizes)
         page = writer.add_blank_page(width=2 * half_width, height=height)
         # Original on the left, translated on the right; a missing twin
         # simply leaves its half blank.
-        if orig is not None:
-            _merge_into_half(page, orig, 0.0, half_width, height)
+        _merge_into_half(page, orig, 0.0, half_width, height)
         if trans is not None:
             _merge_into_half(page, trans, half_width, half_width, height)
+    # Tail pages carry no original twin; appended whole, at their own size.
+    for page in tail:
+        writer.add_page(page)
     return writer
 
 
+def _artifact_content_positions(sidecar, page_count: int) -> list[int] | None:
+    """The baked mono's content-page positions, when the sidecar records them.
+
+    A mono whose vocab pages were interleaved (server/pipeline.py) records
+    `"artifact_layout": {"content_pages": [...]}` — index i is where content
+    page i sits in the baked file. That generalizes the tail-trim below: the
+    content pages are picked out EXACTLY, and everything else (interleaved
+    vocab pages, any baked appendix tail) is dropped — the vocab is rendered
+    fresh at the composed layout instead.
+
+    None means "no usable layout" and the caller falls back to the
+    total_pages tail-trim — which keeps every pre-feature sidecar working
+    unchanged. The sidecar is uploader-supplied here, so the list is
+    distrusted: anything but strictly increasing ints is refused whole, and a
+    position past the file is skipped (the layout describes a longer file
+    than the one sent; the pages that do exist still pair correctly).
+    """
+    if not isinstance(sidecar, dict):
+        return None
+
+    layout = sidecar.get("artifact_layout")
+
+    if not isinstance(layout, dict):
+        return None
+
+    positions = layout.get("content_pages")
+
+    if not isinstance(positions, list) or not positions:
+        return None
+
+    for index, position in enumerate(positions):
+        if not isinstance(position, int) or isinstance(position, bool):
+            return None
+        if position < 0 or (index and position <= positions[index - 1]):
+            return None
+
+    kept = [position for position in positions if position < page_count]
+
+    return kept or None
+
+
+def _content_page_count(sidecar: dict) -> int | None:
+    """How many pages the TRANSLATION itself has, per the sidecar's records.
+
+    Everything past this count in the translated input is a baked-in appendix
+    tail the mono result carries for its own readers — dropped here rather
+    than paired, so the dual never duplicates it.
+    """
+    count = sidecar.get("total_pages")
+
+    if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+        return count
+
+    pages = sidecar.get("pages")
+
+    return len(pages) if isinstance(pages, list) and pages else None
+
+
+def _insert_vocab_pages(composed: bytes, sidecar: dict, fmt: str,
+                        original_count: int, content_count: int) -> bytes:
+    """`composed` with each page's vocab page after its pair — or unchanged.
+
+    Content page N's vocab follows page N's whole unit in the dual: the
+    (original, translated) pair for `alternating`, the wide page for
+    `side_by_side`. A content page past the original (the translated-longer
+    tail) sits whole at the end, and its vocab page follows it there.
+    Best-effort on purpose: the dual the caller paid nothing for must not 422
+    over its vocab layer.
+    """
+    vocab = sidecar.get("vocab")
+
+    if not isinstance(vocab, dict) or not vocab:
+        return composed
+
+    import pymupdf
+
+    from server import vocab_pages
+
+    anchors: dict[int, int] = {}
+
+    for key in vocab:
+        try:
+            number = int(key)
+        except (TypeError, ValueError):
+            continue
+
+        if number < 0 or (number >= original_count
+                          and number >= content_count):
+            continue  # no such content page in this dual
+
+        if fmt == "alternating":
+            anchors[number] = (2 * number + 1 if number < original_count
+                               else original_count + number)
+        else:
+            anchors[number] = number
+
+    if not anchors:
+        return composed
+
+    doc = pymupdf.open(stream=BytesIO(composed), filetype="pdf")
+
+    try:
+        if not vocab_pages.interleave_vocab(doc, vocab, anchors):
+            return composed
+
+        out = BytesIO()
+        # garbage=4 folds the per-box copies of the subset row font into one.
+        doc.save(out, garbage=4, deflate=True)
+
+        return out.getvalue()
+    finally:
+        doc.close()
+
+
 def compose_dual(original_bytes: bytes, translated_bytes: bytes,
-                 fmt: str) -> bytes:
-    """Build the requested dual variant; raises ComposeError on bad input."""
+                 fmt: str, sidecar: dict | None = None) -> bytes:
+    """Build the requested dual variant; raises ComposeError on bad input.
+
+    `sidecar` is optional and changes nothing when absent — see the module
+    docstring for what a sidecar adds.
+    """
     if fmt not in COMPOSE_FORMATS:
         raise ComposeError(f"format must be one of {COMPOSE_FORMATS}")
     original = _read(original_bytes, "original")
     translated = _read(translated_bytes, "translated")
+
+    translated_pages = list(translated.pages)
+    positions = _artifact_content_positions(sidecar, len(translated_pages))
+
+    if positions is not None:
+        # The baked mono's own interleaved vocab pages (and any appendix
+        # tail) are dropped here; the vocab is rendered fresh below, at the
+        # composed layout.
+        translated_pages = [translated_pages[i] for i in positions]
+    elif isinstance(sidecar, dict):
+        content = _content_page_count(sidecar)
+        if content is not None and content < len(translated_pages):
+            # Drop the mono result's baked-in appendix tail; whatever the
+            # sidecar carries for those pages is rendered fresh below.
+            translated_pages = translated_pages[:content]
+
     build = _alternating if fmt == "alternating" else _side_by_side
     out = BytesIO()
-    build(original, translated).write(out)
-    return out.getvalue()
+    build(original, translated_pages).write(out)
+    composed = out.getvalue()
+
+    # The vocab pages live in the body, right after each pair. Best-effort.
+    if config.VOCAB_PAGES and isinstance(sidecar, dict):
+        try:
+            composed = _insert_vocab_pages(composed, sidecar, fmt,
+                                           len(original.pages),
+                                           len(translated_pages))
+        except Exception:  # noqa: BLE001 - the vocab layer is optional
+            logger.exception("compose: inserting vocab pages failed; "
+                             "returning the dual without them")
+
+    return composed
