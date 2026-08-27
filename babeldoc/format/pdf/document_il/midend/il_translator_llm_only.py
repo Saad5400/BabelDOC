@@ -109,11 +109,11 @@ $json_input_str"""
 # pairs that break it are discarded per paragraph, never repaired.
 PHRASE_PAIRS_PROMPT_BLOCK = """
 ## Phrase Pairs
-For every input item that has "want_pairs": true, ALSO add a "pairs" field to that output item: an ordered JSON array of {"s": <source phrase>, "t": <translated phrase>} objects segmenting BOTH texts completely.
+For every input item that has "want_pairs": true, ALSO add a "pairs" field to that output item: a JSON array of {"s": <source phrase>, "t": <translated phrase>} objects segmenting BOTH texts completely.
+- Align by MEANING: each "t" is the translation of its "s". List the pairs in the SOURCE text's order; each "t" phrase will be located in your output wherever your translation actually put it — the two languages may order the phrases differently, and that is fine. NEVER pair a phrase with target words that merely occupy the same position.
 - Split into 2-8 phrases; longer sentences get more phrases.
-- Concatenating all "s" values with single spaces must reproduce the item's "input" exactly; concatenating all "t" values must reproduce your "output" exactly.
+- Every word of the item's "input" must appear in exactly one "s" phrase, and every word of your "output" in exactly one "t" phrase: concatenating all "s" values with single spaces reproduces the input exactly, and the "t" values, rearranged into your output's own order, reproduce the output exactly.
 - Split ONLY between whole words. NEVER split inside a word.
-- Keep the phrase ORDER identical on both sides: the first pair is the start of the input AND the start of the output. When the languages reorder words, use larger phrases so the order still matches.
 - Items without "want_pairs" must NOT get a "pairs" field.
 
 ### Phrase pairs example
@@ -121,7 +121,7 @@ Input:
 [
     {
     "id": 0,
-    "input": "We can not create two local variables with the same name",
+    "input": "A local variable must be declared before it is used.",
     "layout_label": "text",
     "want_pairs": true
     }
@@ -130,15 +130,15 @@ Output:
 [
     {
     "id": 0,
-    "output": "لا يمكننا إنشاء متغيرين محليين بالاسم نفسه",
+    "output": "يجب الإعلان عن المتغير المحلي قبل استخدامه.",
     "pairs": [
-        {"s": "We can not", "t": "لا يمكننا"},
-        {"s": "create", "t": "إنشاء"},
-        {"s": "two local variables", "t": "متغيرين محليين"},
-        {"s": "with the same name", "t": "بالاسم نفسه"}
+        {"s": "A local variable", "t": "المتغير المحلي"},
+        {"s": "must be declared", "t": "يجب الإعلان عن"},
+        {"s": "before it is used.", "t": "قبل استخدامه."}
     ]
     }
 ]
+Note how the Arabic starts with «يجب الإعلان عن» even though its pair is listed second: the pairs follow the SOURCE order and the meaning, not the output's word positions.
 """
 
 
@@ -1022,7 +1022,8 @@ class ILTranslatorLLMOnly:
                 raw_pairs, source_text, paragraph.unicode or ""
             )
             if validated:
-                store[id(paragraph)] = validated
+                pairs, permutation = validated
+                store[id(paragraph)] = {"pairs": pairs, "perm": permutation}
                 self.pairs_kept += 1
             else:
                 self.pairs_discarded += 1

@@ -38,7 +38,12 @@ own `transformation_matrix` (and must neutralise page rotation first — see
 
 PHRASE PAIRS are the one late arrival. When the LLM translator also returned a
 validated phrase segmentation (see `phrase_pairs.py`), a block carries "pairs":
-ordered `{s, t, s_rects, t_rects}` entries. `s_rects` live in the same
+`{s, t, s_rects, t_rects}` entries listed in SOURCE order. The alignment is by
+MEANING, so the translation may put the same phrases in a different order —
+`phrase_pairs.tile_permutation` says where each pair's "t" actually sits, and
+each entry's `t_rects` are that pair's OWN rectangles wherever they landed;
+nothing about an entry's list position implies a position on the translated
+page. `s_rects` live in the same
 original-page space as everything above; `t_rects` are the phrases' rectangles
 in the TRANSLATED output page — they only exist once Typesetting has drawn the
 translation, so {@link attach_target_rects} adds them after the fact and
@@ -270,14 +275,16 @@ def _pairs_entries(
 ) -> list[dict[str, Any]]:
     """One block's "pairs" value: the aligned phrases, with source rects.
 
-    `s_rects` come from the snapshotted ORIGINAL characters, so they live in
-    the same space as the block's own box and lines — the original page's PDF
-    user space (y up). They are attached only when every phrase maps onto the
-    character stream exactly ({@link phrase_pairs.match_phrases_to_rects});
-    otherwise the entries carry the text alignment alone, because a phrase
-    highlight in the wrong place is worse than none. `t_rects` cannot exist
-    yet — the translated characters only get boxes at typesetting — and are
-    filled in by {@link attach_target_rects} afterwards.
+    The entries stay in the pairs' SOURCE order. `s_rects` come from the
+    snapshotted ORIGINAL characters, so they live in the same space as the
+    block's own box and lines — the original page's PDF user space (y up).
+    They are attached only when every phrase maps onto the character stream
+    exactly ({@link phrase_pairs.match_phrases_to_rects}); otherwise the
+    entries carry the text alignment alone, because a phrase highlight in the
+    wrong place is worse than none. `t_rects` cannot exist yet — the
+    translated characters only get boxes at typesetting — and are filled in
+    by {@link attach_target_rects} afterwards, in the translation's own
+    phrase order.
     """
     entries = [{"s": pair["s"], "t": pair["t"]} for pair in pairs]
 
@@ -298,17 +305,19 @@ def build_sidecar(
     lang_in: str,
     lang_out: str,
     sources: dict[int, dict[int, dict]] | None = None,
-    pair_store: dict[int, list[dict]] | None = None,
-    pending_pairs: list[tuple[list[dict], il_version_1.PdfParagraph]] | None = None,
+    pair_store: dict[int, dict] | None = None,
+    pending_pairs: list[tuple[list[dict], il_version_1.PdfParagraph, list[int]]]
+    | None = None,
 ) -> dict[str, Any]:
     """The sidecar document for a translated, NOT YET typeset, IL.
 
-    `pair_store` (id(paragraph) → validated phrase pairs, filled by
-    ILTranslatorLLMOnly) adds a "pairs" key to the blocks whose paragraphs
-    have one; blocks without pairs — and every sidecar from a run without the
-    feature — are unchanged. `pending_pairs`, when given, collects
-    (entries, paragraph) for {@link attach_target_rects} to resolve target
-    rects after typesetting.
+    `pair_store` (id(paragraph) → {"pairs": validated phrase pairs, "perm":
+    their order in the translation}, filled by ILTranslatorLLMOnly) adds a
+    "pairs" key to the blocks whose paragraphs have one; blocks without
+    pairs — and every sidecar from a run without the feature — are unchanged.
+    `pending_pairs`, when given, collects (entries, paragraph, permutation)
+    for {@link attach_target_rects} to resolve target rects after
+    typesetting.
     """
     sources = sources or {}
     pair_store = pair_store or {}
@@ -348,13 +357,15 @@ def build_sidecar(
                 "label": paragraph.layout_label,
             }
 
-            pairs = pair_store.get(id(paragraph))
-            if pairs:
+            record = pair_store.get(id(paragraph))
+            if record:
                 try:
-                    entries = _pairs_entries(pairs, source)
+                    entries = _pairs_entries(record["pairs"], source)
                     block["pairs"] = entries
                     if pending_pairs is not None:
-                        pending_pairs.append((entries, paragraph))
+                        pending_pairs.append(
+                            (entries, paragraph, record["perm"])
+                        )
                 except Exception:  # noqa: BLE001 - pairs are a bonus, never a risk
                     logger.exception(
                         "sidecar: dropping phrase pairs for a paragraph on "
@@ -392,7 +403,7 @@ def write_sidecar(
     lang_in: str,
     lang_out: str,
     sources: dict[int, dict[int, dict]] | None = None,
-    pair_store: dict[int, list[dict]] | None = None,
+    pair_store: dict[int, dict] | None = None,
 ) -> dict[str, Any] | None:
     """Write the sidecar beside a run's output.
 
@@ -406,7 +417,9 @@ def write_sidecar(
     return None, write once, and the file never changes again.
     """
     try:
-        pending_pairs: list[tuple[list[dict], il_version_1.PdfParagraph]] = []
+        pending_pairs: list[
+            tuple[list[dict], il_version_1.PdfParagraph, list[int]]
+        ] = []
         sidecar = build_sidecar(docs, lang_in=lang_in, lang_out=lang_out,
                                 sources=sources, pair_store=pair_store,
                                 pending_pairs=pending_pairs)
@@ -436,11 +449,18 @@ def attach_target_rects(state: dict[str, Any] | None) -> None:
     The glyphs the typeset paragraph stores are Arabic PRESENTATION forms in
     logical order (typesetting reshapes before rendering and its RTL pass
     only moves boxes); {@link phrase_pairs.match_phrases_to_rects} folds that
-    back to comparable text. A paragraph whose typeset characters no longer
-    spell its own translation — a formula slipped in, glyphs were dropped —
-    keeps its pairs and `s_rects` but gets no `t_rects`: partial data is
-    fine, wrong boxes are not. Never raises; the sidecar on disk (written
-    before typesetting) survives any failure here untouched.
+    back to comparable text. The matcher consumes phrases SEQUENTIALLY
+    against that stream, and the translation may order its phrases
+    differently than the source-ordered entries — so the phrases are fed in
+    TARGET order, via the permutation validation derived when it tiled the
+    applied target text ({@link phrase_pairs.validate_pairs}, carried through
+    the pair store), and the k-th resolved rect list is assigned back to the
+    entry the k-th tile belongs to. A paragraph whose typeset
+    characters no longer spell its own translation — a formula slipped in,
+    glyphs were dropped — keeps its pairs and `s_rects` but gets no
+    `t_rects`: partial data is fine, wrong boxes are not. Never raises; the
+    sidecar on disk (written before typesetting) survives any failure here
+    untouched.
     """
     if not state:
         return
@@ -448,16 +468,17 @@ def attach_target_rects(state: dict[str, Any] | None) -> None:
     try:
         resolved_any = False
 
-        for entries, paragraph in state["pending"]:
+        for entries, paragraph, permutation in state["pending"]:
             try:
                 rects = phrase_pairs.match_phrases_to_rects(
                     _char_tuples(paragraph),
-                    [entry["t"] for entry in entries],
+                    [entries[index]["t"] for index in permutation],
                 )
                 if rects is None:
                     continue
-                for entry, phrase_rects in zip(entries, rects, strict=True):
-                    entry["t_rects"] = phrase_rects
+                for index, phrase_rects in zip(permutation, rects,
+                                               strict=True):
+                    entries[index]["t_rects"] = phrase_rects
                 resolved_any = True
             except Exception:  # noqa: BLE001 - one paragraph never spoils the rest
                 logger.exception("sidecar: target rects failed for a paragraph")

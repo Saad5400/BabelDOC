@@ -28,6 +28,21 @@ PAIRS = [
     {"s": "two local variables", "t": "متغيرين محليين"},
     {"s": "with the same name", "t": "بالاسم نفسه"},
 ]
+# A monotonic segmentation: each pair sits at the same position in both texts.
+IDENTITY = [0, 1, 2, 3]
+
+# The owner's real e2e case: Arabic legitimately REORDERS the sentence — the
+# verb phrase «يجب الإعلان عن» comes FIRST in the translation although its
+# source phrase is the sentence's second. Pairs are aligned by MEANING and
+# listed in SOURCE order; the permutation says where each landed.
+REORDER_SOURCE = "A local variable must be declared before it is used."
+REORDER_TARGET = "يجب الإعلان عن المتغير المحلي قبل استخدامه."
+REORDER_PAIRS = [
+    {"s": "A local variable", "t": "المتغير المحلي"},
+    {"s": "must be declared", "t": "يجب الإعلان عن"},
+    {"s": "before it is used.", "t": "قبل استخدامه."},
+]
+REORDER_PERM = [1, 0, 2]  # target tile k belongs to pair REORDER_PERM[k]
 
 
 # --- the prompt asks for pairs, in the shape the parser accepts back ---------
@@ -40,8 +55,10 @@ def test_the_prompt_template_carries_the_pairs_block_slot():
 def test_the_pairs_instruction_teaches_the_contract_with_a_worked_example():
     assert '"want_pairs": true' in PHRASE_PAIRS_PROMPT_BLOCK
     assert "NEVER split inside a word" in PHRASE_PAIRS_PROMPT_BLOCK
-    # The owner's worked example, whole: every phrase of both sides.
-    for pair in PAIRS:
+    # Alignment is by MEANING, and the worked example is the owner's real
+    # reordering case: every phrase of both sides appears verbatim.
+    assert "MEANING" in PHRASE_PAIRS_PROMPT_BLOCK
+    for pair in REORDER_PAIRS:
         assert pair["s"] in PHRASE_PAIRS_PROMPT_BLOCK
         assert pair["t"] in PHRASE_PAIRS_PROMPT_BLOCK
 
@@ -72,17 +89,73 @@ def test_malformed_pairs_are_rejected_at_the_door():
         assert phrase_pairs.pairs_from_item({"id": 0, "pairs": bad}) is None
 
 
+# --- the tiler: target phrases located wherever the translation put them -----
+
+
+def test_a_monotonic_segmentation_tiles_as_the_identity():
+    assert phrase_pairs.tile_permutation(
+        [p["t"].split() for p in PAIRS], TARGET.split()) == IDENTITY
+
+
+def test_a_reordered_translation_tiles_by_meaning():
+    assert phrase_pairs.tile_permutation(
+        [p["t"].split() for p in REORDER_PAIRS],
+        REORDER_TARGET.split()) == REORDER_PERM
+
+
+def test_phrases_that_do_not_tile_the_text_answer_none():
+    for phrases, full in (
+        ([["a"], ["b"]], ["a", "c"]),          # wrong token
+        ([["a"], ["b"]], ["a", "b", "c"]),     # leftover text
+        ([["a", "b"], ["c"]], ["a", "c"]),     # token counts differ
+        ([["a"], []], ["a"]),                  # an empty phrase
+        ([], ["a"]),                           # no phrases at all
+        ([["a"]] * (phrase_pairs.MAX_PAIRS + 1),
+         ["a"] * (phrase_pairs.MAX_PAIRS + 1)),  # runaway
+    ):
+        assert phrase_pairs.tile_permutation(phrases, full) is None
+
+
+def test_identical_duplicate_phrases_are_assigned_deterministically():
+    # Two interchangeable «نعم» phrases: the tiler pins the lowest pair index
+    # to the earliest target position, every time.
+    assert phrase_pairs.tile_permutation(
+        [["نعم"], ["لا"], ["نعم"]],
+        ["نعم", "نعم", "لا"]) == [0, 2, 1]
+
+
+def test_a_pathological_duplicate_heavy_tiling_fails_closed():
+    # Distinct all-"a" phrases of every length 1..10 against a text whose LAST
+    # token can never match: every complete placement fails at the end, so the
+    # naive search would grind through factorially many orders. The step
+    # budget answers None instead of spinning.
+    phrases = [["a"] * n for n in range(1, 11)]
+    full = ["a"] * (sum(range(1, 11)) - 1) + ["b"]
+
+    assert phrase_pairs.tile_permutation(phrases, full) is None
+
+
 # --- validation: the strict segmentation contract ----------------------------
 
 
 def test_a_complete_ordered_segmentation_passes():
-    assert phrase_pairs.validate_pairs(PAIRS, SOURCE, TARGET) == PAIRS
+    assert phrase_pairs.validate_pairs(PAIRS, SOURCE, TARGET) == (
+        PAIRS, IDENTITY)
+
+
+def test_a_reordered_translation_validates_with_its_permutation():
+    # The owner's ruling: matching colours mean matching MEANING. The pairs
+    # stay in source order; the permutation records the Arabic's own order.
+    assert phrase_pairs.validate_pairs(
+        REORDER_PAIRS, REORDER_SOURCE, REORDER_TARGET) == (
+        REORDER_PAIRS, REORDER_PERM)
 
 
 def test_validation_normalises_whitespace_but_nothing_else():
     sloppy = [{"s": "  We   can not", "t": "لا  يمكننا "}] + PAIRS[1:]
 
-    assert phrase_pairs.validate_pairs(sloppy, f"  {SOURCE} ", TARGET) == PAIRS
+    assert phrase_pairs.validate_pairs(sloppy, f"  {SOURCE} ", TARGET) == (
+        PAIRS, IDENTITY)
 
 
 def test_pairs_that_do_not_reproduce_the_source_are_discarded():
@@ -125,7 +198,8 @@ def test_diacritics_the_postprocessor_stripped_are_absorbed():
     # stripped form — the one the sidecar's target actually says.
     diacritized = [{"s": "We can not", "t": "لا يُمكننا"}, *PAIRS[1:]]
 
-    assert phrase_pairs.validate_pairs(diacritized, SOURCE, TARGET) == PAIRS
+    assert phrase_pairs.validate_pairs(diacritized, SOURCE, TARGET) == (
+        PAIRS, IDENTITY)
 
 
 def test_empty_inputs_never_validate():
@@ -264,8 +338,10 @@ def _translated_document():
     docs = _document([paragraph])
     sources = translation_sidecar.snapshot_source(docs)
     paragraph.unicode = "لا يمكننا إنشاء"
-    pair_store = {id(paragraph): [{"s": "We can not", "t": "لا يمكننا"},
-                                  {"s": "create", "t": "إنشاء"}]}
+    pair_store = {id(paragraph): {
+        "pairs": [{"s": "We can not", "t": "لا يمكننا"},
+                  {"s": "create", "t": "إنشاء"}],
+        "perm": [0, 1]}}
     return docs, sources, pair_store, paragraph
 
 
@@ -320,6 +396,44 @@ def test_target_rects_are_resolved_after_typesetting(tmp_path):
     assert pairs[0]["s_rects"] == [[60.0, 704.0, 120.0, 714.0]]
 
 
+def test_a_reordered_translation_gets_its_target_rects_on_the_right_pairs(
+        tmp_path):
+    """The owner's e2e defect, end to end: the Arabic puts «يجب الإعلان عن»
+    FIRST although its pair is listed second, and every pair's t_rects must
+    land on ITS OWN phrase — wherever the translation put it."""
+    paragraph = _paragraph(
+        REORDER_SOURCE, _box(60, 680, 400, 714),
+        compositions=[_char_run(REORDER_SOURCE, 714, 60, step=5.0)])
+    docs = _document([paragraph])
+    sources = translation_sidecar.snapshot_source(docs)
+    paragraph.unicode = REORDER_TARGET
+    pairs, perm = phrase_pairs.validate_pairs(
+        REORDER_PAIRS, REORDER_SOURCE, REORDER_TARGET)
+    pair_store = {id(paragraph): {"pairs": pairs, "perm": perm}}
+    path = tmp_path / "sidecar.json"
+
+    state = translation_sidecar.write_sidecar(
+        docs, path, lang_in="en", lang_out="ar", sources=sources,
+        pair_store=pair_store)
+    assert state is not None
+
+    _typeset(paragraph)
+    translation_sidecar.attach_target_rects(state)
+
+    written = json.loads(path.read_text(encoding="utf-8"))["pages"][0][
+        "blocks"][0]["pairs"]
+    # Entries stayed in SOURCE order…
+    assert [(p["s"], p["t"]) for p in written] == [
+        (p["s"], p["t"]) for p in REORDER_PAIRS]
+    assert all(pair["t_rects"] for pair in written)
+    # …while the rects follow the TRANSLATION's order. The typeset line runs
+    # right-to-left, so the pair whose phrase comes FIRST in the Arabic —
+    # «يجب الإعلان عن», listed second — sits furthest RIGHT, then «المتغير
+    # المحلي» (listed first), then «قبل استخدامه.» (listed third).
+    assert (written[1]["t_rects"][0][0] > written[0]["t_rects"][0][0]
+            > written[2]["t_rects"][0][0])
+
+
 def test_unmatchable_typeset_text_keeps_pairs_but_omits_target_rects(tmp_path):
     docs, sources, pair_store, paragraph = _translated_document()
     path = tmp_path / "sidecar.json"
@@ -350,8 +464,9 @@ def test_a_run_without_pairs_writes_the_sidecar_exactly_as_before(tmp_path):
     # produce the identical document — and never a "pairs" key.
     assert json.dumps(build(pair_store={}), ensure_ascii=False,
                       sort_keys=True) == today
-    assert json.dumps(build(pair_store={12345: PAIRS}), ensure_ascii=False,
-                      sort_keys=True) == today
+    assert json.dumps(build(pair_store={12345: {"pairs": PAIRS,
+                                                "perm": IDENTITY}}),
+                      ensure_ascii=False, sort_keys=True) == today
     assert '"pairs"' not in today
 
     # And the write path reports nothing to finalize.
@@ -370,8 +485,10 @@ def test_a_source_that_cannot_be_mapped_keeps_the_pairs_textual():
     docs = _document([paragraph])
     sources = translation_sidecar.snapshot_source(docs)
     paragraph.unicode = "لا يمكننا إنشاء"
-    pair_store = {id(paragraph): [{"s": "We can not", "t": "لا يمكننا"},
-                                  {"s": "create", "t": "إنشاء"}]}
+    pair_store = {id(paragraph): {
+        "pairs": [{"s": "We can not", "t": "لا يمكننا"},
+                  {"s": "create", "t": "إنشاء"}],
+        "perm": [0, 1]}}
 
     block = translation_sidecar.build_sidecar(
         docs, lang_in="en", lang_out="ar", sources=sources,
@@ -386,4 +503,7 @@ def test_attach_target_rects_swallows_a_broken_state(tmp_path):
     translation_sidecar.attach_target_rects(None)
     translation_sidecar.attach_target_rects(
         {"path": tmp_path / "nope.json", "sidecar": {}, "pending": [
-            (["not-an-entry"], object())]})  # garbage in, silence out
+            (["not-an-entry"], object(), [0])]})  # garbage in, silence out
+    translation_sidecar.attach_target_rects(
+        {"path": tmp_path / "nope.json", "sidecar": {}, "pending": [
+            ("wrong", "shape")]})  # even the tuple arity is untrusted

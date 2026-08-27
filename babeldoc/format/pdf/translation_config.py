@@ -241,10 +241,14 @@ class TranslationConfig:
         )
         self.capture_phrase_pairs = bool(capture_phrase_pairs)
         # Runtime store, filled by ILTranslatorLLMOnly as paragraphs come
-        # back: id(paragraph) → validated pairs. Keyed by identity because
-        # the IL dataclasses are slotted (no ad-hoc attributes) and the
-        # paragraph objects live in `docs` until well past the sidecar write.
-        self.phrase_pair_store: dict[int, list[dict]] = {}
+        # back: id(paragraph) → {"pairs": validated pairs (source order),
+        # "perm": the pairs' order in the translation (phrase_pairs.
+        # tile_permutation, computed once at validation against the applied
+        # target text and carried to attach_target_rects)}. Keyed by identity
+        # because the IL dataclasses are slotted (no ad-hoc attributes) and
+        # the paragraph objects live in `docs` until well past the sidecar
+        # write.
+        self.phrase_pair_store: dict[int, dict] = {}
         self.input_file = input_file
         self.lang_in = lang_in
         self.lang_out = lang_out

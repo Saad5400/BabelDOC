@@ -230,6 +230,72 @@ def test_a_chunk_straddling_a_phrase_boundary_gets_both_colours():
         f"{AMBER}لا يمكننا</span> {SKY}إنشاء</span>")
 
 
+def test_a_reordered_gloss_keeps_colours_bound_to_meaning():
+    # The owner's e2e case: the Arabic REORDERS the sentence's phrases. Pairs
+    # are listed in SOURCE order; «يجب الإعلان عن» is pair 1's phrase and gets
+    # pair 1's colour even though it comes FIRST in the gloss.
+    reorder_pairs = [
+        {"s": "A local variable", "t": "المتغير المحلي"},
+        {"s": "must be declared", "t": "يجب الإعلان عن"},
+        {"s": "before it is used.", "t": "قبل استخدامه."},
+    ]
+    target = "يجب الإعلان عن المتغير المحلي قبل استخدامه."
+    gh = phrase_highlights.gloss_highlighter(target, reorder_pairs)
+
+    assert gh is not None
+    assert gh.html(target) == (
+        f"{SKY}يجب الإعلان عن</span> "
+        f"{AMBER}المتغير المحلي</span> "
+        f'<span style="background-color:{phrase_highlights.span_color(2)}">'
+        "قبل استخدامه.</span>")
+
+
+def test_a_reordered_gloss_spreads_chunk_by_chunk_with_meaning_colours():
+    reorder_pairs = [
+        {"s": "A local variable", "t": "المتغير المحلي"},
+        {"s": "must be declared", "t": "يجب الإعلان عن"},
+        {"s": "before it is used.", "t": "قبل استخدامه."},
+    ]
+    gh = phrase_highlights.gloss_highlighter(
+        "يجب الإعلان عن المتغير المحلي قبل استخدامه.", reorder_pairs)
+
+    # Chunks consume the gloss in TARGET order; a straddling chunk carries
+    # both its phrases' colours, still bound to the SOURCE pair indexes.
+    assert gh.html("يجب الإعلان") == f"{SKY}يجب الإعلان</span>"
+    straddle = gh.html("عن المتغير")
+    assert f"{SKY}عن</span>" in straddle
+    assert f"{AMBER}المتغير</span>" in straddle
+    assert gh.html("المحلي قبل استخدامه.") == (
+        f"{AMBER}المحلي</span> "
+        f'<span style="background-color:{phrase_highlights.span_color(2)}">'
+        "قبل استخدامه.</span>")
+
+
+def test_identical_duplicate_phrases_colour_deterministically():
+    # Two interchangeable «نعم» phrases: the shared tiler pins the lowest pair
+    # index to the earliest gloss position, so the colours never flicker
+    # between renders.
+    gh = phrase_highlights.gloss_highlighter(
+        "نعم نعم لا", [{"t": "نعم"}, {"t": "لا"}, {"t": "نعم"}])
+
+    assert gh is not None
+    assert gh.html("نعم نعم لا") == (
+        f"{AMBER}نعم</span> "
+        f'<span style="background-color:{phrase_highlights.span_color(2)}">'
+        "نعم</span> "
+        f"{SKY}لا</span>")
+
+
+def test_a_pathological_duplicate_heavy_gloss_fails_closed():
+    # Uploader-shaped poison: distinct all-«كلمة» phrases of every length
+    # against a gloss whose last word never matches. The tiler's step budget
+    # answers None — no highlighter — instead of spinning the worker.
+    phrases = [{"t": " ".join(["كلمة"] * n)} for n in range(1, 11)]
+    gloss = " ".join(["كلمة"] * (sum(range(1, 11)) - 1) + ["أخرى"])
+
+    assert phrase_highlights.gloss_highlighter(gloss, phrases) is None
+
+
 def test_a_mismatched_segmentation_means_no_highlighter_at_all():
     assert phrase_highlights.gloss_highlighter(
         "شيء آخر تماما", PAIRS) is None

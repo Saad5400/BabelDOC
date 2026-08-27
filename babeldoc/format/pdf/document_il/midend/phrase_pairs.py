@@ -11,12 +11,22 @@ This module is the data discipline around that idea, in three parts:
 
 - {@link pairs_from_item}: pull a response item's raw "pairs" without trusting
   its shape.
-- {@link validate_pairs}: the strict per-paragraph contract. The phrases must
-  be a COMPLETE, ORDERED segmentation of both texts, split only at word
-  boundaries — an Arabic word split mid-way would be re-joined wrongly by any
-  renderer. Formally: the word tokens of the phrases, concatenated, must equal
-  the word tokens of the full text, on both sides. Anything less is discarded
-  for that paragraph only.
+- {@link validate_pairs}: the strict per-paragraph contract. The pairs are
+  listed in SOURCE order and aligned by MEANING, so the two sides obey
+  different disciplines. The "s" phrases must be a COMPLETE, ORDERED
+  segmentation of the source: their word tokens, concatenated, equal the
+  source's word tokens. The "t" phrases must be a COMPLETE segmentation of the
+  translation IN WHATEVER ORDER the translation actually uses — Arabic
+  legitimately reorders a sentence's phrases — which {@link tile_permutation}
+  checks by tiling the translation's word tokens with the phrases. Both sides
+  split only at word boundaries — an Arabic word split mid-way would be
+  re-joined wrongly by any renderer. Anything less is discarded for that
+  paragraph only.
+- {@link tile_permutation}: the target-order oracle — which pair each
+  successive stretch of a text belongs to. validate_pairs derives it once for
+  the capture pipeline (and returns it with the pairs); the server's gloss
+  highlighter re-derives it from the sidecar's pairs at render time, which is
+  safe because the tiler is deterministic.
 - {@link match_phrases_to_rects}: map validated phrases onto a paragraph's
   characters and union their boxes per visual line. Works on both sides: the
   ORIGINAL characters (snapshotted before translation) and the TYPESET
@@ -38,6 +48,12 @@ logger = logging.getLogger(__name__)
 # How many phrases a single paragraph may reasonably split into. The prompt
 # asks for 2-8; anything past this bound is a model runaway, not a segmentation.
 MAX_PAIRS = 50
+
+# The tiling search's work budget. Pairs are uploader-influenced at the server
+# endpoints, and a duplicate-heavy phrase list can make the backtracking
+# explore factorially many placements; past this many candidate probes the
+# search fails closed — no pairs rather than an unbounded worker.
+MAX_TILING_STEPS = 5000
 
 # Same set the Arabic post-processor strips (il_translator._ARABIC_DIACRITICS_RE):
 # tashkeel and Quranic annotation marks. Stripped from BOTH sides before any
@@ -91,6 +107,90 @@ def _words(text: str) -> list[str]:
     return text.split()
 
 
+class _SearchBudgetError(Exception):
+    """The tiling search hit MAX_TILING_STEPS; the answer is fail-closed."""
+
+
+def tile_permutation(
+    phrases_tokens: list[list[str]],
+    full_tokens: list[str],
+) -> list[int] | None:
+    """How the phrases tile the full text, or None.
+
+    `phrases_tokens` are the pairs' target phrases as word-token lists, in the
+    pairs' listed (SOURCE) order; `full_tokens` the full translation's word
+    tokens. When the phrases partition the full text in SOME order, the return
+    value has one entry per successive tile of the full text: the index of the
+    pair whose phrase sits there. A monotonic segmentation answers the identity
+    permutation; a reordered one answers where each pair actually landed.
+
+    DETERMINISTIC on purpose, so it can be re-derived downstream from the same
+    inputs: at every position the lowest-indexed unused phrase that matches is
+    tried first, which makes the answer the lexicographically smallest valid
+    permutation — two IDENTICAL phrases are assigned to their target positions
+    in ascending pair-index order (identical phrases are interchangeable, so
+    any tie-break is equally true; this one is stable).
+
+    Backtracking, bounded two ways: at each position only DISTINCT phrase
+    contents are probed (an identical twin of a failed branch fails
+    identically), and the whole search stops at {@link MAX_TILING_STEPS}
+    probes — pairs are uploader-influenced at the server, and a crafted
+    duplicate-heavy list must fail closed, never spin.
+    """
+    count = len(phrases_tokens)
+
+    if not 1 <= count <= MAX_PAIRS or any(not p for p in phrases_tokens):
+        return None
+
+    if sum(len(p) for p in phrases_tokens) != len(full_tokens):
+        return None
+
+    used = [False] * count
+    permutation: list[int] = []
+    steps = 0
+
+    def _place(position: int) -> bool:
+        nonlocal steps
+        if position == len(full_tokens):
+            return True
+
+        tried: set[tuple[str, ...]] = set()
+
+        for index in range(count):
+            if used[index]:
+                continue
+
+            tokens = phrases_tokens[index]
+            content = tuple(tokens)
+            if content in tried:
+                continue
+            tried.add(content)
+
+            steps += 1
+            if steps > MAX_TILING_STEPS:
+                raise _SearchBudgetError
+
+            if full_tokens[position:position + len(tokens)] != tokens:
+                continue
+
+            used[index] = True
+            permutation.append(index)
+            if _place(position + len(tokens)):
+                return True
+            used[index] = False
+            permutation.pop()
+
+        return False
+
+    try:
+        return permutation if _place(0) else None
+    except _SearchBudgetError:
+        logger.warning(
+            "phrase pairs: tiling search exhausted its budget; failing closed"
+        )
+        return None
+
+
 def pairs_from_item(item) -> list[dict] | None:
     """A response item's raw pairs, shape-checked but not yet validated.
 
@@ -124,21 +224,31 @@ def validate_pairs(
     raw_pairs: list[dict] | None,
     source_text: str,
     target_text: str,
-) -> list[dict] | None:
-    """The strict segmentation contract, or None.
+) -> tuple[list[dict], list[int]] | None:
+    """The strict segmentation contract — (pairs, permutation) — or None.
 
-    Both sides must reproduce their full text when the phrases are
-    concatenated with single spaces (after whitespace normalization), and
-    every split must fall on a whitespace word boundary. Both requirements
-    are one check: the flattened word tokens of the phrases must equal the
-    word tokens of the full text — a mid-word split ("can"+"not" for
-    "cannot") changes the token list and fails.
+    The pairs are listed in SOURCE order and aligned by meaning, so the two
+    sides are checked differently. SOURCE: the flattened word tokens of the
+    "s" phrases must equal the source's word tokens — completeness, order and
+    word-boundary splits in one check (a mid-word split, "can"+"not" for
+    "cannot", changes the token list and fails). TARGET: the "t" phrases must
+    TILE the translation's word tokens in some permutation
+    ({@link tile_permutation}) — the translation may put its phrases in a
+    different order than the source, and the pair's list position never
+    implies its position in the translation. Word boundaries bind exactly the
+    same way: a tile match is token-by-token.
 
     The target is compared against the text as it was APPLIED to the
     paragraph, which the Arabic post-processor may have altered after the LLM
     produced the pairs; diacritic stripping is absorbed (the stored "t" is
     then the stripped form, matching what the sidecar's target says), any
     other divergence discards the pairs.
+
+    On success the permutation rides along with the pairs: for each
+    successive stretch of the target text, the index of the pair sitting
+    there. It is derived here — against the exact text the pairs were
+    validated on — and carried, not recomputed, to every consumer that must
+    walk the translation in ITS order (`attach_target_rects`).
     """
     if not raw_pairs or not source_text or not target_text:
         return None
@@ -148,18 +258,25 @@ def validate_pairs(
 
     t_phrases = [p["t"] for p in raw_pairs]
 
-    if [w for p in t_phrases for w in _words(p)] != _words(target_text):
+    permutation = tile_permutation(
+        [_words(p) for p in t_phrases], _words(target_text)
+    )
+
+    if permutation is None:
         t_phrases = [_DIACRITICS_RE.sub("", p).strip() for p in t_phrases]
         stripped_target = _DIACRITICS_RE.sub("", target_text)
-        if any(not p for p in t_phrases) or [
-            w for p in t_phrases for w in _words(p)
-        ] != _words(stripped_target):
+        if any(not p for p in t_phrases):
+            return None
+        permutation = tile_permutation(
+            [_words(p) for p in t_phrases], _words(stripped_target)
+        )
+        if permutation is None:
             return None
 
     return [
         {"s": " ".join(_words(pair["s"])), "t": " ".join(_words(t))}
         for pair, t in zip(raw_pairs, t_phrases, strict=True)
-    ]
+    ], permutation
 
 
 def _line_rects(chars: list[tuple[str, tuple | None]]) -> list[list[float]] | None:

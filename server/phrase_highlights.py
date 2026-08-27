@@ -1,8 +1,10 @@
 """Matching phrase highlights: the sidecar's aligned pairs, drawn as chips.
 
 Phrase-pair capture (babeldoc/.../midend/phrase_pairs.py) leaves each sidecar
-block with ordered `{s, t, s_rects, t_rects}` entries. This module is the
-drawing side of that data: phrase i of a paragraph gets colour i on BOTH sides,
+block with `{s, t, s_rects, t_rects}` entries, listed in SOURCE order and
+aligned by MEANING — the translation may put the same phrases in a different
+order, and each entry's rects are its own wherever they landed. This module is
+the drawing side of that data: pair i of a paragraph gets colour i on BOTH sides,
 as a soft background chip — filled at FILL_OPACITY ON TOP of the existing page
 content, the way a text highlighter marks a printed page, which is also what
 makes it work on scanned/opaque-background pages. No border, small rounded
@@ -45,6 +47,7 @@ from io import BytesIO
 
 import pymupdf
 from babeldoc.format.pdf.document_il.midend.phrase_pairs import MAX_PAIRS
+from babeldoc.format.pdf.document_il.midend.phrase_pairs import tile_permutation
 
 logger = logging.getLogger("doctranslate.phrase_highlights")
 
@@ -308,9 +311,14 @@ def highlight_pairs(pdf_bytes: bytes, sidecar, key: str) -> bytes:
 class GlossHighlighter:
     """Colours one paragraph's gloss text by its phrase segmentation.
 
-    The pairs' "t" strings are an ordered EXACT segmentation of the block's
-    translation (whitespace-normalized), so the gloss string splits by matching
-    them in order — word-wise, which is what makes the matching
+    The pairs are listed in SOURCE order and their "t" strings are an EXACT
+    segmentation of the block's translation in whatever order the translation
+    actually uses (whitespace-normalized) — Arabic may reorder the source's
+    phrases. `phrase_pairs.tile_permutation` (the same tiler the capture
+    pipeline uses) says which pair each successive stretch of the gloss
+    belongs to, and each stretch is coloured with its SOURCE pair's index —
+    matching colours stay bound to matching MEANING, wherever the phrase
+    landed. The matching is word-wise, which is what makes it
     whitespace-flexible. The overlay may draw a gloss as ONE box or SPREAD it
     down the source lines in word chunks; {@link html} is therefore a cursor:
     called once with the full text, or repeatedly with consecutive chunks in
@@ -327,25 +335,27 @@ class GlossHighlighter:
 
     @staticmethod
     def _word_colors(target_text, pairs) -> list[tuple[str, int]] | None:
-        """Each word of the target tagged with its phrase's colour index."""
+        """Each word of the target, in TARGET order, tagged with the colour
+        index of the SOURCE pair whose phrase it belongs to."""
         if not isinstance(target_text, str) or not isinstance(pairs, list):
             return None
 
         if not 1 <= len(pairs) <= MAX_PAIRS:
             return None
 
-        words: list[tuple[str, int]] = []
-
-        for index, pair in enumerate(pairs):
+        for pair in pairs:
             if not isinstance(pair, dict) or not isinstance(pair.get("t"), str):
                 return None
 
-            words.extend((word, index) for word in pair["t"].split())
+        phrase_tokens = [pair["t"].split() for pair in pairs]
+        permutation = tile_permutation(phrase_tokens, target_text.split())
 
-        if not words or [word for word, _ in words] != target_text.split():
+        if permutation is None:
             return None
 
-        return words
+        return [(word, index)
+                for index in permutation
+                for word in phrase_tokens[index]]
 
     @property
     def usable(self) -> bool:
