@@ -261,7 +261,7 @@ def build_sidecar(
 
             source = page_sources.get(para_index) or {}
 
-            blocks.append({
+            block = {
                 "box": box,
                 "source": (source.get("text") or "").strip() or None,
                 "lines": source.get("lines") or [],
@@ -269,7 +269,18 @@ def build_sidecar(
                 "font_size": (paragraph.pdf_style.font_size
                               if paragraph.pdf_style is not None else None),
                 "label": paragraph.layout_label,
-            })
+            }
+
+            # Image-text lane (additive, version stays 1): a label that sits
+            # ON an embedded raster image carries its image's placement box,
+            # so the interlinear renderer knows the containing image's own
+            # ink must not veto the gloss and can plate it for legibility.
+            region = getattr(paragraph, "raster_region", None)
+            if region and len(region) == 4 and None not in region:
+                block["on_raster"] = True
+                block["region"] = [float(value) for value in region]
+
+            blocks.append(block)
 
         # Figures are not glossed, but they are the other thing that occupies
         # vertical space: a renderer looking for room above a paragraph has to

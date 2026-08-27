@@ -235,6 +235,11 @@
           <data type="int"/>
         </attribute>
       </optional>
+      <optional>
+        <attribute name="renderMode">
+          <data type="int"/>
+        </attribute>
+      </optional>
       <ref name="PDFStyle"/>
       <ref name="Box"/>
       <optional>
@@ -326,6 +331,16 @@
       <optional>
         <attribute name="renderOrder">
           <data type="int"/>
+        </attribute>
+      </optional>
+      <optional>
+        <attribute name="rasterRegion">
+          <list>
+            <data type="float"/>
+            <data type="float"/>
+            <data type="float"/>
+            <data type="float"/>
+          </list>
         </attribute>
       </optional>
       <ref name="Box"/>
@@ -450,6 +465,16 @@
       <optional>
         <attribute name="renderOrder">
           <data type="int"/>
+        </attribute>
+      </optional>
+      <optional>
+        <attribute name="rasterRegion">
+          <list>
+            <data type="float"/>
+            <data type="float"/>
+            <data type="float"/>
+            <data type="float"/>
+          </list>
         </attribute>
       </optional>
     </element>
