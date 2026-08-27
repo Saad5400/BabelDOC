@@ -40,6 +40,7 @@ from babeldoc.format.pdf.document_il.midend.styles_and_formulas import (
     build_code_font_ids,
 )
 from babeldoc.format.pdf.document_il.utils.paragraph_helper import is_cid_paragraph
+from babeldoc.format.pdf.document_il.utils.style_helper import BLACK
 from babeldoc.format.pdf.document_il.utils.style_helper import INDIGO
 from babeldoc.format.pdf.document_il.utils.style_helper import WHITE
 from babeldoc.format.pdf.translation_config import TranslationConfig
@@ -428,6 +429,12 @@ class ParagraphFinder:
         # 预处理公式布局的标签
         self._preprocess_formula_layouts(page)
 
+        # Image-text lane (digital pages with injected invisible OCR runs
+        # over embedded raster images): pull those characters out FIRST so
+        # they can never merge with normal digital-text paragraphs, and turn
+        # them into their own per-region label paragraphs.
+        image_text_paragraphs = self._extract_image_text_paragraphs(page)
+
         # 第一步：根据 layout 创建 paragraphs
         # 在这一步中，page.pdf_character 中的字符会被移除
         paragraphs = self._group_characters_into_paragraphs(
@@ -519,6 +526,13 @@ class ParagraphFinder:
             page.pdf_character = []
 
         self.fix_overlapping_paragraphs(page)
+
+        # Image-text lane: the label paragraphs join the page only after all
+        # digital-text passes (merging, splitting, overlap fixing) have run,
+        # so none of those ever touches them. Their masks ride along.
+        if image_text_paragraphs:
+            page.pdf_paragraph.extend(image_text_paragraphs)
+            self.add_image_text_masks(page, image_text_paragraphs)
 
         # 第六步：对每一行的字符进行排序
         # self._sort_characters_in_lines(page)
@@ -1088,6 +1102,258 @@ class ParagraphFinder:
         if mid_delta <= 0.12 * max(la.x2 - la.x, lb.x2 - lb.x, fa.x2 - fa.x):
             return True
         return lb.x >= fa.x + 0.5 * hb
+
+    # ------------------------------------------------------------------
+    # Image-text lane (digital pages): recognise injected invisible OCR
+    # runs over embedded raster images, group them into per-region label
+    # paragraphs, and give each one a background-matched mask. This is the
+    # per-REGION equivalent of the scanned lane (ocr_workaround), on pages
+    # whose real text layer stays fully digital. Inert unless the run
+    # declares image_text_regions.
+    # ------------------------------------------------------------------
+
+    # Contract 1: a character is an image-OCR character iff its render mode
+    # is invisible (Tr 3) AND its box lies inside a declared image_bbox
+    # with this tolerance (pt).
+    IMAGE_TEXT_BBOX_TOLERANCE = 2.0
+    # Two runs on one visual line further apart than this many line heights
+    # are separate labels (hexagon labels sharing a row), never one line.
+    IMAGE_TEXT_GAP_FACTOR = 1.2
+    IMAGE_TEXT_GAP_MIN = 8.0
+    # Mask padding beyond the label's glyph box, to swallow the raster
+    # glyphs' anti-aliasing halo and OCR-tight ascender undershoot (pt).
+    IMAGE_TEXT_MASK_PAD = 2.0
+    # Vertical mask padding as a fraction of the label height: the injected
+    # helv run's metrics drift from the raster glyphs' true extents by up to
+    # a third of the line (bold all-caps baselines), and an uncovered glyph
+    # strip reads worse than a slightly taller color-matched mask.
+    IMAGE_TEXT_MASK_VPAD_FRACTION = 0.35
+
+    def _extract_image_text_paragraphs(self, page: Page) -> list[PdfParagraph]:
+        """Pull image-OCR characters off the page into label paragraphs.
+
+        Recognised characters leave page.pdf_character before the normal
+        layout-based grouping ever sees them, so they can never merge with
+        digital-text paragraphs. Returns the label paragraphs (not yet added
+        to the page); [] leaves the page untouched.
+        """
+        if self.translation_config.ocr_workaround:
+            return []
+        regions = self.translation_config.image_text_regions_for_page(
+            page.page_number
+        )
+        if not regions:
+            return []
+
+        per_region: list[list[PdfCharacter]] = [[] for _ in regions]
+        remaining: list[PdfCharacter] = []
+        for char in page.pdf_character:
+            index = self._image_text_region_index(char, regions)
+            if index is None:
+                remaining.append(char)
+            else:
+                per_region[index].append(char)
+        if not any(per_region):
+            return []
+        page.pdf_character = remaining
+
+        paragraphs: list[PdfParagraph] = []
+        for region, chars in zip(regions, per_region, strict=True):
+            if chars:
+                paragraphs.extend(
+                    self._build_image_text_region_paragraphs(region, chars)
+                )
+        return paragraphs
+
+    @classmethod
+    def _image_text_region_index(
+        cls,
+        char: PdfCharacter,
+        regions: list[tuple[float, float, float, float]],
+    ) -> int | None:
+        """Contract 1 recognition rule: invisible AND inside a region."""
+        if char.render_mode != 3:
+            return None
+        box = char.box
+        if box is None or None in (box.x, box.y, box.x2, box.y2):
+            return None
+        tol = cls.IMAGE_TEXT_BBOX_TOLERANCE
+        for index, (x0, y0, x1, y1) in enumerate(regions):
+            if (
+                box.x >= x0 - tol
+                and box.x2 <= x1 + tol
+                and box.y >= y0 - tol
+                and box.y2 <= y1 + tol
+            ):
+                return index
+        return None
+
+    def _build_image_text_region_paragraphs(
+        self,
+        region: tuple[float, float, float, float],
+        chars: list[PdfCharacter],
+    ) -> list[PdfParagraph]:
+        """One region's characters -> its label paragraphs.
+
+        Bucket the region's characters into lines BY BASELINE, split lines at
+        large horizontal gaps (side-by-side labels), then merge adjacent
+        lines that geometrically continue each other (a wrapped label) using
+        the scanned lane's continuation rule. Each resulting paragraph is
+        tagged with its region and stripped of render order so it layers
+        exactly like the scanned lane: mask below, translated text on top.
+
+        Baselines, not line-threading: every char of one injected image_prep
+        run shares its box.y exactly (one Tj, one Tm), while a large label's
+        ink-tight glyph boxes can OVERLAP the next line's by a point or two
+        (23 pt caps on a 22 pt pitch). Threading needs a zero-collision
+        scanline between lines, so that overlap welded «Product»/«features»
+        into one "line" whose x-sort interleaved the two words' characters.
+        """
+        buckets: list[tuple[float, list[PdfCharacter]]] = []
+        for char in sorted(chars, key=lambda c: -c.box.y):
+            for baseline, members in buckets:
+                if abs(char.box.y - baseline) <= 0.5:
+                    members.append(char)
+                    break
+            else:
+                buckets.append((char.box.y, [char]))
+
+        paragraphs: list[PdfParagraph] = []
+        for _baseline, members in buckets:
+            line = self.create_line(members).pdf_line
+            if line is None or not line.pdf_character:
+                continue
+            for piece in self._split_image_text_line_at_gaps(line):
+                paragraph = PdfParagraph(
+                    box=Box(0, 0, 0, 0),
+                    pdf_paragraph_composition=[piece],
+                    unicode="",
+                    debug_id=generate_base58_id(),
+                    layout_label="image_text",
+                )
+                self.update_paragraph_data(paragraph)
+                paragraphs.append(paragraph)
+
+        # Wrapped labels: pull continuation lines back into their paragraph.
+        self.merge_ocr_continuation_paragraphs(paragraphs)
+
+        for paragraph in paragraphs:
+            paragraph.raster_region = list(region)
+            self.update_paragraph_data(paragraph, update_unicode=True)
+            for composition in paragraph.pdf_paragraph_composition:
+                if not composition.pdf_line:
+                    continue
+                for char in composition.pdf_line.pdf_character:
+                    # Layering (scanned-lane convention): orderless elements
+                    # render last, masks (finite sub-order) below the
+                    # translated text (orderless). Also drop the invisible
+                    # run's own graphic state; the mask pass may retint.
+                    char.render_order = None
+                    char.sub_render_order = None
+                    if char.pdf_style is not None:
+                        char.pdf_style.graphic_state = BLACK
+        return paragraphs
+
+    def _split_image_text_line_at_gaps(
+        self, line: PdfLine
+    ) -> list[PdfParagraphComposition]:
+        """Split one threaded line into label pieces at big horizontal gaps."""
+        chars = sorted(
+            line.pdf_character,
+            key=lambda c: (c.visual_bbox.box.x if c.visual_bbox else c.box.x),
+        )
+        height = max(
+            (c.visual_bbox.box.y2 - c.visual_bbox.box.y for c in chars),
+            default=0.0,
+        )
+        threshold = max(
+            self.IMAGE_TEXT_GAP_MIN, self.IMAGE_TEXT_GAP_FACTOR * height
+        )
+        pieces: list[list[PdfCharacter]] = [[chars[0]]]
+        for prev, char in zip(chars, chars[1:], strict=False):
+            prev_box = prev.visual_bbox.box if prev.visual_bbox else prev.box
+            char_box = char.visual_bbox.box if char.visual_bbox else char.box
+            if char_box.x - prev_box.x2 > threshold:
+                pieces.append([])
+            pieces[-1].append(char)
+        return [self.create_line(piece) for piece in pieces if piece]
+
+    def add_image_text_masks(
+        self, page: Page, paragraphs: list[PdfParagraph]
+    ) -> None:
+        """A background-matched mask under each image-OCR label paragraph.
+
+        The mask covers the label's source pixels inside the raster image
+        (plus an anti-aliasing pad, clipped to the region) and carries the
+        region so the RTL mirror can move it rigidly with the image. The
+        sampled ink color retints the translated text (white-on-teal labels
+        stay white).
+        """
+        sampler = self._get_mask_color_sampler()
+        pad = self.IMAGE_TEXT_MASK_PAD
+        for paragraph in paragraphs:
+            if paragraph.box is None or not paragraph.raster_region:
+                continue
+            rx0, ry0, rx1, ry1 = paragraph.raster_region
+            # The paragraph box is built from visual bboxes (descent-shifted);
+            # the raster glyphs underneath also overshoot the OCR-tight run
+            # by their ascenders. Union both char boxes so the mask covers
+            # the full glyph band, not just the shifted visual one.
+            gx1, gy1, gx2, gy2 = (
+                paragraph.box.x,
+                paragraph.box.y,
+                paragraph.box.x2,
+                paragraph.box.y2,
+            )
+            for composition in paragraph.pdf_paragraph_composition or []:
+                if not composition.pdf_line:
+                    continue
+                for char in composition.pdf_line.pdf_character:
+                    for char_box in (
+                        char.box,
+                        char.visual_bbox.box if char.visual_bbox else None,
+                    ):
+                        if char_box is None or None in (
+                            char_box.x, char_box.y, char_box.x2, char_box.y2
+                        ):
+                            continue
+                        gx1 = min(gx1, char_box.x)
+                        gy1 = min(gy1, char_box.y)
+                        gx2 = max(gx2, char_box.x2)
+                        gy2 = max(gy2, char_box.y2)
+            vpad = max(
+                pad, (gy2 - gy1) * self.IMAGE_TEXT_MASK_VPAD_FRACTION
+            )
+            x1 = max(gx1 - pad, rx0)
+            y1 = max(gy1 - vpad, ry0)
+            x2 = min(gx2 + pad, rx1)
+            y2 = min(gy2 + vpad, ry1)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            fill_state = WHITE
+            if sampler is not None:
+                try:
+                    bg, ink = sampler.sample(page.page_number, x1, y1, x2, y2)
+                    if bg is not None:
+                        fill_state = solid_graphic_state(bg)
+                    if ink is not None:
+                        self._tint_paragraph_text(paragraph, ink)
+                except Exception:
+                    logger.exception(
+                        "Mask-color sampling failed for image-text paragraph "
+                        f"{getattr(paragraph, 'debug_id', None)} on page "
+                        f"{page.page_number}; using a white mask."
+                    )
+            page.pdf_rectangle.append(
+                PdfRectangle(
+                    box=Box(x1, y1, x2, y2),
+                    fill_background=True,
+                    graphic_state=fill_state,
+                    debug_info=False,
+                    xobj_id=paragraph.xobj_id,
+                    raster_region=list(paragraph.raster_region),
+                )
+            )
 
     def _group_characters_into_paragraphs(
         self, page: Page, layout_index, layout_map

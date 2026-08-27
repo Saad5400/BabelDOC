@@ -46,6 +46,20 @@ line — but it reads in order, top to bottom, which one crushed 4 pt paragraph
 does not. The spaced layout splits the same way, for the same reason, and there
 it is the normal case rather than the rescue.
 
+Text that lives INSIDE an embedded raster image — a diagram's labels, a
+figure's captions — arrives as blocks marked `on_raster` with the image's
+`region`, and gets the same treatment TURNED INSIDE OUT. Everywhere else the
+page's ink is the veto and the whitespace is the canvas; inside an image there
+is no whitespace, only artwork, so the gloss is allowed onto the artwork and
+carries its own legibility with it: a rounded translucent PLATE under the
+text. What it may still never cover is the image's own INK — the label it
+glosses, the neighbouring labels, the arrows and borders between them — and
+since none of that exists as objects the page could report, the region's
+PIXELS are consulted instead: wherever the rendering changes sharply, something
+was drawn, and the plate keeps off it. The band directly above the label is
+tried first, then the band below, and a label with no quiet band either way is
+skipped and counted, exactly like a paragraph with no room.
+
 TEXT RENDERING is PyMuPDF's Story engine, which shapes Arabic into its
 contextual forms and runs the bidi algorithm over it — including the Latin
 technical terms the glossary deliberately keeps in Latin script. The sidecar
@@ -57,12 +71,14 @@ import html
 import logging
 import re
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+import numpy
 import pymupdf
 
 logger = logging.getLogger("doctranslate.interlinear")
@@ -102,6 +118,31 @@ _MAX_BACKDROP_SHARE = 0.4
 # an empty line above it, comes out even — and there the spread is the whole
 # point.
 _SPREAD_TOLERANCE = 0.9
+
+# The raster lane's view of an image region: its pixels at twice the region's
+# point size (144 dpi), which resolves a 1 pt hairline to a couple of pixels —
+# enough to see every mark that matters without paying photo-sized renders.
+_RASTER_SCALE = 2.0
+
+# A grey step this big between neighbouring pixels is a mark, not a gradient:
+# text and line art against any flat fill clear it by a wide margin, a
+# background's soft blend stays under it.
+_RASTER_EDGE_STEP = 20
+
+# How far ink pushes back from itself, in mask pixels — the anti-aliased fringe
+# around every glyph and line, plus a hair of standoff so a plate never looks
+# welded to the mark it stopped at.
+_RASTER_INK_DILATION = 2
+
+# The share of a plate's pixels allowed to be ink anyway: exactly none is
+# brittle (one stray speck of dither vetoes a whole band), so a speck is
+# forgiven and anything that could be part of a letter is not.
+_RASTER_INK_TOLERANCE = 0.003
+
+# Corner rounding of the legibility plate, as the fraction of its short side
+# pymupdf's draw_rect wants. Enough to read as a tag laid on the artwork
+# rather than a patch torn out of it.
+_PLATE_RADIUS = 0.25
 
 # The pan-Unicode face BabelDOC itself embeds for Arabic output, so a gloss is
 # set in the same letterforms as the Arabic-only PDF. It is also 15 MB, which
@@ -169,6 +210,16 @@ class OverlayOptions:
     # How far a gloss may shrink below min_font_size when its band is still too
     # tight — the last resort before it is skipped altogether.
     squeeze: float = 0.8
+    # The legibility plate under a raster gloss — the one gloss that is drawn
+    # OVER artwork instead of into whitespace. Translucent on purpose: the
+    # artwork should read as dimmed under the plate, not censored by it, and
+    # 0.72 is where dark text stays comfortable on top of any flat fill the
+    # test decks throw at it. White suits a dark default text colour; a caller
+    # recolouring the gloss light can recolour the plate to match.
+    plate_color: str = "#ffffff"
+    plate_opacity: float = 0.72
+    # Breathing room between the plate's edge and the text it carries.
+    plate_padding: float = 1.5
 
     @classmethod
     def defaults(cls, style: str = "interlinear") -> OverlayOptions:
@@ -199,6 +250,12 @@ class OverlayOptions:
             raise OverlayError("squeeze must be between 0.1 and 1.0")
         if not 0.5 <= self.line_height <= 3.0:
             raise OverlayError("line_height must be between 0.5 and 3.0")
+        if not _HEX_COLOR.match(self.plate_color):
+            raise OverlayError("plate_color must be a hex colour such as #ffffff")
+        if not 0.0 <= self.plate_opacity <= 1.0:
+            raise OverlayError("plate_opacity must be between 0 and 1")
+        if not 0.0 <= self.plate_padding <= 10.0:
+            raise OverlayError("plate_padding must be between 0 and 10")
         return self
 
 
@@ -411,16 +468,21 @@ class _Layout:
         self.align = _css_align(options.align, rtl)
         self.options = options
 
-    def html(self, text: str, font_size: float) -> str:
-        return _gloss_html(text, font_size, self.direction, self.align)
+    def html(self, text: str, font_size: float, align: str | None = None) -> str:
+        # `align=None` is the configured edge; "center" is what a raster gloss
+        # asks for, because a diagram's labels are centred and a gloss hanging
+        # off one edge of its plate reads as a mistake. Centring is the same
+        # keyword in both writing directions, so it skips the LTR/RTL flip.
+        return _gloss_html(text, font_size, self.direction, align or self.align)
 
-    def measure(self, text: str, font_size: float, width: float) -> float:
+    def measure(self, text: str, font_size: float, width: float,
+                align: str | None = None) -> float:
         """The height this gloss needs at the width it will be drawn in.
 
         A bare `Story.place()` rather than insert_htmlbox's `fit_scale`: one
         layout pass instead of a binary search, and every paragraph pays it.
         """
-        story = pymupdf.Story(html=self.html(text, font_size),
+        story = pymupdf.Story(html=self.html(text, font_size, align),
                               user_css=self.font.css, archive=self.font.archive)
         _, filled = story.place(pymupdf.Rect(0, 0, width, 100_000))
 
@@ -460,12 +522,13 @@ class _Layout:
             size = max(floor, size * 0.85)
 
     def draw(self, page: pymupdf.Page, rect: pymupdf.Rect, text: str,
-             font_size: float) -> None:
+             font_size: float, align: str | None = None) -> None:
         # scale_low lets the renderer absorb a sub-point disagreement with the
         # measuring pass instead of dropping the gloss; fit() means it is never
         # asked for real shrinking.
-        page.insert_htmlbox(rect, self.html(text, font_size), css=self.font.css,
-                            archive=self.font.archive, scale_low=0.75)
+        page.insert_htmlbox(rect, self.html(text, font_size, align),
+                            css=self.font.css, archive=self.font.archive,
+                            scale_low=0.75)
 
 
 def _placement(layout: _Layout, text: str, anchor: pymupdf.Rect,
@@ -693,14 +756,240 @@ def _cover_ink(anchor: pymupdf.Rect, source_size: float,
     return pymupdf.Rect(anchor.x0, top, anchor.x1, anchor.y1)
 
 
+def _hex_rgb(color: str) -> tuple[float, float, float]:
+    """A validated hex colour as the 0..1 triple pymupdf's drawing wants."""
+    digits = color.lstrip("#")
+
+    if len(digits) == 3:
+        digits = "".join(char * 2 for char in digits)
+
+    return tuple(int(digits[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+
+class _RegionInk:
+    """One image region's pixels, read as ink the way _page_ink reads objects.
+
+    Inside a raster image nothing exists as an object the page could report:
+    the labels, the arrows, the borders are all just pixels. So the region is
+    rendered once, and every sharp step between neighbouring pixels is taken as
+    a mark somebody drew — text against a fill, a border against the page, an
+    arrow against both — while the flat fills and soft gradients a plate is
+    allowed to dim stay clear. The marks are dilated by their own anti-aliased
+    fringe and summed into an integral image, so the fitting ladder can ask
+    about every candidate plate for the price of one render.
+
+    Rendered from the page as it stands MID-OVERLAY, deliberately: anything the
+    normal pass already drew near the region shows up as ink and keeps plates
+    off it, without this module keeping a second account of its own output.
+    """
+
+    def __init__(self, page: pymupdf.Page, clip: pymupdf.Rect) -> None:
+        self.clip = clip
+        pix = page.get_pixmap(
+            matrix=pymupdf.Matrix(_RASTER_SCALE, _RASTER_SCALE), clip=clip,
+            colorspace=pymupdf.csGRAY, alpha=False)
+        grey = (numpy.frombuffer(pix.samples, numpy.uint8)
+                .reshape(pix.height, pix.stride)[:, :pix.width]
+                .astype(numpy.int16))
+
+        # A step in either direction marks BOTH pixels astride it: the edge
+        # belongs to the mark and to the fringe it bleeds into.
+        edge = numpy.zeros(grey.shape, dtype=bool)
+        step_x = numpy.abs(numpy.diff(grey, axis=1)) > _RASTER_EDGE_STEP
+        step_y = numpy.abs(numpy.diff(grey, axis=0)) > _RASTER_EDGE_STEP
+        edge[:, :-1] |= step_x
+        edge[:, 1:] |= step_x
+        edge[:-1, :] |= step_y
+        edge[1:, :] |= step_y
+
+        # Grown into a COPY each round: |= between overlapping views of one
+        # array cascades in memory order and smears a single edge pixel across
+        # the whole row.
+        for _ in range(_RASTER_INK_DILATION):
+            grown = edge.copy()
+            grown[:, :-1] |= edge[:, 1:]
+            grown[:, 1:] |= edge[:, :-1]
+            grown[:-1, :] |= edge[1:, :]
+            grown[1:, :] |= edge[:-1, :]
+            edge = grown
+
+        self._integral = numpy.pad(edge.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+
+    def inky(self, rect: pymupdf.Rect) -> bool:
+        """Does a plate here sit on something that was drawn?"""
+        rows, cols = self._integral.shape[0] - 1, self._integral.shape[1] - 1
+        x0 = max(int((rect.x0 - self.clip.x0) * _RASTER_SCALE), 0)
+        y0 = max(int((rect.y0 - self.clip.y0) * _RASTER_SCALE), 0)
+        x1 = min(int((rect.x1 - self.clip.x0) * _RASTER_SCALE) + 1, cols)
+        y1 = min(int((rect.y1 - self.clip.y0) * _RASTER_SCALE) + 1, rows)
+        area = (x1 - x0) * (y1 - y0)
+
+        if area <= 0:
+            # Entirely off the rendered mask: nothing is known about what is
+            # there, and unknown pixels are not a place to draw.
+            return True
+
+        count = (self._integral[y1, x1] - self._integral[y0, x1]
+                 - self._integral[y1, x0] + self._integral[y0, x0])
+
+        return count > area * _RASTER_INK_TOLERANCE
+
+
+def _raster_placement(layout: _Layout, text: str, anchor: pymupdf.Rect,
+                      region: pymupdf.Rect, source_size: float,
+                      ink: _RegionInk,
+                      taken: list[pymupdf.Rect]) -> tuple[pymupdf.Rect, float] | None:
+    """Where one raster gloss's plate would go — nothing is drawn.
+
+    The band directly above the label first — a gloss reads as belonging to
+    what it sits over — then the band below it. Each band gets the same fitting
+    ladder as a normal gloss, but the judge is different: not "is there
+    whitespace", which inside an image there never is, but "are these pixels
+    quiet". A size step that would land the plate on a border or a neighbour
+    shrinks past it; a label with no quiet pixels either way is given up on,
+    and the caller counts it.
+
+    Only the plate comes back: the text's own rect is derived from it at draw
+    time by peeling the padding off.
+    """
+    options = layout.options
+    pad = options.plate_padding
+    # The label's box is an OCR measurement, and the mask has grown every mark
+    # by its dilation on top of that — so a plate standing off by the ordinary
+    # gap still lands on the label's own fringe and is vetoed by it. The
+    # fringe's width in points is known exactly, and the plate stands off by
+    # that much more.
+    gap = options.gap + (_RASTER_INK_DILATION + 1) / _RASTER_SCALE
+
+    # The label's own span first; then a wider reach for the label whose
+    # translation runs longer than it does. The ink test is what decides
+    # whether the borrowed width was actually free.
+    stretch = anchor.width * 0.3
+    spans = dict.fromkeys((
+        (max(region.x0, anchor.x0), min(region.x1, anchor.x1)),
+        (max(region.x0, anchor.x0 - stretch), min(region.x1, anchor.x1 + stretch)),
+    ))
+
+    start = min(max(source_size * options.scale, options.min_font_size),
+                options.max_font_size)
+    floor = options.min_font_size * options.squeeze
+
+    for below in (False, True):
+        for span_x0, span_x1 in spans:
+            if span_x1 - span_x0 - 2 * pad < 8:
+                continue
+
+            size = start
+
+            while True:
+                # The same hair of slack as fit(): the draw re-lays the text
+                # out, and a rounding disagreement must not spill the plate.
+                needed = layout.measure(text, size, span_x1 - span_x0 - 2 * pad,
+                                        align="center") + 0.5
+                height = needed + 2 * pad
+
+                if below:
+                    plate = pymupdf.Rect(span_x0, anchor.y1 + gap,
+                                         span_x1, anchor.y1 + gap + height)
+                else:
+                    plate = pymupdf.Rect(span_x0, anchor.y0 - gap - height,
+                                         span_x1, anchor.y0 - gap)
+
+                if (plate.y0 >= region.y0 and plate.y1 <= region.y1
+                        and not any(plate.intersects(other) for other in taken)
+                        and not ink.inky(plate)):
+                    return plate, size
+
+                if size <= floor:
+                    break
+
+                size = max(floor, size * 0.85)
+
+    return None
+
+
+def _render_raster(page: pymupdf.Page, blocks: list[dict], layout: _Layout,
+                   matrix: pymupdf.Matrix, page_rect: pymupdf.Rect,
+                   remap: Callable[[pymupdf.Rect, pymupdf.Rect],
+                                   tuple[pymupdf.Rect, pymupdf.Rect]] | None = None,
+                   ) -> tuple[int, int]:
+    """Draw one page's raster glosses. Returns `(drawn, skipped)`.
+
+    Each block rides its own declared region and never consults the page's
+    object-level obstacle set: the region's pixels are the whole truth about
+    what may not be covered, and the region's edges are the fence the gloss
+    may not leave. Plates already placed are the one thing the pixels cannot
+    know about, so they are carried alongside.
+
+    `remap` is the spaced layout's hand: it has rebuilt the page taller and
+    moved the artwork down it, so the label and its region are mapped onto the
+    new page before anything is judged or drawn.
+    """
+    options = layout.options
+    plate_rgb = _hex_rgb(options.plate_color)
+    masks: dict[tuple[float, float, float, float], _RegionInk] = {}
+    taken: list[pymupdf.Rect] = []
+    drawn = skipped = 0
+
+    for block in blocks:
+        anchor = _to_display(block["box"], matrix)
+        region = _to_display(block["region"], matrix).normalize()
+
+        if remap is not None:
+            anchor, region = remap(anchor, region)
+
+        region = (region & page_rect).normalize()
+
+        if region.is_empty or not region.is_valid:
+            skipped += 1
+            continue
+
+        key = tuple(region)
+
+        if key not in masks:
+            masks[key] = _RegionInk(page, region)
+
+        source_size = float(block.get("font_size") or 0) or anchor.height
+        found = _raster_placement(layout, block["target"].strip(), anchor,
+                                  region, source_size, masks[key], taken)
+
+        if found is None:
+            skipped += 1
+            continue
+
+        plate, size = found
+        pad = options.plate_padding
+        # Plate first, text second: the text must sit ON the plate, and both
+        # over the artwork.
+        page.draw_rect(plate, color=None, fill=plate_rgb,
+                       fill_opacity=options.plate_opacity, radius=_PLATE_RADIUS)
+        layout.draw(page, plate + (pad, pad, -pad, -pad),
+                    block["target"].strip(), size, align="center")
+        taken.append(plate)
+        drawn += 1
+
+    return drawn, skipped
+
+
 def _render_page(page: pymupdf.Page, page_data: dict,
-                 layout: _Layout) -> tuple[int, int]:
-    """Draw one page's glosses. Returns `(drawn, skipped)`."""
+                 layout: _Layout) -> tuple[int, int, int, int]:
+    """Draw one page's glosses.
+
+    Returns `(drawn, skipped, raster_drawn, raster_skipped)`.
+    """
     blocks = [block for block in (page_data.get("blocks") or [])
               if block.get("box") and (block.get("target") or "").strip()]
+    # The raster lane: blocks the engine marked as living inside an embedded
+    # image. They are split out BEFORE the normal pass so that pass's anchors,
+    # obstacles and column edge are computed from exactly the blocks it always
+    # saw — an old sidecar renders exactly what it always did.
+    raster = [block for block in blocks
+              if block.get("on_raster") and block.get("region")]
+    blocks = [block for block in blocks
+              if not (block.get("on_raster") and block.get("region"))]
 
-    if not blocks:
-        return 0, 0
+    if not blocks and not raster:
+        return 0, 0, 0, 0
 
     # The sidecar's coordinates are unrotated PDF user space. Neutralising
     # /Rotate for the duration makes page.transformation_matrix the plain
@@ -784,7 +1073,16 @@ def _render_page(page: pymupdf.Page, page_data: dict,
             obstacles.append(rect)
             drawn += 1
 
-        return drawn, skipped
+        # The raster lane runs LAST: its ink masks are rendered from the page
+        # as it now stands, so every normal gloss just drawn is already part of
+        # what a plate must keep off.
+        raster_drawn = raster_skipped = 0
+
+        if raster:
+            raster_drawn, raster_skipped = _render_raster(page, raster, layout,
+                                                          matrix, page_rect)
+
+        return drawn, skipped, raster_drawn, raster_skipped
     finally:
         if rotation:
             page.set_rotation(rotation)
@@ -1559,8 +1857,12 @@ def _size_bands(leaves: list[_Region], layout: _Layout, page_height: float) -> N
 
 
 def _spaced_page(target: pymupdf.Document, source: pymupdf.Document, index: int,
-                 page_data: dict, layout: _Layout) -> tuple[int, int]:
-    """Rebuild one page, opened up. Returns `(drawn, skipped)`."""
+                 page_data: dict,
+                 layout: _Layout) -> tuple[int, int, int, int]:
+    """Rebuild one page, opened up.
+
+    Returns `(drawn, skipped, raster_drawn, raster_skipped)`.
+    """
     page = source[index]
     rect = page.rect
     options = layout.options
@@ -1593,6 +1895,14 @@ def _spaced_page(target: pymupdf.Document, source: pymupdf.Document, index: int,
 
     blocks = [block for block in (page_data.get("blocks") or [])
               if block.get("box") and (block.get("target") or "").strip()]
+    # The raster lane's blocks live INSIDE an embedded image. No cut can pass
+    # through an image (it is a blocker), so opening the page cannot make room
+    # for them — they keep the plate treatment, drawn on the rebuilt page after
+    # everything has landed where it is going to stay.
+    raster = [block for block in blocks
+              if block.get("on_raster") and block.get("region")]
+    blocks = [block for block in blocks
+              if not (block.get("on_raster") and block.get("region"))]
     matrix = page.transformation_matrix
     anchors: list[pymupdf.Rect] = []
     fallbacks: list[tuple[pymupdf.Rect, str, float]] = []
@@ -1677,7 +1987,38 @@ def _spaced_page(target: pymupdf.Document, source: pymupdf.Document, index: int,
             obstacles.append(box)
             drawn += 1
 
-    return drawn, skipped
+    raster_drawn = raster_skipped = 0
+
+    if raster:
+        def remap(anchor: pymupdf.Rect,
+                  region: pymupdf.Rect) -> tuple[pymupdf.Rect, pymupdf.Rect]:
+            # The image moved as one rigid block: no cut passes through a
+            # blocker, so every point of it shares the region's own shift.
+            # The one exception is a stretched leaf (wall-to-wall backdrop),
+            # which was scaled taller rather than cut — there the map is the
+            # same vertical scale the artwork itself took.
+            leaf = _leaf_for(region, leaves)
+
+            if leaf.stretch:
+                grow = ((leaf.rect.height + leaf.stretch)
+                        / (leaf.rect.height or 1.0))
+                base = leaf.rect.y0 + leaf.offset - grow * leaf.rect.y0
+
+                def move(box: pymupdf.Rect) -> pymupdf.Rect:
+                    return pymupdf.Rect(box.x0, grow * box.y0 + base,
+                                        box.x1, grow * box.y1 + base)
+            else:
+                dy = _shift(leaf, region.y0)
+
+                def move(box: pymupdf.Rect) -> pymupdf.Rect:
+                    return box + (0, dy, 0, dy)
+
+            return move(anchor), move(region)
+
+        raster_drawn, raster_skipped = _render_raster(
+            new_page, raster, layout, matrix, new_page.rect, remap)
+
+    return drawn, skipped, raster_drawn, raster_skipped
 
 
 def render_spaced(original_bytes: bytes, sidecar: dict,
@@ -1698,7 +2039,7 @@ def render_spaced(original_bytes: bytes, sidecar: dict,
                     "and the PDF are not from the same run")
 
         target = pymupdf.open()
-        drawn = skipped = touched = 0
+        drawn = skipped = raster_drawn = raster_skipped = touched = 0
 
         try:
             for index in range(source.page_count):
@@ -1716,19 +2057,23 @@ def render_spaced(original_bytes: bytes, sidecar: dict,
                     # the page along is not the axis the reader sees lines
                     # stacked on — a cut meant to pass between two lines would
                     # pass THROUGH every one of them. The page is carried over
-                    # and glossed the way `interlinear` does it, which works in
-                    # the rotated frame and leaves the page alone.
+                    # and glossed the way `interlinear_compact` does it, which
+                    # works in the rotated frame and leaves the page alone.
                     target.insert_pdf(source, from_page=index, to_page=index)
-                    page_drawn, page_skipped = _render_page(
+                    page_counts = _render_page(
                         target[target.page_count - 1], page_data, layout)
                 else:
-                    page_drawn, page_skipped = _spaced_page(target, source, index,
-                                                            page_data, layout)
-                drawn += page_drawn
-                skipped += page_skipped
+                    page_counts = _spaced_page(target, source, index,
+                                               page_data, layout)
+                drawn += page_counts[0]
+                skipped += page_counts[1]
+                raster_drawn += page_counts[2]
+                raster_skipped += page_counts[3]
                 touched += 1
 
-            return target, {"pages": touched, "drawn": drawn, "skipped": skipped}
+            return target, {"pages": touched, "drawn": drawn, "skipped": skipped,
+                            "raster_drawn": raster_drawn,
+                            "raster_skipped": raster_skipped}
         except Exception:
             target.close()
             raise
@@ -1783,7 +2128,7 @@ def render_compact(original_bytes: bytes, sidecar: dict,
     doc = _open_original(original_bytes)
 
     try:
-        drawn = skipped = pages = 0
+        drawn = skipped = raster_drawn = raster_skipped = pages = 0
 
         for page_data in sidecar["pages"]:
             if not isinstance(page_data, dict):
@@ -1799,12 +2144,16 @@ def render_compact(original_bytes: bytes, sidecar: dict,
                     f"({doc.page_count} pages) does not have — the sidecar and "
                     "the PDF are not from the same run")
 
-            page_drawn, page_skipped = _render_page(doc[index], page_data, layout)
-            drawn += page_drawn
-            skipped += page_skipped
+            page_counts = _render_page(doc[index], page_data, layout)
+            drawn += page_counts[0]
+            skipped += page_counts[1]
+            raster_drawn += page_counts[2]
+            raster_skipped += page_counts[3]
             pages += 1
 
-        return doc, {"pages": pages, "drawn": drawn, "skipped": skipped}
+        return doc, {"pages": pages, "drawn": drawn, "skipped": skipped,
+                     "raster_drawn": raster_drawn,
+                     "raster_skipped": raster_skipped}
     except Exception:
         doc.close()
         raise
@@ -1816,8 +2165,9 @@ def render_overlay(original_bytes: bytes, sidecar: Any,
     """Draw `style` over the original PDF from its translation sidecar.
 
     Returns the PDF bytes and a small report — pages touched, glosses drawn,
-    glosses that had nowhere to go — so a caller can tell a good fit from a
-    document that quietly got nothing.
+    glosses that had nowhere to go, with the raster lane's counts on their own
+    keys — so a caller can tell a good fit from a document that quietly got
+    nothing.
     """
     if style not in OVERLAY_STYLES:
         raise OverlayError(f"style must be one of {OVERLAY_STYLES}")
@@ -1840,10 +2190,11 @@ def render_overlay(original_bytes: bytes, sidecar: Any,
         # engine leaves behind into a single embedded subset.
         doc.save(out, garbage=4, deflate=True)
 
-        if report["skipped"]:
-            logger.info("%s: %s gloss(es) had no room and were skipped "
-                        "(%s drawn over %s page(s))", style, report["skipped"],
-                        report["drawn"], report["pages"])
+        if report["skipped"] or report["raster_skipped"]:
+            logger.info("%s: %s gloss(es) and %s raster gloss(es) had no room "
+                        "and were skipped (%s + %s drawn over %s page(s))",
+                        style, report["skipped"], report["raster_skipped"],
+                        report["drawn"], report["raster_drawn"], report["pages"])
 
         return out.getvalue(), report
     finally:

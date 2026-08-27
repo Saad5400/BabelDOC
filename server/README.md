@@ -14,7 +14,7 @@ wrapper included, is public).
 | `GET` | `/v1/jobs/{id}/result` | token | The output PDF (`409` until `done`). |
 | `GET` | `/v1/jobs/{id}/sidecar` | token | The run's **translation sidecar** — its translated text as data (`409` until `done`, `404` when the run produced none). See below. |
 | `POST` | `/v1/compose` | token | Stateless dual builder. Multipart `original` + `translated` PDFs, field `format` = `alternating` \| `side_by_side`. Returns the composed PDF. Pure page shuffling — no LLM, no job, no charge. |
-| `POST` | `/v1/overlay` | token | Stateless **overlay** builder. Multipart `original` PDF + `sidecar` JSON, field `style` = `interlinear` \| `interlinear_compact`, optional `scale`, `min_font_size`, `max_font_size`, `gap`, `color` (hex), `align` (each defaults to the tuning of the style asked for). Returns the overlaid PDF plus `X-Overlay-Pages` / `X-Overlay-Drawn` / `X-Overlay-Skipped`. No LLM, no job, no charge. |
+| `POST` | `/v1/overlay` | token | Stateless **overlay** builder. Multipart `original` PDF + `sidecar` JSON, field `style` = `interlinear` \| `interlinear_compact`, optional `scale`, `min_font_size`, `max_font_size`, `gap`, `color` (hex), `align`, `plate_color` (hex), `plate_opacity`, `plate_padding` (each defaults to the tuning of the style asked for). Returns the overlaid PDF plus `X-Overlay-Pages` / `X-Overlay-Drawn` / `X-Overlay-Skipped` (and `X-Overlay-Raster-Drawn` / `X-Overlay-Raster-Skipped` for glosses inside embedded images). No LLM, no job, no charge. |
 | `POST` | `/v1/convert` | token | Stateless office-to-PDF normaliser (LibreOffice). Multipart `file` (docx/pptx/…). Returns the PDF. |
 | `GET` | `/healthz` | open | `200 {"status":"ok","versions":{babeldoc,tesseract,ocrmypdf,libreoffice}}`; `503 degraded` if a binary is missing. Deploy health check. |
 
@@ -85,6 +85,16 @@ the sidecar is for.
   Arabic is shaped and bidi-resolved by PyMuPDF's Story engine in both; the
   gloss font is BabelDOC's own, subset per document (a deck would otherwise
   carry one 15 MB font copy per gloss).
+
+  Sidecar blocks marked `on_raster` (text the engine found INSIDE an embedded
+  image, with the image's `region`) are glossed inside that image in both
+  styles: on a rounded translucent plate in the band directly above the label,
+  placed by reading the region's PIXELS — a plate may dim flat artwork but
+  never cover a mark — falling back below the label, else skipped. Opening the
+  page cannot help a label that lives inside a raster, so under `interlinear`
+  the plates simply ride the image to wherever the cuts moved it. Their fit
+  comes back on `X-Overlay-Raster-Drawn` / `X-Overlay-Raster-Skipped`, and the
+  plate is tunable via `plate_color` / `plate_opacity` / `plate_padding`.
 
 ## Environment
 

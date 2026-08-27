@@ -151,6 +151,9 @@ async def overlay(
     gap: float | None = Form(None),
     color: str | None = Form(None),
     align: str | None = Form(None),
+    plate_color: str | None = Form(None),
+    plate_opacity: float | None = Form(None),
+    plate_padding: float | None = Form(None),
 ):
     """Stateless layout builder for the layouts that need the translated TEXT.
 
@@ -186,7 +189,10 @@ async def overlay(
             **{key: value for key, value in
                (("scale", scale), ("min_font_size", min_font_size),
                 ("max_font_size", max_font_size), ("gap", gap),
-                ("color", color), ("align", align))
+                ("color", color), ("align", align),
+                ("plate_color", plate_color),
+                ("plate_opacity", plate_opacity),
+                ("plate_padding", plate_padding))
                if value is not None})
         result, report = interlinear.render_overlay(original_bytes, parsed,
                                                     style=style, options=options)
@@ -203,6 +209,11 @@ async def overlay(
             "X-Overlay-Pages": str(report["pages"]),
             "X-Overlay-Drawn": str(report["drawn"]),
             "X-Overlay-Skipped": str(report["skipped"]),
+            # The raster lane's fit, on its own headers: a deck whose diagrams
+            # all came back unglossed should say so even when every ordinary
+            # paragraph fitted.
+            "X-Overlay-Raster-Drawn": str(report["raster_drawn"]),
+            "X-Overlay-Raster-Skipped": str(report["raster_skipped"]),
         })
 
 
