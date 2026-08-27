@@ -13,7 +13,7 @@ wrapper included, is public).
 | `GET` | `/v1/jobs/{id}` | token | `{"status": "queued|running|done|failed", "progress": {"percent", "stage"}, "pages", "format", "usage": {...} (when done), "error" (when failed)}` |
 | `GET` | `/v1/jobs/{id}/result` | token | The output PDF (`409` until `done`). |
 | `GET` | `/v1/jobs/{id}/sidecar` | token | The run's **translation sidecar** — its translated text as data (`409` until `done`, `404` when the run produced none). See below. |
-| `POST` | `/v1/compose` | token | Stateless dual builder. Multipart `original` + `translated` PDFs, field `format` = `alternating` \| `side_by_side`. Returns the composed PDF. Pure page shuffling — no LLM, no job, no charge. |
+| `POST` | `/v1/compose` | token | Stateless dual builder. Multipart `original` + `translated` PDFs, field `format` = `alternating` \| `side_by_side`, optional `sidecar` JSON (see **Terms pages**). Returns the composed PDF. Pure page shuffling (plus the glossary render when the sidecar carries one) — no LLM, no job, no charge. |
 | `POST` | `/v1/overlay` | token | Stateless **overlay** builder. Multipart `original` PDF + `sidecar` JSON, field `style` = `interlinear`, optional `scale`, `min_font_size`, `max_font_size`, `color` (hex), `align`. Returns the overlaid PDF plus `X-Overlay-Pages` / `X-Overlay-Drawn` / `X-Overlay-Skipped`. No LLM, no job, no charge. |
 | `POST` | `/v1/convert` | token | Stateless office-to-PDF normaliser (LibreOffice). Multipart `file` (docx/pptx/…). Returns the PDF. |
 | `GET` | `/healthz` | open | `200 {"status":"ok","versions":{babeldoc,tesseract,ocrmypdf,libreoffice}}`; `503 degraded` if a binary is missing. Deploy health check. |
@@ -73,6 +73,34 @@ the sidecar is for.
   is BabelDOC's own, subset per document (a deck would otherwise carry one
   15 MB font copy per gloss).
 
+## Terms pages («شرح المصطلحات»)
+
+After a **mono** run, one extra LLM call over the run's sidecar
+(`server/terms.py`) picks the genuinely difficult English terms in the document
+(0–10; "Wrapping", "Overloading" — not every technical word) and writes a short,
+friendly Saudi-Arabic explanation for each. The entries are stored in the
+sidecar under a top-level **`"glossary"`** key (`[{term, arabic, explanation,
+page, quote}]`, 1-based pages; `[]` when nothing made the cut; absent on runs
+from before this feature — consumers must tolerate both), and
+`server/glossary_pages.py` renders them as styled pages **appended to the end**
+of the output. The pass is best-effort everywhere: any failure logs and the
+translation ships without the pages — a run never fails over its appendix.
+
+The same pages ride along on the free layouts:
+
+- **`/v1/overlay`** appends them whenever the sidecar it received carries
+  `"glossary"` (the report gains a `glossary_pages` count).
+- **`/v1/compose`** accepts an optional multipart `sidecar` part. When it
+  carries `"glossary"`, the composed dual gets the pages appended — and the
+  translated input's own glossary tail (every page past the sidecar's
+  `total_pages`) is ignored, so the appendix never appears twice. Without a
+  sidecar, compose is also tolerant of a translated PDF that is *longer* than
+  the original: the extra tail pages are appended whole at the end (alternating
+  and side-by-side alike) instead of being paired against blanks.
+
+Kill switch: `GLOSSARY_PAGES=0` disables the whole feature — the extraction
+call and every append, on all three paths.
+
 ## Environment
 
 | Env | Default | Meaning |
@@ -83,6 +111,7 @@ the sidecar is for.
 | `OPENAI_MODEL` | `google/gemini-3.1-flash-lite` | Translation model |
 | `DATA_DIR` | `/data` | Job storage (volume) |
 | `JOB_TTL_HOURS` | `24` | Job retention |
+| `GLOSSARY_PAGES` | `1` | «شرح المصطلحات» terms pages; `0` disables extraction and every append |
 
 ## Run locally
 
