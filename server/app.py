@@ -133,7 +133,9 @@ async def compose_dual(
     "glossary" entries the mono run selected, the composed dual gets the same
     «شرح المصطلحات» pages appended (and the translated input's own glossary
     tail, past the page count the sidecar records, is ignored so the appendix
-    never appears twice). Without it, behavior is exactly as before.
+    never appears twice). When its blocks carry "pairs" (the aligned phrase
+    segmentation), both sides of the dual get matching phrase-highlight chips
+    (server/phrase_highlights.py). Without it, behavior is exactly as before.
     """
     if format not in compose.COMPOSE_FORMATS:
         raise HTTPException(status_code=422,

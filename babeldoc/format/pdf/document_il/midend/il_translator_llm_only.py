@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import threading
 from pathlib import Path
 from string import Template
 
@@ -21,12 +22,16 @@ from babeldoc.format.pdf.document_il.midend.il_translator import (
 from babeldoc.format.pdf.document_il.midend.il_translator import (
     DocumentTranslateTracker,
 )
+from babeldoc.format.pdf.document_il.midend import phrase_pairs
 from babeldoc.format.pdf.document_il.midend.il_translator import ILTranslator
 from babeldoc.format.pdf.document_il.midend.il_translator import PageTranslateTracker
 from babeldoc.format.pdf.document_il.midend.il_translator import (
     ParagraphTranslateTracker,
 )
 from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper
+from babeldoc.format.pdf.document_il.utils.layout_helper import (
+    get_char_unicode_string,
+)
 from babeldoc.format.pdf.document_il.utils.paragraph_helper import is_cid_paragraph
 from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
     is_placeholder_only_paragraph,
@@ -90,7 +95,7 @@ Output:
     "output": "{v1}<style id='2'>$example_hello</style>$example_world"
     }
 ]
-
+$phrase_pairs_block
 $contextual_hints_block
 
 $glossary_tables_block
@@ -99,6 +104,212 @@ $glossary_tables_block
 
 $json_input_str"""
 )
+
+
+# Pairing rules shared VERBATIM between the in-band prompt block below and the
+# pairs-only retry prompt ({@link PAIRS_RETRY_PROMPT_TEMPLATE}): both prompts
+# feed the same validator, so the field-agnostic parts of the contract are one
+# string, not two drifting copies.
+_PAIR_RULE_FERTILITY_AND_CLITICS = """- When consecutive source words share ONE inseparable translation, either group them into a single pair OR let each of them repeat that same "t" verbatim — both are accepted ("software systems" → «أنظمة برمجية» as one pair, or "software" → «أنظمة برمجية» then "systems" → «أنظمة برمجية»). Arabic clitic prefixes (و، ف، ب، ل، ك، س) are part of the word they attach to: NEVER emit a clitic alone as a "t" phrase — "and different" → «ومختلفة» pairs the clitic with its word."""
+
+_PAIR_RULE_OPAQUE_TOKENS = """- Placeholders like {v1} are OPAQUE WORDS of both texts: put each one inside EXACTLY ONE "s" phrase and EXACTLY ONE "t" phrase, at the spot where it sits in that text. NEVER split, alter, or drop such a token, and NEVER make a phrase that is ONLY tokens — a leading bullet's token belongs to the phrase that follows it, as in {"s": "{v1} Software products", "t": "{v1} منتجات البرمجيات"}."""
+
+_PAIR_RULE_WORD_BOUNDARY = (
+    "- Split ONLY between whole words. NEVER split inside a word."
+)
+
+
+# Appended to the prompt only when at least one item in the batch is marked
+# "want_pairs". Style tags — <style id='N'> — merely wrap text the model does
+# see, and the phrases cover the PLAIN text, tags removed. Formula
+# placeholders — {vN}, standing in for characters the model never sees (on
+# real slides, most often just the bullet glyph «•») — ride the phrases as
+# OPAQUE WORDS: each token sits inside exactly one phrase on each side, and
+# the capture seam expands it back to the formula's own text afterwards.
+# The rules here are the exact contract phrase_pairs.validate_pairs (and
+# phrase_pairs.expand_formula_tokens) enforces — after its deterministic
+# normalization pass, which is why repeated-"t" runs and (per its clitic
+# retry) split-off proclitics are declared acceptable above; anything else
+# that breaks the contract is discarded per paragraph, never repaired.
+PHRASE_PAIRS_PROMPT_BLOCK = (
+    """
+## Phrase Pairs
+For every input item that has "want_pairs": true, ALSO add a "pairs" field to that output item: a JSON array of {"s": <source phrase>, "t": <translated phrase>} objects segmenting BOTH texts completely.
+- Align by MEANING: each "t" is the translation of its "s". List the pairs in the SOURCE text's order; each "t" phrase will be located in your output wherever your translation actually put it — the two languages may order the phrases differently, and that is fine. NEVER pair a phrase with target words that merely occupy the same position.
+- Split as FINELY as possible — the ideal unit is ONE word: "Software products" is TWO pairs ("Software" and "products"), never one. Merge words into one unit only when the mapping forces it: glue an article/preposition to its content word when it has no standalone counterpart ("of products" → «المنتجات»), and keep grammar-fused forms together when word-by-word units would not be contiguous on both sides ("two local variables" → «متغيرين محليين»). A 12-word sentence should typically produce 8-12 pairs, not 3.
+"""
+    + _PAIR_RULE_FERTILITY_AND_CLITICS
+    + """
+- The phrases cover the PLAIN text: read both the item's "input" and your "output" with every <style id='N'>...</style> tag removed, keeping each tag's inner text in place. NEVER put a tag, or any part of one, inside an "s" or "t" phrase.
+"""
+    + _PAIR_RULE_OPAQUE_TOKENS
+    + """
+- Every word of that plain input must appear in exactly one "s" phrase, and every word of your plain output in exactly one "t" phrase: concatenating all "s" values with single spaces reproduces the plain input exactly, and the "t" values, rearranged into your output's own order, reproduce the plain output exactly.
+"""
+    + _PAIR_RULE_WORD_BOUNDARY
+    + """
+- Items without "want_pairs" must NOT get a "pairs" field.
+
+### Phrase pairs example
+Input:
+[
+    {
+    "id": 0,
+    "input": "A local variable must be declared before it is used.",
+    "layout_label": "text",
+    "want_pairs": true
+    }
+]
+Output:
+[
+    {
+    "id": 0,
+    "output": "يجب الإعلان عن المتغير المحلي قبل استخدامه.",
+    "pairs": [
+        {"s": "A local", "t": "المحلي"},
+        {"s": "variable", "t": "المتغير"},
+        {"s": "must be declared", "t": "يجب الإعلان عن"},
+        {"s": "before", "t": "قبل"},
+        {"s": "it is used.", "t": "استخدامه."}
+    ]
+    }
+]
+Note how the Arabic starts with «يجب الإعلان عن» even though its pair is listed third: the pairs follow the SOURCE order and the meaning, not the output's word positions. Note also the granularity — "variable" and "before" stand alone; "must be declared" stays whole only because «يجب الإعلان عن» cannot be split against it word by word.
+"""
+)
+
+
+# The one-shot pairs-only retry prompt. Measured on a real deck, word-level
+# granularity fails validation on long multi-clause sentences (the model pairs
+# one Arabic word with non-adjacent English words) and full-deck coverage
+# dropped from 145/218 paragraphs to 85/218 — so every paragraph whose
+# main-pass pairs were discarded gets ONE more chance at the END of the
+# document, with the granularity guidance inverted: correctness first, single
+# words only where certain. The texts sent are the exact validation-time plain
+# strings (style tags stripped, {vN} tokens kept), so a compliant answer
+# validates against precisely what the model saw. Same output contract, same
+# validator, same expansion seam.
+PAIRS_RETRY_PROMPT_TEMPLATE = Template(
+    """You are a professional aligner of $lang_out translations with their sources. Each input item carries a "source" text and its FINAL "translation" — do NOT retranslate or alter either text. Your ONLY task is to segment both into aligned phrase pairs.
+
+## Output Format
+Return a JSON array of the same length. For each item:
+- Keep the same "id" and remove other fields like "source" and "translation".
+- Add "pairs": a JSON array of {"s": <source phrase>, "t": <translation phrase>} objects segmenting BOTH texts completely.
+- No extra text, no ```json blocks.
+
+## Pairing Rules
+- Align by MEANING: each "t" is the translation of its "s". List the pairs in the SOURCE text's order; each "t" phrase sits in the translation wherever the translation actually put it — the two languages may order the phrases differently, and that is fine. NEVER pair a phrase with target words that merely occupy the same position.
+- Split as finely as you can get RIGHT — single words are ideal, but NEVER guess an alignment: when unsure, group neighbouring words into ONE larger unit instead. A correct 4-pair segmentation beats a wrong 10-pair one; a whole clause as a single pair is acceptable when its words cannot be aligned with certainty.
+"""
+    + _PAIR_RULE_FERTILITY_AND_CLITICS
+    + "\n"
+    + _PAIR_RULE_OPAQUE_TOKENS
+    + """
+- Every word of the source must appear in exactly one "s" phrase, and every word of the translation in exactly one "t" phrase: concatenating all "s" values with single spaces reproduces the source exactly, and the "t" values, rearranged into the translation's own order, reproduce the translation exactly.
+"""
+    + _PAIR_RULE_WORD_BOUNDARY
+    + """
+
+## Here is the input:
+
+$json_input_str"""
+)
+
+
+# The retry sweep's shape. One attempt per discarded paragraph, batched like
+# the main flow, and bounded: past PAIRS_RETRY_MAX_PARAGRAPHS discards the
+# rest simply stay pairless — a document failing at that scale has a
+# systematic problem no retry will fix, and the bound caps the retry's cost.
+# COST: the sweep re-sends each recorded paragraph's plain source AND its
+# translation once — roughly the failed fraction's tokens over again (both
+# sides this time), plus one rules preamble per batch.
+PAIRS_RETRY_MAX_PARAGRAPHS = 200
+PAIRS_RETRY_BATCH_SIZE = 5
+
+
+# How many formula placeholders a paragraph may carry and still be asked for
+# pairs. A formula token is an opaque WORD to the pairing contract, so a
+# handful (a bullet glyph, an inline symbol or two) costs nothing — but a
+# paragraph that is MOSTLY formulas (a derivation, a table row of equations)
+# has next to no prose to align, and each token is one more chance for the
+# model to drop or duplicate one and void the whole paragraph's pairs. Ten is
+# comfortably past any real prose paragraph and comfortably short of the
+# degenerate ones.
+MAX_PAIR_FORMULAS = 10
+
+
+def pairs_eligible(translate_input: "ILTranslator.TranslateInput") -> bool:
+    """Whether a paragraph's translate input may carry phrase pairs.
+
+    A style placeholder (<style id='N'>...</style>) merely WRAPS text the
+    model does see; the phrases cover the plain text, the input with the
+    wrappers removed ({@link strip_style_placeholders}). A formula
+    placeholder ({vN}) REPLACES source characters with an opaque token — but
+    the pairing contract treats that token as an opaque WORD the model
+    carries into exactly one phrase on each side, and the capture seam
+    expands it back to the formula's own text ({@link
+    phrase_pairs.expand_formula_tokens}), so formulas no longer disqualify.
+    This matters on real decks: babeldoc classifies the bullet glyph «•» as a
+    formula, so under the old rule every bulleted body paragraph — most of a
+    slide deck's content — was excluded. Only degenerate formula-HEAVY
+    paragraphs (more than {@link MAX_PAIR_FORMULAS} tokens) stay out: barely
+    any prose to align, many chances to void the pairs.
+    """
+    return (
+        sum(
+            isinstance(placeholder, il_translator.FormulaPlaceholder)
+            for placeholder in translate_input.placeholders
+        )
+        <= MAX_PAIR_FORMULAS
+    )
+
+
+def formula_expansions(placeholders) -> dict[str, str]:
+    """Each formula token mapped to the text its formula's characters spell.
+
+    The same resolution {@link ILTranslator.parse_translate_output} performs
+    when it swaps a `{vN}` back for its formula composition: the composition's
+    `pdf_character` list, read through `get_char_unicode_string` — exactly how
+    the sidecar's `_target_text` will later read the very same characters, so
+    an expanded phrase and the block's target text agree on what the formula
+    says. A formula with no characters expands to "" (the token is simply
+    dropped from its phrase — see phrase_pairs.expand_formula_tokens).
+    """
+    return {
+        placeholder.placeholder: (
+            get_char_unicode_string(placeholder.formula.pdf_character)
+            if placeholder.formula is not None
+            and placeholder.formula.pdf_character
+            else ""
+        )
+        for placeholder in placeholders
+        if isinstance(placeholder, il_translator.FormulaPlaceholder)
+    }
+
+
+def strip_style_placeholders(text: str, placeholders) -> str:
+    """The plain text of a translate input: style wrappers out, content kept.
+
+    Removes each RichTextPlaceholder's tags by its own regex patterns — the
+    same case-insensitive, whitespace-tolerant patterns
+    parse_translate_output recognises the model's echoed tags with. What
+    remains are exactly the paragraph's own characters (the wrappers were
+    injected AROUND them), which is why "s" phrases validated against this
+    text also line up with the snapshotted source characters when the
+    sidecar resolves s_rects: rect matching is whitespace-blind, and the
+    non-space characters agree by construction.
+    """
+    for placeholder in placeholders:
+        if isinstance(placeholder, il_translator.FormulaPlaceholder):
+            continue
+        for pattern in (
+            placeholder.left_regex_pattern,
+            placeholder.right_regex_pattern,
+        ):
+            if pattern:
+                text = re.sub(pattern, "", text, flags=re.IGNORECASE)
+    return text
 
 
 class BatchParagraph:
@@ -156,6 +367,25 @@ class ILTranslatorLLMOnly:
         self.fallback_count = 0
         self.total_count = 0
 
+        # Phrase-pair alignment (see phrase_pairs.py). Off when the config
+        # says so — and off whenever no sidecar was asked for, because the
+        # sidecar is the only place pairs can land: asking would spend prompt
+        # tokens on answers nobody keeps. Degenerate formula-heavy paragraphs
+        # never take part ({@link pairs_eligible}), and the fallback
+        # translator (il_translator) never produces pairs at all.
+        self.capture_phrase_pairs = bool(
+            getattr(translation_config, "capture_phrase_pairs", False)
+            and getattr(translation_config, "translation_sidecar_path", None)
+        )
+        self.pairs_kept = 0
+        self.pairs_discarded = 0
+        # Paragraphs whose main-pass pairs were discarded, queued for the ONE
+        # pairs-only retry sweep at the end of translate(). Appended from the
+        # executor's worker threads, hence the lock; drained sequentially.
+        self.pairs_retry_kept = 0
+        self._pairs_retry_lock = threading.Lock()
+        self._pairs_retry_queue: list[dict] = []
+
     def calc_token_count(self, text: str) -> int:
         try:
             return len(self.tokenizer.encode(text, disallowed_special=()))
@@ -180,6 +410,13 @@ class ILTranslatorLLMOnly:
 
     def translate(self, docs: Document) -> None:
         self.il_translator.docs = docs
+        store = getattr(self.translation_config, "phrase_pair_store", None)
+        if store is not None:
+            # A reused config must not carry pairs keyed by a previous
+            # document's (since freed) paragraph ids into this one.
+            store.clear()
+        # Same freshness rule for the retry queue: it references paragraphs.
+        self._pairs_retry_queue = []
         tracker = DocumentTranslateTracker()
         self.mid = 0
 
@@ -258,11 +495,25 @@ class ILTranslatorLLMOnly:
             logger.debug(f"save translate tracking to {path}")
             with Path(path).open("w", encoding="utf-8") as f:
                 f.write(tracker.to_json())
+        # The one-shot pairs-only retry: after every main batch has finished
+        # (the executors above have drained), before the summary below counts.
+        self._retry_phrase_pairs()
         untranslated_total = self.il_translator.report_untranslated()
         logger.info(
             f"Translation completed. Total: {self.total_count}, Successful: {self.ok_count}, "
             f"Fallback: {self.fallback_count}, Untranslated: {untranslated_total}"
         )
+        if self.capture_phrase_pairs and (
+            self.pairs_kept or self.pairs_retry_kept or self.pairs_discarded
+        ):
+            # Once per document, as promised: discards are normal (the model
+            # missegments, the Arabic post-processor rewrites) and only worth
+            # a single summary line, never a per-paragraph drumbeat.
+            logger.info(
+                f"Phrase pairs: kept {self.pairs_kept} "
+                f"(+{self.pairs_retry_kept} on retry), "
+                f"discarded {self.pairs_discarded}"
+            )
 
     def _is_body_text_paragraph(self, paragraph: PdfParagraph) -> bool:
         """判断正文段落（当前仅 layout_label == 'text'）。
@@ -695,6 +946,15 @@ class ILTranslatorLLMOnly:
                     and self.translation_config.add_formula_placehold_hint
                 ):
                     obj["formula_placeholders_hint"] = placeholders_hint
+                # Pairs are requested for formula-bearing paragraphs too: a
+                # {vN} token is an opaque WORD the model carries into exactly
+                # one phrase on each side, expanded back to the formula's own
+                # text at the capture seam. Style placeholders merely WRAP
+                # text the model does see — the phrases cover the input with
+                # the tags stripped. Only degenerate formula-heavy paragraphs
+                # sit out ({@link pairs_eligible}).
+                if self.capture_phrase_pairs and pairs_eligible(ti):
+                    obj["want_pairs"] = True
                 json_format_input.append(obj)
 
             json_format_input_str = json.dumps(
@@ -710,6 +970,9 @@ class ILTranslatorLLMOnly:
                 title_paragraph=title_paragraph,
                 local_title_paragraph=local_title_paragraph,
                 batch_text_for_glossary_matching=batch_text_for_glossary_matching,
+                include_phrase_pairs=any(
+                    obj.get("want_pairs") for obj in json_format_input
+                ),
             )
 
             for llm_translate_tracker in llm_translate_trackers:
@@ -738,6 +1001,14 @@ class ILTranslatorLLMOnly:
                 item["id"]: item.get("output", item.get("input"))
                 for item in parsed_output
             }
+            # The raw pairs riding on each item, shape-checked only; the
+            # strict validation waits until the translation has actually been
+            # applied (the Arabic post-processor may still rewrite it).
+            pairs_results = {
+                item["id"]: phrase_pairs.pairs_from_item(item)
+                for item in parsed_output
+                if isinstance(item, dict) and "id" in item
+            }
 
             if len(translation_results) != len(inputs):
                 raise Exception(
@@ -746,6 +1017,9 @@ class ILTranslatorLLMOnly:
 
             for id_, output in translation_results.items():
                 should_fallback = True
+                # Fetch by the RAW key: id_ is re-typed to int below, but
+                # pairs_results is keyed exactly like translation_results.
+                raw_pairs = pairs_results.get(id_)
                 try:
                     if not isinstance(output, str):
                         logger.warning(
@@ -821,13 +1095,20 @@ class ILTranslatorLLMOnly:
                             llm_translate_tracker.set_placeholder_full_match()
                             continue
                     # Apply the translation to the paragraph
-                    self.il_translator.post_translate_paragraph(
+                    applied = self.il_translator.post_translate_paragraph(
                         inputs[id_][2],
                         inputs[id_][3],
                         translate_input,
                         translated_text,
                     )
                     should_fallback = False
+                    if applied:
+                        self._capture_phrase_pairs(
+                            paragraph=inputs[id_][2],
+                            translate_input=translate_input,
+                            source_text=input_unicode,
+                            raw_pairs=raw_pairs,
+                        )
                     if pbar:
                         pbar.advance(1)
                 except Exception as e:
@@ -900,12 +1181,217 @@ class ILTranslatorLLMOnly:
                     local_title_paragraph=local_title_paragraph,
                 )
 
+    def _capture_phrase_pairs(
+        self,
+        paragraph: PdfParagraph,
+        translate_input,
+        source_text: str,
+        raw_pairs: list[dict] | None,
+    ) -> None:
+        """Validate one paragraph's pairs and file them for the sidecar.
+
+        Called only after the translation was APPLIED, so `paragraph.unicode`
+        holds the exact string post_translate_paragraph applied: the model's
+        raw output, post-processed (Arabic diacritics stripped, operator
+        spacing fixed), with its `<style id='N'>` tags and `{vN}` tokens
+        still intact. Both sides are validated against the TOKENIZED PLAIN
+        texts — style wrappers stripped ({@link strip_style_placeholders}),
+        formula tokens KEPT, each counting as one opaque word: the source
+        side is `source_text` so stripped, the text the prompt told the model
+        its "s" phrases cover; the target side is `paragraph.unicode` so
+        stripped — the raw output rather than the sidecar's expanded target
+        text, because the model segmented ITS OWN output, tokens and all, and
+        only against that string do the token words line up.
+
+        Validation is then followed by EXPANSION ({@link
+        phrase_pairs.expand_formula_tokens} with {@link formula_expansions}):
+        each `{vN}` in the validated phrase strings becomes the formula's
+        actual text, so what lands in the store — and from there in the
+        sidecar — is only real page text, matching the snapshotted source
+        characters and the typeset target characters that rect resolution
+        reads. Any violation at either step discards the pairs for this
+        paragraph alone; the translation itself is already safe — but the
+        discarded paragraph is RECORDED, with the exact validation-time plain
+        strings, for the one pairs-only retry sweep at the end of translate()
+        ({@link _retry_phrase_pairs}). Never raises: pairs are a bonus, and a
+        bug here must not cost a paid paragraph its fallback accounting.
+        """
+        try:
+            if not self.capture_phrase_pairs or not pairs_eligible(
+                translate_input
+            ):
+                return
+            store = getattr(self.translation_config, "phrase_pair_store", None)
+            if store is None:
+                return
+
+            plain_source = strip_style_placeholders(
+                source_text, translate_input.placeholders
+            )
+            plain_target = strip_style_placeholders(
+                paragraph.unicode or "", translate_input.placeholders
+            )
+
+            pairs = None
+            validated = phrase_pairs.validate_pairs(
+                raw_pairs, plain_source, plain_target
+            )
+            if validated:
+                pairs, permutation = validated
+                pairs = phrase_pairs.expand_formula_tokens(
+                    pairs, formula_expansions(translate_input.placeholders)
+                )
+            if pairs is not None:
+                store[id(paragraph)] = {"pairs": pairs, "perm": permutation}
+                self.pairs_kept += 1
+            else:
+                self.pairs_discarded += 1
+                self._record_pairs_retry(
+                    paragraph=paragraph,
+                    plain_source=plain_source,
+                    plain_target=plain_target,
+                    expansions=formula_expansions(
+                        translate_input.placeholders
+                    ),
+                )
+        except Exception:  # noqa: BLE001 - see docstring
+            self.pairs_discarded += 1
+            logger.exception("phrase pairs: capture failed; discarding")
+
+    def _record_pairs_retry(
+        self,
+        paragraph: PdfParagraph,
+        plain_source: str,
+        plain_target: str,
+        expansions: dict[str, str],
+    ) -> None:
+        """Queue one discarded paragraph for the end-of-document retry sweep.
+
+        What is recorded is exactly what the retry needs to replay the
+        capture: the paragraph (the store is keyed by its identity), the two
+        TOKENIZED PLAIN strings validation just ran on — style tags stripped,
+        `{vN}` formula tokens kept — and the formula expansions those tokens
+        resolve to. Bounded by {@link PAIRS_RETRY_MAX_PARAGRAPHS}; past the
+        bound (or on any surprise) the paragraph simply stays pairless, in
+        the capture seam's never-fail spirit.
+        """
+        try:
+            if not plain_source or not plain_target:
+                return
+            with self._pairs_retry_lock:
+                if len(self._pairs_retry_queue) >= PAIRS_RETRY_MAX_PARAGRAPHS:
+                    return
+                self._pairs_retry_queue.append(
+                    {
+                        "paragraph": paragraph,
+                        "source": plain_source,
+                        "target": plain_target,
+                        "expansions": expansions,
+                    }
+                )
+        except Exception:  # noqa: BLE001 - never-fail, see docstring
+            logger.exception("phrase pairs: retry recording failed")
+
+    def _retry_phrase_pairs(self) -> None:
+        """The one-shot pairs-only retry sweep over recorded discards.
+
+        Runs at the END of translate(), after the main executors have
+        drained, only when pair capture is on and something was discarded.
+        Each batch is ONE new LLM call built from {@link
+        PAIRS_RETRY_PROMPT_TEMPLATE} — same request path, json mode and rate
+        limiting as the main batches — whose granularity guidance prefers a
+        CORRECT coarse segmentation over a wrong fine one, because that is
+        exactly how the main pass failed (word-level pairs on long
+        multi-clause sentences). One attempt per paragraph, no second retry:
+        a failed batch (network error, garbage JSON, mismatched ids) is
+        logged and skipped — the translations are already applied and those
+        paragraphs simply keep no pairs.
+        """
+        queue = self._pairs_retry_queue
+        if not self.capture_phrase_pairs or not queue:
+            return
+        store = getattr(self.translation_config, "phrase_pair_store", None)
+        if store is None:
+            return
+
+        for start in range(0, len(queue), PAIRS_RETRY_BATCH_SIZE):
+            batch = queue[start : start + PAIRS_RETRY_BATCH_SIZE]
+            try:
+                self._retry_phrase_pairs_batch(batch, store)
+            except Exception:  # noqa: BLE001 - see docstring
+                logger.exception(
+                    "phrase pairs: retry batch failed; pairs stay absent"
+                )
+        self._pairs_retry_queue = []
+
+    def _retry_phrase_pairs_batch(self, batch: list[dict], store) -> None:
+        """One retry call: ask, validate exactly like the main pass, store.
+
+        A response item counts only when its id names a batch entry and its
+        pairs survive the very same `validate_pairs` → `expand_formula_tokens`
+        path the main pass runs; a success moves the paragraph from
+        `pairs_discarded` (it was counted there when the main pass failed)
+        into `pairs_retry_kept`.
+        """
+        items = [
+            {"id": i, "source": entry["source"], "translation": entry["target"]}
+            for i, entry in enumerate(batch)
+        ]
+        prompt = PAIRS_RETRY_PROMPT_TEMPLATE.substitute(
+            lang_out=self.translation_config.lang_out,
+            json_input_str=json.dumps(items, ensure_ascii=False, indent=2),
+        )
+        token_count = sum(
+            self.calc_token_count(entry["source"])
+            + self.calc_token_count(entry["target"])
+            for entry in batch
+        )
+        llm_output = self.translate_engine.llm_translate(
+            prompt,
+            rate_limit_params={
+                "paragraph_token_count": token_count,
+                "request_json_mode": True,
+            },
+        )
+        parsed = json.loads(self._clean_json_output(llm_output.strip()))
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        if not isinstance(parsed, list):
+            return
+        items_by_id = {
+            item["id"]: item
+            for item in parsed
+            if isinstance(item, dict) and "id" in item
+        }
+
+        for i, entry in enumerate(batch):
+            item = items_by_id.get(i, items_by_id.get(str(i)))
+            pairs = None
+            validated = phrase_pairs.validate_pairs(
+                phrase_pairs.pairs_from_item(item),
+                entry["source"],
+                entry["target"],
+            )
+            if validated:
+                pairs, permutation = validated
+                pairs = phrase_pairs.expand_formula_tokens(
+                    pairs, entry["expansions"]
+                )
+            if pairs is not None:
+                store[id(entry["paragraph"])] = {
+                    "pairs": pairs,
+                    "perm": permutation,
+                }
+                self.pairs_retry_kept += 1
+                self.pairs_discarded -= 1
+
     def _build_llm_prompt(
         self,
         json_input_str: str,
         title_paragraph: TitleContextSnapshot | None,
         local_title_paragraph: TitleContextSnapshot | None,
         batch_text_for_glossary_matching: str,
+        include_phrase_pairs: bool = False,
     ) -> str:
         """Build LLM prompt using a single template for easier maintenance."""
         # Build role block, honoring custom_system_prompt if provided.
@@ -1008,6 +1494,9 @@ class ILTranslatorLLMOnly:
             style_addendum_block=style_addendum_block,
             example_hello=example_hello,
             example_world=example_world,
+            phrase_pairs_block=(
+                PHRASE_PAIRS_PROMPT_BLOCK if include_phrase_pairs else ""
+            ),
         )
 
     def _clean_json_output(self, llm_output: str) -> str:

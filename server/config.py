@@ -37,6 +37,24 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 GLOSSARY_PAGES = (os.environ.get("GLOSSARY_PAGES", "1").strip().lower()
                   not in ("0", "false", "no", "off"))
 
+# Phrase-pair alignment — the translating LLM also segments each paragraph
+# into aligned source↔target phrases, captured into the sidecar ("pairs" on
+# its blocks, with the page rects of each phrase on both sides) for a later
+# highlight overlay. On by default; PHRASE_PAIRS=0 (or false/no/off) stops
+# requesting pairs entirely: prompt and sidecar are exactly as before.
+# See babeldoc/format/pdf/document_il/midend/phrase_pairs.py.
+PHRASE_PAIRS = (os.environ.get("PHRASE_PAIRS", "1").strip().lower()
+                not in ("0", "false", "no", "off"))
+
+# Matching phrase highlights — the DRAWING side of the pairs above: soft
+# colour chips over each aligned source↔target phrase on /v1/compose duals,
+# and chips + coloured gloss spans on /v1/overlay. On by default;
+# PHRASE_HIGHLIGHTS=0 (or false/no/off) turns the drawing off at both call
+# sites. Independent of PHRASE_PAIRS, which gates capturing pairs into the
+# sidecar in the first place. See server/phrase_highlights.py.
+PHRASE_HIGHLIGHTS = (os.environ.get("PHRASE_HIGHLIGHTS", "1").strip().lower()
+                     not in ("0", "false", "no", "off"))
+
 GLOSSARY_PATH = SERVER_DIR / "glossary_ar_cs.csv"
 OCR_PREP_SCRIPT = SERVER_DIR / "ocr_prep.py"
 FIX_LAYER_ORDER_SCRIPT = SERVER_DIR / "fix_layer_order.py"
