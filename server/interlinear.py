@@ -1992,28 +1992,32 @@ def _spaced_page(target: pymupdf.Document, source: pymupdf.Document, index: int,
     if raster:
         def remap(anchor: pymupdf.Rect,
                   region: pymupdf.Rect) -> tuple[pymupdf.Rect, pymupdf.Rect]:
-            # The image moved as one rigid block: no cut passes through a
-            # blocker, so every point of it shares the region's own shift.
-            # The one exception is a stretched leaf (wall-to-wall backdrop),
-            # which was scaled taller rather than cut — there the map is the
-            # same vertical scale the artwork itself took.
-            leaf = _leaf_for(region, leaves)
+            # The map is the ANCHOR's, not the region's. A furniture image is
+            # a blocker no cut passes through, so anchor and region share one
+            # rigid shift — but a full-page backdrop is not a blocker: the
+            # cuts slice straight through it and each label inside it moves
+            # with its own strip. The label's own leaf knows that move
+            # exactly. The region is only a fence, so its edges are mapped
+            # through the same leaf one by one, letting a sliced backdrop's
+            # fence stretch over everything it now spans.
+            leaf = _leaf_for(anchor, leaves)
 
             if leaf.stretch:
                 grow = ((leaf.rect.height + leaf.stretch)
                         / (leaf.rect.height or 1.0))
                 base = leaf.rect.y0 + leaf.offset - grow * leaf.rect.y0
 
-                def move(box: pymupdf.Rect) -> pymupdf.Rect:
-                    return pymupdf.Rect(box.x0, grow * box.y0 + base,
-                                        box.x1, grow * box.y1 + base)
+                def place(y: float) -> float:
+                    return grow * y + base
             else:
-                dy = _shift(leaf, region.y0)
+                def place(y: float) -> float:
+                    return y + _shift(leaf, y)
 
-                def move(box: pymupdf.Rect) -> pymupdf.Rect:
-                    return box + (0, dy, 0, dy)
+            dy = place(anchor.y0) - anchor.y0
 
-            return move(anchor), move(region)
+            return (anchor + (0, dy, 0, dy),
+                    pymupdf.Rect(region.x0, place(region.y0),
+                                 region.x1, place(region.y1)))
 
         raster_drawn, raster_skipped = _render_raster(
             new_page, raster, layout, matrix, new_page.rect, remap)
