@@ -1,9 +1,9 @@
 """Tests for the pipeline's vocab step (server/pipeline.py::_insert_vocab).
 
 No babeldoc run and no API call: the extraction is monkeypatched, and what is
-under test is the seam — entries recorded in the sidecar, pages interleaved
-into the finished result, the artifact_layout record that lets /v1/compose
-undo the interleaving, and the never-lose-the-run failure posture.
+under test is the seam — entries recorded in the sidecar, each page grown by
+its own bottom strip in the finished result, the artifact_layout record that
+lets /v1/compose undo the baking, and the never-lose-the-run failure posture.
 
 Run from the repo root (pyproject's testpaths only covers tests/):
 
@@ -56,7 +56,8 @@ def _texts(path):
         doc.close()
 
 
-def test_vocab_lands_in_the_sidecar_and_pages_interleave(tmp_path, monkeypatch):
+def test_vocab_lands_in_the_sidecar_and_strips_the_pages(tmp_path,
+                                                         monkeypatch):
     pdf, sidecar = tmp_path / "result.pdf", tmp_path / "sidecar.json"
     _result_pdf(pdf)
     _sidecar(sidecar)
@@ -68,19 +69,31 @@ def test_vocab_lands_in_the_sidecar_and_pages_interleave(tmp_path, monkeypatch):
     stored = json.loads(sidecar.read_text(encoding="utf-8"))
     assert stored["vocab"] == VOCAB
     assert stored["version"] == 1  # the shape the overlay reads is untouched
-    assert stored["artifact_layout"] == {"content_pages": [0, 2]}
+    layout = stored["artifact_layout"]
+    assert layout["content_pages"] == [0, 1]  # strips insert nothing
+    assert set(layout["vocab_strips"]) == {"0", "1"}
+    assert all(height > 0 for height in layout["vocab_strips"].values())
 
     texts = _texts(pdf)
-    assert len(texts) == 4  # c0 v0 c1 v1
+    assert len(texts) == 2  # each page carries its own words
     assert "Content a" in texts[0]
-    assert "declared" in texts[1]
-    assert "Content b" in texts[2]
-    assert "scope" in texts[3]
+    assert "declared" in texts[0]
+    assert "Content b" in texts[1]
+    assert "scope" in texts[1]
+
+    doc = pymupdf.open(str(pdf))
+    try:
+        # The pages grew by exactly the recorded strip heights.
+        for index in range(2):
+            grown = 842 + layout["vocab_strips"][str(index)]
+            assert abs(doc[index].rect.height - grown) < 0.1
+    finally:
+        doc.close()
 
 
 def test_an_existing_appendix_tail_stays_at_the_very_end(tmp_path, monkeypatch):
-    # A result that already ends with an appendix page past total_pages: body
-    # insertions shift it back, never split it.
+    # A result that already ends with an appendix page past total_pages: the
+    # strips draw on the content pages only and the tail keeps its place.
     pdf, sidecar = tmp_path / "result.pdf", tmp_path / "sidecar.json"
     _result_pdf(pdf, appendix_tail=True)
     _sidecar(sidecar)
@@ -90,13 +103,14 @@ def test_an_existing_appendix_tail_stays_at_the_very_end(tmp_path, monkeypatch):
     pipeline._insert_vocab(pdf, sidecar)
 
     texts = _texts(pdf)
-    assert len(texts) == 5  # c0 v0 c1 v1 tail
-    assert "declared" in texts[1]
-    assert "scope" in texts[3]
-    assert "TAILMARK" in texts[4]
+    assert len(texts) == 3  # c0 c1 tail
+    assert "declared" in texts[0]
+    assert "scope" in texts[1]
+    assert "TAILMARK" in texts[2]
 
     stored = json.loads(sidecar.read_text(encoding="utf-8"))
-    assert stored["artifact_layout"] == {"content_pages": [0, 2]}
+    assert stored["artifact_layout"]["content_pages"] == [0, 1]
+    assert set(stored["artifact_layout"]["vocab_strips"]) == {"0", "1"}
 
 
 def test_a_sidecars_glossary_terms_are_the_exclusion_list(tmp_path,

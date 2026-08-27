@@ -7,6 +7,7 @@ path explicitly):
 """
 
 import json
+import unicodedata
 from io import BytesIO
 
 import pymupdf
@@ -825,7 +826,7 @@ def test_endpoint_requires_the_token(client):
 
 
 # --------------------------------------------------------------------------
-# Vocab pages: «كلمات هذه الصفحة» interleaved into the overlay
+# Vocab: «كلمات هذه الصفحة» strips drawn onto the overlay pages
 # --------------------------------------------------------------------------
 
 VOCAB = {"0": [{"w": "inevitable", "ar": "حتمي، لا مفر منه"}]}
@@ -840,18 +841,33 @@ def _page_texts(pdf_bytes: bytes) -> list[str]:
         doc.close()
 
 
-def test_a_pages_vocab_page_follows_it():
+def _page_heights(pdf_bytes: bytes) -> list[float]:
+    doc = pymupdf.open(stream=BytesIO(pdf_bytes), filetype="pdf")
+
+    try:
+        return [doc[i].rect.height for i in range(doc.page_count)]
+    finally:
+        doc.close()
+
+
+def test_a_pages_vocab_strip_is_on_the_page_itself():
     original = _page_pdf([(60, 300, 500, 340, "Software change is inevitable")])
     sidecar = _sidecar([{"box": (60, 300, 400, 314), "target": AR_ONE}])
     sidecar["vocab"] = VOCAB
 
     result, report = _render(original, sidecar)
 
-    assert report["vocab_pages"] == 1
+    assert report["vocab_pages"] == 1  # one page got its words
     texts = _page_texts(result)
-    assert len(texts) == 2
-    assert "inevitable" in texts[0]  # the original page, glossed
-    assert "inevitable" in texts[1]  # its vocab page, right behind it
+    assert len(texts) == 1  # nothing inserted — the page grew instead
+    # NFKC: shaped Arabic can extract as presentation forms (a GoNotoKurrent
+    # ToUnicode characteristic).
+    normalized = unicodedata.normalize("NFKC", texts[0])
+    assert "حتمي" in normalized  # the strip's Arabic meaning, same page
+    plain, _ = _render(original,
+                       _sidecar([{"box": (60, 300, 400, 314),
+                                  "target": AR_ONE}]))
+    assert _page_heights(result)[0] > _page_heights(plain)[0]
 
 
 def test_a_sidecar_without_vocab_adds_nothing():
@@ -880,7 +896,7 @@ def test_an_unknown_sidecar_key_is_tolerated():
     assert report["drawn"] == 1
     assert report["vocab_pages"] == 1
     texts = _page_texts(result)
-    assert len(texts) == 2  # the glossed page + its vocab page, nothing more
+    assert len(texts) == 1  # the glossed page with its strip, nothing more
     assert "Wrapping" not in " ".join(texts)
 
 

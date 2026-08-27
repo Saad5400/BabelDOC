@@ -2195,12 +2195,13 @@ def render_overlay(original_bytes: bytes, sidecar: Any,
 
     try:
         # A sidecar that carries "vocab" (server/vocab.py wrote it after the
-        # mono run) gets the same «كلمات هذه الصفحة» pages the mono result
-        # has: each original page is followed by its own new-words page —
-        # whichever lane (spaced or compact) built it. Best-effort: an
-        # overlay must not fail over its vocab layer. Lazy import —
-        # vocab_pages draws on the shared page-fonts machinery, which imports
-        # this module for the font subsetter.
+        # mono run) gets the same «كلمات هذه الصفحة» treatment the mono
+        # result has: each original page grows a compact bottom strip of its
+        # own new words (a page the strip cannot serve — rotated, too small —
+        # falls back to an inserted page after it) — whichever lane (spaced
+        # or compact) built it. Best-effort: an overlay must not fail over
+        # its vocab layer. Lazy import — vocab_pages draws on the shared
+        # page-fonts machinery, which imports this module for the subsetter.
         vocab_added = 0
 
         if config.VOCAB_PAGES and isinstance(sidecar.get("vocab"), dict):
@@ -2218,11 +2219,13 @@ def render_overlay(original_bytes: bytes, sidecar: Any,
                     anchors[number] = number
 
             try:
-                vocab_added = sum(vocab_pages.interleave_vocab(
-                    doc, sidecar["vocab"], anchors).values())
+                # How many content pages got their words (strip or fallback
+                # page) — not a page count, since a strip adds no page.
+                vocab_added = len(vocab_pages.attach_vocab(
+                    doc, sidecar["vocab"], anchors))
             except Exception:  # noqa: BLE001 - the vocab layer is optional
-                logger.exception("interlinear: inserting vocab pages failed; "
-                                 "returning the overlay without them")
+                logger.exception("interlinear: attaching vocab failed; "
+                                 "returning the overlay without it")
 
         report["vocab_pages"] = vocab_added
 

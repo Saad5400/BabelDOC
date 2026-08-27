@@ -1,21 +1,26 @@
-"""The «كلمات هذه الصفحة» pages: per-page vocabulary rendered and interleaved.
+"""The «كلمات هذه الصفحة» layer: per-page vocabulary rendered onto the pages.
 
 `server/vocab.py` picks each page's NEW English words and short phrases and
-gives each a concise Arabic meaning; this module is the one renderer and the
-one inserter of those entries, shared by every artifact they ride in — the
-mono result (server/pipeline.py), the recomposed duals (server/compose.py) and
-the interlinear overlay (server/interlinear.py). A page's vocab page goes
-IMMEDIATELY AFTER that page's content, never to the end of the document — the
-reader meets the words while the page is still in front of them.
+gives each a concise Arabic meaning; this module is the one renderer of those
+entries, shared by every artifact they ride in — the mono result
+(server/pipeline.py), the recomposed duals (server/compose.py) and the
+interlinear overlay (server/interlinear.py). A page's words stay ON that page,
+never deferred to the end of the document — the reader meets them while the
+page is still in front of them.
 
 DESIGN: a quick word list, not a set of explanations. A blue #1d4ed8 accent on
 the English word, #111827 body, #64748b muted title and notes, and rows rather
 than anything heavier: a small muted title («كلمات هذه الصفحة»), then tight
 RTL rows of bold English word — Arabic meaning — optional muted note, with a
-soft #F1F5F9 stripe on alternate rows. More than six entries flow into two
-columns (right column first — the page is RTL), which is what keeps a full
-20-word page (the extraction's per-page cap) on one inserted slide-sized page;
-a page that still overflows continues onto a second inserted page.
+soft #F1F5F9 stripe on alternate rows.
+
+TWO LAYOUTS, one preferred: {@link attach_vocab} grows the content page
+DOWNWARD by exactly what the rows measure and draws them as a bottom strip
+(balanced right-first columns under a hairline divider — no wasted space, no
+extra page); a page the strip cannot serve (rotated, too narrow, rows too
+tall) falls back to {@link draw_vocab_pages}, the classic full vocab page
+inserted right after it, where more than six entries flow into two columns
+and an overflowing page continues onto a second one.
 
 TEXT and FONTS are the shared page-fonts machinery (server/page_fonts.py):
 `PageFonts` subsets the regular + bold GoNotoKurrent faces once per document,
@@ -250,6 +255,195 @@ def draw_vocab_pages(doc: pymupdf.Document, at_index: int, rows: list[dict],
                          row_rect.x1 - _ROW_PAD_X, row_rect.y1 - _ROW_PAD_Y),
             html, css=fonts.css, archive=fonts.archive, scale_low=0)
         y = row_rect.y1 + _ROW_GAP
+
+    return added
+
+
+# ---------------------------------------------------------------------------
+# The bottom-strip variant: the same rows drawn INTO the content page itself.
+#
+# Instead of inserting a page after the content, the page's mediabox is
+# extended DOWNWARD by exactly the height the rows need and the words are
+# drawn in that new band. The extension lives at negative PDF y (the original
+# content keeps its coordinates untouched), which is also what makes the
+# pristine page recoverable: restoring the strip is nothing but adding the
+# recorded height back onto mediabox.y0 — no content ever moves.
+# ---------------------------------------------------------------------------
+
+# Strip geometry (points). Deliberately tighter than the page variant: the
+# strip borrows room from the slide, so it takes only what the rows measure.
+_STRIP_MARGIN_X = 40.0
+_STRIP_PAD_TOP = 8.0       # divider line → title
+_STRIP_PAD_BOTTOM = 10.0
+_STRIP_TITLE_GAP = 5.0
+_STRIP_COLUMN_GAP = 16.0
+_STRIP_MIN_COLUMN = 190.0  # a column narrower than this wraps every row
+_STRIP_MAX_COLUMNS = 4
+_DIVIDER_COLOR = (0xE2 / 255, 0xE8 / 255, 0xF0 / 255)  # #E2E8F0
+# A strip taller than this share of the page means the layout degenerated
+# (a tiny page, enormous notes); the caller falls back to an inserted page.
+_STRIP_MAX_SHARE = 0.9
+
+
+def _strip_columns(rows: list[dict], fonts: PageFonts,
+                   content_width: float) -> tuple[list[list[tuple[dict, float]]],
+                                                  float, float] | None:
+    """The balanced column plan: (columns of (row, height), column_width,
+    tallest column). None when the width cannot hold even one column."""
+    count = max(1, min(_STRIP_MAX_COLUMNS,
+                       int(content_width // _STRIP_MIN_COLUMN)))
+    count = min(count, len(rows))
+    column_width = (content_width - (count - 1) * _STRIP_COLUMN_GAP) / count
+    text_width = column_width - 2 * _ROW_PAD_X
+
+    if text_width <= 0:
+        return None
+
+    heights = [measure(_row_html(row), fonts, text_width) + 2 * _ROW_PAD_Y
+               for row in rows]
+    total = sum(heights) + len(rows) * _ROW_GAP
+    target = total / count
+    columns: list[list[tuple[dict, float]]] = [[]]
+    used = 0.0
+
+    for row, height in zip(rows, heights):
+        # Greedy sequential fill against the balanced target — keeps the
+        # reading order (right column first on an RTL page) while ending
+        # with roughly equal columns, which is what minimises the strip.
+        if used > 0 and used + height / 2 > target and len(columns) < count:
+            columns.append([])
+            used = 0.0
+
+        columns[-1].append((row, height))
+        used += height + _ROW_GAP
+
+    tallest = max(sum(h for _row, h in column) + (len(column) - 1) * _ROW_GAP
+                  for column in columns)
+
+    return columns, column_width, tallest
+
+
+def attach_vocab_strip(page: pymupdf.Page, rows: list[dict],
+                       fonts: PageFonts) -> float:
+    """`rows` drawn as a compact band appended BELOW `page`'s content;
+    returns the band's height in points, 0.0 when the page was left alone.
+
+    The page grows by exactly the measured band height (mediabox.y0 moves
+    down; the content's coordinates are untouched, so it stays pixel-identical
+    at the top). 0.0 — the deliberate skip — for a rotated page, a page too
+    narrow for one column, or a band that would dwarf the page itself
+    (>{@link _STRIP_MAX_SHARE} of its height); the caller may then fall back
+    to the inserted-page layout.
+    """
+    if not rows or page.rotation:
+        return 0.0
+
+    rect = page.rect
+    content_width = rect.width - 2 * _STRIP_MARGIN_X
+    plan = (_strip_columns(rows, fonts, content_width)
+            if content_width > 0 else None)
+
+    if plan is None:
+        logger.warning("vocab: page %sx%s too narrow for a strip; skipped",
+                       rect.width, rect.height)
+        return 0.0
+
+    columns, column_width, tallest = plan
+    title = _title_html()
+    title_height = measure(title, fonts, content_width)
+    strip_height = (_STRIP_PAD_TOP + title_height + _STRIP_TITLE_GAP
+                    + tallest + _STRIP_PAD_BOTTOM)
+
+    if strip_height > _STRIP_MAX_SHARE * rect.height:
+        logger.warning("vocab: strip (%.0fpt) would dwarf the %.0fpt page; "
+                       "skipped", strip_height, rect.height)
+        return 0.0
+
+    media = page.mediabox  # PDF space — y grows upward, so the bottom is y0
+    page.set_mediabox(pymupdf.Rect(media.x0, media.y0 - strip_height,
+                                   media.x1, media.y1))
+
+    top = rect.height  # page space — the old bottom edge, now the band's top
+    page.draw_line(pymupdf.Point(_STRIP_MARGIN_X, top),
+                   pymupdf.Point(rect.width - _STRIP_MARGIN_X, top),
+                   color=_DIVIDER_COLOR, width=0.75)
+    page.insert_htmlbox(
+        pymupdf.Rect(_STRIP_MARGIN_X, top + _STRIP_PAD_TOP,
+                     rect.width - _STRIP_MARGIN_X,
+                     top + _STRIP_PAD_TOP + title_height + 2),
+        title, css=fonts.css, archive=fonts.archive)
+
+    column_top = top + _STRIP_PAD_TOP + title_height + _STRIP_TITLE_GAP
+
+    for index, column in enumerate(columns):
+        # Right column first — the page is RTL.
+        x0 = (rect.width - _STRIP_MARGIN_X - column_width
+              - index * (column_width + _STRIP_COLUMN_GAP))
+        y = column_top
+
+        for stripe, (row, height) in enumerate(column):
+            row_rect = pymupdf.Rect(x0, y, x0 + column_width, y + height)
+
+            if stripe % 2 == 1:
+                page.draw_rect(row_rect, color=None, fill=_STRIPE_BG,
+                               radius=min(0.5, 3.0 / max(height, 1.0)))
+
+            page.insert_htmlbox(
+                pymupdf.Rect(row_rect.x0 + _ROW_PAD_X,
+                             row_rect.y0 + _ROW_PAD_Y,
+                             row_rect.x1 - _ROW_PAD_X,
+                             row_rect.y1 - _ROW_PAD_Y),
+                _row_html(row), css=fonts.css, archive=fonts.archive,
+                scale_low=0)
+            y = row_rect.y1 + _ROW_GAP
+
+    return strip_height
+
+
+def attach_vocab(doc: pymupdf.Document, vocab: object,
+                 anchors: dict[int, int]) -> dict[int, float]:
+    """Each page's vocab drawn as a bottom strip ON its anchor page; strip
+    heights (points) per content page number.
+
+    The strip-mode sibling of {@link interleave_vocab}: same `anchors`
+    contract, but nothing is inserted — page indices never shift. A page the
+    strip cannot serve (rotated, too narrow, rows too tall) falls back to the
+    classic inserted page right after it, reported as a negative page count
+    so the caller can tell the two apart (-N = N inserted pages, +h = a strip
+    h points tall).
+    """
+    pages = sanitize_vocab(vocab)
+    plan = [(anchors[number], number) for number in pages
+            if number in anchors and 0 <= anchors[number] < doc.page_count]
+
+    if not plan:
+        return {}
+
+    fonts = make_fonts({number: pages[number] for _anchor, number in plan})
+    added: dict[int, float] = {}
+
+    # Back-to-front: a fallback insertion must not shift the anchors still
+    # to be visited.
+    for anchor, number in sorted(plan, reverse=True):
+        height = attach_vocab_strip(doc[anchor], pages[number], fonts)
+
+        if height:
+            added[number] = height
+            continue
+
+        rect = doc[anchor].rect
+        count = draw_vocab_pages(doc, anchor + 1, pages[number],
+                                 (rect.width, rect.height), fonts)
+
+        if count:
+            added[number] = -float(count)
+
+    if added:
+        strips = sum(1 for value in added.values() if value > 0)
+        logger.info("vocab: %s strip(s), %s fallback page(s) for %s "
+                    "content page(s)", strips,
+                    sum(int(-value) for value in added.values() if value < 0),
+                    len(added))
 
     return added
 
