@@ -219,7 +219,8 @@ def test_a_tight_list_gets_every_gloss_and_the_page_grows():
 
     pdf, report = _render(builder)
 
-    assert report == {"pages": 1, "drawn": 5, "skipped": 0}
+    assert report == {"pages": 1, "drawn": 5, "skipped": 0,
+                      "raster_drawn": 0, "raster_skipped": 0}
     assert _page_size(pdf)[1] > PAGE[1]
     assert len(_gloss_lines(pdf)) == 5
 
@@ -324,7 +325,8 @@ def test_lines_whose_font_boxes_overlap_are_still_told_apart():
 
     pdf, report = _render(builder)
 
-    assert report == {"pages": 1, "drawn": 2, "skipped": 0}
+    assert report == {"pages": 1, "drawn": 2, "skipped": 0,
+                      "raster_drawn": 0, "raster_skipped": 0}
 
     latin = sorted((rect for rect, _text in _latin(pdf)), key=lambda r: r.y0)
     arabic = _gloss_lines(pdf)
@@ -378,7 +380,8 @@ def test_a_filled_panel_is_opened_up_rather_than_stepped_around():
 
     pdf, report = _render(builder)
 
-    assert report == {"pages": 1, "drawn": 4, "skipped": 0}
+    assert report == {"pages": 1, "drawn": 4, "skipped": 0,
+                      "raster_drawn": 0, "raster_skipped": 0}
 
     doc = pymupdf.open(stream=BytesIO(pdf), filetype="pdf")
 
@@ -533,3 +536,84 @@ def test_the_endpoint_uses_the_style_tuning_when_nothing_is_asked_for(client):
         heights[style] = max(rect.height for rect in _arabic(response.content))
 
     assert heights[STYLE] > heights[interlinear.COMPACT_STYLE]
+
+
+# --------------------------------------------------------------------------
+# raster glosses — a label inside an embedded image, on a page that is opened
+# --------------------------------------------------------------------------
+
+def test_a_raster_label_rides_its_image_down_the_opened_page():
+    """Opening the page cannot help a label inside a raster: it keeps its
+    plate, and the plate lands wherever the cuts moved the image to."""
+    builder = _Builder()
+    builder.text(100, 90, "Software change is inevitable", gloss=AR_ONE)
+
+    image = pymupdf.Rect(100, 300, 400, 540)
+    label = pymupdf.Rect(200, 400, 300, 412)
+
+    # The stand-in for a diagram: a flat light fill with a dark bar where the
+    # label sits, so the pixel judge has quiet air above it.
+    scale = 4
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(
+        0, 0, int(image.width * scale), int(image.height * scale)))
+    pix.set_rect(pix.irect, (205, 210, 215))
+    pix.set_rect(pymupdf.IRect(int((label.x0 - image.x0) * scale),
+                               int((label.y0 - image.y0) * scale),
+                               int((label.x1 - image.x0) * scale),
+                               int((label.y1 - image.y0) * scale)),
+                 (40, 40, 60))
+    builder.page.insert_image(image, pixmap=pix)
+
+    height = PAGE[1]
+    sidecar = builder.sidecar()
+    sidecar["pages"][0]["blocks"].append({
+        "box": [label.x0, height - label.y1, label.x1, height - label.y0],
+        "lines": [[label.x0, height - label.y1, label.x1, height - label.y0]],
+        "source": "label",
+        "target": AR_TWO,
+        "font_size": 10.0,
+        "label": "plain text",
+        "on_raster": True,
+        "region": [image.x0, height - image.y1, image.x1, height - image.y0],
+    })
+
+    pdf, report = interlinear.render_overlay(builder.pdf(), sidecar,
+                                             style=STYLE)
+
+    assert report["drawn"] == 1 and report["skipped"] == 0
+    assert report["raster_drawn"] == 1 and report["raster_skipped"] == 0
+
+    doc = pymupdf.open(stream=BytesIO(pdf), filetype="pdf")
+
+    try:
+        growth = doc[0].rect.height - height
+        placed = [pymupdf.Rect(info["bbox"]) for info in doc[0].get_image_info()]
+        plates = [pymupdf.Rect(drawing["rect"])
+                  for drawing in doc[0].get_drawings()
+                  if drawing.get("fill") is not None
+                  and (drawing.get("fill_opacity") or 1.0) < 1.0]
+    finally:
+        doc.close()
+
+    # The band opened above the glossed line is what moved the image.
+    assert growth > 0
+
+    moved = image + (0, growth, 0, growth)
+    moved_label = label + (0, growth, 0, growth)
+
+    # The image really is at its shifted place on the taller page...
+    assert any(abs(rect.y0 - moved.y0) < 1.0 and abs(rect.y1 - moved.y1) < 1.0
+               for rect in placed)
+
+    # ...and the plate and its gloss sit inside it, clear of the label bar.
+    assert plates, "no plate was drawn"
+
+    for plate in plates:
+        assert moved.contains(plate)
+        assert plate.y1 <= moved_label.y0 or plate.y0 >= moved_label.y1
+
+    inside = [rect for rect in _arabic(pdf) if moved.contains(rect)]
+    assert inside, "no Arabic was drawn inside the moved image"
+
+    for rect in inside:
+        assert any(plate.contains(rect) for plate in plates)
