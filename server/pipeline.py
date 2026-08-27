@@ -253,8 +253,10 @@ def _write_sidecar(sidecar_path: Path, data: dict) -> None:
 
 def _insert_vocab(output_pdf: Path, sidecar_path: Path) -> None:
     """The «كلمات هذه الصفحة» step: pick each page's new English words, record
-    them in the sidecar, interleave the compact vocab pages into the result —
-    page N's words IMMEDIATELY after page N, never deferred to the end.
+    them in the sidecar, and draw each page's words as a compact strip at the
+    BOTTOM of that page (the page grows by exactly the strip's height) — never
+    deferred to the end. A page the strip cannot serve falls back to the
+    classic inserted vocab page right after it.
 
     A sidecar may carry a deep-terms list under its "glossary" key (nothing on
     this branch writes one, but a sidecar that has it is honoured); those
@@ -263,10 +265,12 @@ def _insert_vocab(output_pdf: Path, sidecar_path: Path) -> None:
     pages are inserted, staying at the very end.
 
     The baked layout is recorded in the sidecar as
-    `"artifact_layout": {"content_pages": [...]}` — where each translated
-    content page ended up in the mono file — which is what lets /v1/compose
-    later take the content pages back out EXACTLY instead of tail-trimming.
-    Written only when pages were really inserted: an untouched mono is still
+    `"artifact_layout": {"content_pages": [...], "vocab_strips": {...}}` —
+    where each translated content page ended up in the mono file, plus each
+    stripped page's strip height in points — which is what lets /v1/compose
+    later recover the pristine content pages EXACTLY (drop any inserted
+    fallback pages, crop the strips back off) instead of tail-trimming.
+    Written only when the file was really changed: an untouched mono is still
     described perfectly by `total_pages`.
 
     Best-effort at every seam: the paid translation is already on disk and
@@ -311,7 +315,7 @@ def _insert_vocab(output_pdf: Path, sidecar_path: Path) -> None:
         doc = pymupdf.open(str(output_pdf))
         try:
             content = min(content, doc.page_count) or doc.page_count
-            added = vocab_pages.interleave_vocab(
+            added = vocab_pages.attach_vocab(
                 doc, entries, {number: number for number in range(content)})
             if not added:
                 return
@@ -324,16 +328,24 @@ def _insert_vocab(output_pdf: Path, sidecar_path: Path) -> None:
             doc.close()
         tmp.replace(output_pdf)
     except Exception:  # noqa: BLE001 - the vocab layer must never lose the run
-        logger.exception("vocab: inserting pages failed; the result ships "
+        logger.exception("vocab: attaching strips failed; the result ships "
                          "without them")
         return
 
-    # Only now — the mono on disk really carries the interleaved layout.
-    positions, shift = [], 0
+    # Only now — the mono on disk really carries the baked layout. A strip is
+    # reported as its height (+h points), a fallback insertion as -n pages.
+    positions, strips, shift = [], {}, 0
     for number in range(content):
         positions.append(number + shift)
-        shift += added.get(number, 0)
-    sidecar_data["artifact_layout"] = {"content_pages": positions}
+        value = added.get(number, 0)
+        if value < 0:
+            shift += int(-value)
+        elif value:
+            strips[str(number)] = round(value, 2)
+    layout: dict = {"content_pages": positions}
+    if strips:
+        layout["vocab_strips"] = strips
+    sidecar_data["artifact_layout"] = layout
     _write_sidecar(sidecar_path, sidecar_data)
 
 

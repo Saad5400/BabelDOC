@@ -221,6 +221,104 @@ def test_a_page_too_small_for_the_layout_is_skipped_not_raised():
 
 
 # --------------------------------------------------------------------------
+# attach_vocab: the bottom-strip layout (the production path)
+# --------------------------------------------------------------------------
+
+def test_a_strip_grows_the_page_and_keeps_its_content():
+    doc = _doc(pages=2)
+    base = doc[0].rect.height
+
+    added = vocab_pages.attach_vocab(doc, {"0": _rows(4)}, {0: 0})
+
+    assert set(added) == {0}
+    assert added[0] > 0  # a strip, not a fallback insertion
+    assert doc.page_count == 2  # nothing was inserted
+    assert doc[0].rect.height == pytest.approx(base + added[0])
+    assert doc[1].rect.height == base  # the stripless neighbour is untouched
+    text = _text(doc, 0)
+    assert "Slide a" in text  # the content survived, on the same page
+    assert "worda" in text
+    assert "معنى" in text
+    doc.close()
+
+
+def test_the_strip_sits_entirely_below_the_original_content():
+    doc = _doc(pages=1)
+    base = doc[0].rect.height
+
+    vocab_pages.attach_vocab(doc, {"0": _rows(6)}, {0: 0})
+
+    drawn = [word for word in doc[0].get_text("words")
+             if word[4].startswith("word") or "معنى" in word[4]]
+    assert drawn
+    assert all(word[1] > base for word in drawn)  # every row is in the band
+    doc.close()
+
+
+def test_a_wide_page_flows_the_strip_into_several_columns():
+    doc = _doc(pages=1, size=WIDESCREEN)
+
+    added = vocab_pages.attach_vocab(doc, {"0": _rows(9)}, {0: 0})
+
+    assert added[0] > 0
+    xs = [word[0] for word in doc[0].get_text("words")
+          if word[4].startswith("word")]
+    middle = WIDESCREEN[0] / 2
+    # Rows landed in BOTH halves of the band (the RTL right column first).
+    assert any(x > middle for x in xs)
+    assert any(x < middle for x in xs)
+    doc.close()
+
+
+def test_a_rotated_page_falls_back_to_an_inserted_page():
+    doc = _doc(pages=1)
+    doc[0].set_rotation(90)
+
+    added = vocab_pages.attach_vocab(doc, {"0": _rows(3)}, {0: 0})
+
+    assert added == {0: -1.0}  # -N = N fallback pages
+    assert doc.page_count == 2
+    assert "worda" in _text(doc, 1)
+    doc.close()
+
+
+def test_rows_that_would_dwarf_the_page_fall_back_too():
+    doc = _doc(pages=1, size=(300.0, 160.0))
+
+    added = vocab_pages.attach_vocab(doc, {"0": _rows(12)}, {0: 0})
+
+    assert added[0] < 0  # inserted pages, not a strip taller than the slide
+    assert doc.page_count == 1 + int(-added[0])
+    assert doc[0].rect.height == 160.0  # the content page was left alone
+    doc.close()
+
+
+def test_attach_junk_vocab_touches_nothing():
+    doc = _doc(pages=1)
+    before = doc[0].rect.height
+
+    assert vocab_pages.attach_vocab(doc, {"0": ["junk", 7]}, {0: 0}) == {}
+    assert vocab_pages.attach_vocab(doc, "not a dict", {0: 0}) == {}
+    assert doc.page_count == 1
+    assert doc[0].rect.height == before
+    doc.close()
+
+
+def test_the_strip_lives_at_negative_pdf_y():
+    # The compose restore contract: the strip occupies exactly
+    # [mediabox.y0, y0 + height) below the original zero line, so cropping
+    # the recorded height back off recovers the pristine page.
+    doc = _doc(pages=1)
+
+    added = vocab_pages.attach_vocab(doc, {"0": _rows(3)}, {0: 0})
+
+    media = doc[0].mediabox
+    assert media.y0 == pytest.approx(-added[0])
+    assert media.y1 == PAGE[1]
+    doc.close()
+
+
+# --------------------------------------------------------------------------
 # interleave_vocab: same-named conflicting subsets in the target
 # --------------------------------------------------------------------------
 
@@ -273,6 +371,44 @@ def test_vocab_arabic_survives_a_conflicting_embedded_subset():
     target = _conflicting_target()
     assert vocab_pages.interleave_vocab(target, {"0": rows}, {0: 0})
     got = _saved_page_pixmap(target, 1)
+    target.close()
+
+    assert (got.width, got.height) == (want.width, want.height)
+    mismatch = sum(a != b for a, b in zip(got.samples, want.samples,
+                                          strict=True))
+    assert mismatch / len(want.samples) < 0.005
+
+
+def _saved_band_pixmap(doc, index, band):
+    """The band rect of page `index`, rendered from the SAVED file."""
+    data = doc.tobytes(garbage=4, deflate=True)
+    saved = pymupdf.open(stream=data, filetype="pdf")
+    try:
+        return saved[index].get_pixmap(dpi=96, clip=band)
+    finally:
+        saved.close()
+
+
+def test_strip_arabic_survives_a_conflicting_embedded_subset():
+    # The strip draws DIRECTLY onto a page that already embeds its own
+    # same-named GoNotoKurrent subsets (every babeldoc mono does). Pin that
+    # the band renders pixel-identical to the same band drawn on a blank
+    # page — pixels, not extracted text, for the same ToUnicode reason as
+    # the page-variant test above.
+    rows = _rows(5)
+
+    reference = pymupdf.open()
+    reference.new_page(width=PAGE[0], height=PAGE[1])
+    added = vocab_pages.attach_vocab(reference, {"0": rows}, {0: 0})
+    assert added and added[0] > 0
+    band = pymupdf.Rect(0, PAGE[1], PAGE[0], PAGE[1] + added[0])
+    want = _saved_band_pixmap(reference, 0, band)
+    reference.close()
+
+    target = _conflicting_target()
+    got_added = vocab_pages.attach_vocab(target, {"0": rows}, {0: 0})
+    assert got_added[0] == pytest.approx(added[0])
+    got = _saved_band_pixmap(target, 0, band)
     target.close()
 
     assert (got.width, got.height) == (want.width, want.height)

@@ -174,7 +174,7 @@ def test_missing_token_is_401(client, original_pdf, translated_pdf):
 
 
 # --------------------------------------------------------------------------
-# The optional sidecar part: «كلمات هذه الصفحة» pages interleaved into the dual
+# The optional sidecar part: «كلمات هذه الصفحة» strips drawn onto the dual
 # --------------------------------------------------------------------------
 
 VOCAB = {"0": [{"w": "declared", "ar": "يُصرَّح عنه"}],
@@ -220,31 +220,38 @@ def _page_text(response, index):
         doc.close()
 
 
-def test_alternating_puts_each_vocab_page_after_its_pair(client):
+def test_alternating_strips_each_pairs_translated_page(client):
     original, translated = _pdf([LETTER] * 2), _pdf([A4] * 2)
     resp = _post_with_sidecar(client, original, translated, "alternating",
                               _sidecar_json(2, vocab=VOCAB))
     assert resp.status_code == 200
     pages = _pages(resp)
-    # o0 t0 v0 o1 t1 v1
-    assert len(pages) == 6
-    assert [_size(p) for p in pages] == [LETTER, A4, A4, LETTER, A4, A4]
-    assert "declared" in _page_text(resp, 2)
-    assert "evolved" in _page_text(resp, 5)
+    # o0 t0+strip o1 t1+strip — nothing inserted, the translated pages grew.
+    assert len(pages) == 4
+    sizes = [_size(p) for p in pages]
+    assert sizes[0] == LETTER
+    assert sizes[2] == LETTER
+    for index in (1, 3):
+        assert sizes[index][0] == A4[0]
+        assert sizes[index][1] > A4[1]
+    assert "declared" in _page_text(resp, 1)
+    assert "evolved" in _page_text(resp, 3)
 
 
-def test_side_by_side_puts_each_vocab_page_after_its_wide_page(client):
+def test_side_by_side_strips_each_wide_page(client):
     original, translated = _pdf([LETTER] * 2), _pdf([A4] * 2)
     resp = _post_with_sidecar(client, original, translated, "side_by_side",
                               _sidecar_json(2, vocab=VOCAB))
     assert resp.status_code == 200
     pages = _pages(resp)
-    # wide0 v0 wide1 v1 — the vocab page is sized like the wide page before it.
-    assert len(pages) == 4
+    # wide0+strip wide1+strip — the strip spans the whole wide page's width.
+    assert len(pages) == 2
     wide = (2 * max(LETTER[0], A4[0]), max(LETTER[1], A4[1]))
-    assert [_size(p) for p in pages] == [wide] * 4
-    assert "declared" in _page_text(resp, 1)
-    assert "evolved" in _page_text(resp, 3)
+    for size in [_size(p) for p in pages]:
+        assert size[0] == wide[0]
+        assert size[1] > wide[1]
+    assert "declared" in _page_text(resp, 0)
+    assert "evolved" in _page_text(resp, 1)
 
 
 def test_a_sidecar_without_vocab_changes_nothing(client, original_pdf,
@@ -264,7 +271,7 @@ def test_an_empty_vocab_inserts_nothing(client, original_pdf, translated_pdf):
 
 
 def test_artifact_layout_takes_the_content_pages_back_out_exactly(client):
-    # A baked mono as the pipeline now writes it: content page 0, its vocab
+    # A legacy baked mono (inserted vocab pages): content page 0, its vocab
     # page (odd size marks it), content page 1, plus a baked appendix tail
     # (another odd size). The sidecar records where the content pages sit;
     # the dual must rebuild from JUST those and render the vocab fresh.
@@ -279,10 +286,47 @@ def test_artifact_layout_takes_the_content_pages_back_out_exactly(client):
     sizes = [_size(p) for p in pages]
     assert (400.0, 400.0) not in sizes  # the baked vocab page was dropped
     assert (500.0, 500.0) not in sizes  # the baked appendix tail was dropped
-    assert len(pages) == 6
-    assert sizes == [LETTER, A4, A4, LETTER, A4, A4]
-    assert "declared" in _page_text(resp, 2)  # rendered fresh, right place
-    assert "evolved" in _page_text(resp, 5)
+    # o0 t0+strip o1 t1+strip — the vocab rendered fresh, as strips.
+    assert len(pages) == 4
+    assert sizes[0] == sizes[2] == LETTER
+    assert sizes[1][1] > A4[1]
+    assert "declared" in _page_text(resp, 1)
+    assert "evolved" in _page_text(resp, 3)
+
+
+def test_baked_strips_are_cropped_back_off_before_composing(client):
+    # A strip-baked mono as the pipeline writes it now: each content page's
+    # mediabox reaches below zero by the recorded height, with the baked
+    # strip text living in that band. The dual must recover the pristine
+    # pages (no doubled words from the baked band) and draw fresh strips.
+    import pymupdf
+
+    doc = pymupdf.open()
+    for index in range(2):
+        page = doc.new_page(width=A4[0], height=A4[1])
+        page.insert_text((72, 72), f"CONTENT{index}", fontsize=24)
+        media = page.mediabox
+        page.set_mediabox(pymupdf.Rect(media.x0, media.y0 - 100.0,
+                                       media.x1, media.y1))
+        page.insert_text((72, A4[1] + 50), f"BAKEDSTRIP{index}", fontsize=18)
+    translated = doc.tobytes()
+    doc.close()
+
+    original = _pdf([LETTER] * 2)
+    resp = _post_with_sidecar(
+        client, original, translated, "alternating",
+        _sidecar_json(2, vocab=VOCAB,
+                      artifact_layout={"content_pages": [0, 1],
+                                       "vocab_strips": {"0": 100.0,
+                                                        "1": 100.0}}))
+    assert resp.status_code == 200
+    pages = _pages(resp)
+    assert len(pages) == 4
+    text = " ".join(_page_text(resp, i) for i in range(4))
+    assert "CONTENT0" in text and "CONTENT1" in text
+    assert "BAKEDSTRIP" not in text  # the baked band is gone
+    assert "declared" in _page_text(resp, 1)  # the fresh strip replaced it
+    assert "evolved" in _page_text(resp, 3)
 
 
 def test_a_pre_feature_sidecar_still_tail_trims_by_total_pages(client):
@@ -322,7 +366,9 @@ def test_the_vocab_kill_switch_disables_the_insert(client, monkeypatch):
     resp = _post_with_sidecar(client, original, translated, "alternating",
                               _sidecar_json(2, vocab=VOCAB))
     assert resp.status_code == 200
-    assert len(_pages(resp)) == 4  # pairs only, no vocab pages
+    pages = _pages(resp)
+    assert len(pages) == 4  # pairs only
+    assert [_size(p) for p in pages] == [LETTER, A4] * 2  # and no strips
 
 
 def test_vocab_for_a_page_neither_side_has_is_skipped(client):
@@ -346,7 +392,7 @@ def test_an_unknown_sidecar_key_is_tolerated(client):
     resp = _post_with_sidecar(client, original, translated, "alternating",
                               json.dumps(sidecar))
     assert resp.status_code == 200
-    assert len(_pages(resp)) == 6  # o0 t0 v0 o1 t1 v1 — nothing more
+    assert len(_pages(resp)) == 4  # o0 t0+strip o1 t1+strip — nothing more
 
 
 def test_a_malformed_sidecar_is_422(client, original_pdf, translated_pdf):

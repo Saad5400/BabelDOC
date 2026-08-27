@@ -18,12 +18,15 @@ Conventions:
 
 SIDECAR: a caller may also send the run's sidecar. When it carries the
 "vocab" entries server/vocab.py selected, each content page's «كلمات هذه
-الصفحة» page is rendered fresh and inserted right after that page's unit in
-the dual — and the translated input's own baked-in extra pages are taken
-back out first: exactly, via the sidecar's "artifact_layout" when the mono
-was interleaved, else by trimming everything past the page count the sidecar
-records. Without a sidecar the tail-append rule above keeps an
-appendix-tailed mono usable as-is.
+الصفحة» strip is rendered fresh at the bottom of that page's unit in the
+dual — and the translated input's own baked-in vocab is taken back out
+first: exactly, via the sidecar's "artifact_layout" (drop any inserted
+fallback pages by "content_pages", crop the baked bottom strips back off by
+"vocab_strips" — a strip lives entirely at negative PDF y, so restoring the
+recorded height onto mediabox.y0 recovers the pristine page bit-for-bit),
+else by trimming everything past the page count the sidecar records. Without
+a sidecar the tail-append rule above keeps an appendix-tailed mono usable
+as-is.
 """
 
 import logging
@@ -169,6 +172,91 @@ def _artifact_content_positions(sidecar, page_count: int) -> list[int] | None:
     return kept or None
 
 
+def _artifact_strip_heights(sidecar) -> dict[int, float]:
+    """The baked mono's per-content-page vocab strip heights, distrusted.
+
+    `"artifact_layout": {"vocab_strips": {"i": h}}` records that content page
+    i (an index into content_pages order) carries an h-points bottom strip
+    (server/vocab_pages.attach_vocab). Junk keys and junk heights are dropped
+    item by item — a bad entry loses only its own page's restore.
+    """
+    if not isinstance(sidecar, dict):
+        return {}
+
+    layout = sidecar.get("artifact_layout")
+    strips = layout.get("vocab_strips") if isinstance(layout, dict) else None
+
+    if not isinstance(strips, dict):
+        return {}
+
+    out: dict[int, float] = {}
+
+    for key, value in strips.items():
+        try:
+            index, height = int(key), float(value)
+        except (TypeError, ValueError):
+            continue
+
+        if index >= 0 and 0 < height <= 14400:  # NaN fails both comparisons
+            out[index] = height
+
+    return out
+
+
+def _crop_baked_strips(translated_bytes: bytes, positions: list[int],
+                       strips: dict[int, float]) -> bytes:
+    """The translated input with its baked bottom strips PHYSICALLY removed.
+
+    Shrinking the mediabox alone would only hide the band: its bytes would
+    still ride along and re-surface the moment the fresh strip re-extends the
+    page (or a side-by-side merge re-centers the content). So the band is
+    redacted out — text, drawings, the divider, everything strictly below the
+    content's old bottom edge — and only then is the box restored. A height
+    that would consume the whole page is refused (a lying sidecar must not
+    blank the content); a page the layout doesn't cover is left alone.
+    """
+    import pymupdf
+
+    doc = pymupdf.open(stream=BytesIO(translated_bytes), filetype="pdf")
+
+    try:
+        changed = False
+
+        for content_index in sorted(strips):
+            height = strips[content_index]
+
+            if content_index >= len(positions):
+                continue
+
+            page = doc[positions[content_index]]
+            rect = page.rect
+
+            if height >= rect.height or page.rotation:
+                continue
+
+            # 0.25pt below the old bottom edge: the divider (stroked ON the
+            # edge) intersects and goes; content that merely ENDS at the
+            # edge does not intersect and stays.
+            page.add_redact_annot(
+                pymupdf.Rect(-2, rect.height - height + 0.25,
+                             rect.width + 2, rect.height + 2))
+            page.apply_redactions()
+            media = page.mediabox
+            page.set_mediabox(pymupdf.Rect(media.x0, media.y0 + height,
+                                           media.x1, media.y1))
+            changed = True
+
+        if not changed:
+            return translated_bytes
+
+        out = BytesIO()
+        doc.save(out, garbage=3, deflate=True)
+
+        return out.getvalue()
+    finally:
+        doc.close()
+
+
 def _content_page_count(sidecar: dict) -> int | None:
     """How many pages the TRANSLATION itself has, per the sidecar's records.
 
@@ -188,14 +276,15 @@ def _content_page_count(sidecar: dict) -> int | None:
 
 def _insert_vocab_pages(composed: bytes, sidecar: dict, fmt: str,
                         original_count: int, content_count: int) -> bytes:
-    """`composed` with each page's vocab page after its pair — or unchanged.
+    """`composed` with each page's vocab strip on its unit — or unchanged.
 
-    Content page N's vocab follows page N's whole unit in the dual: the
-    (original, translated) pair for `alternating`, the wide page for
-    `side_by_side`. A content page past the original (the translated-longer
-    tail) sits whole at the end, and its vocab page follows it there.
-    Best-effort on purpose: the dual the caller paid nothing for must not 422
-    over its vocab layer.
+    Content page N's strip sits at the bottom of page N's unit in the dual:
+    the translated page of the (original, translated) pair for `alternating`,
+    the wide page for `side_by_side` (spanning both halves). A content page
+    past the original (the translated-longer tail) sits whole at the end and
+    carries its strip there. A unit the strip cannot serve falls back to the
+    classic inserted vocab page right after it. Best-effort on purpose: the
+    dual the caller paid nothing for must not 422 over its vocab layer.
     """
     vocab = sidecar.get("vocab")
 
@@ -230,7 +319,7 @@ def _insert_vocab_pages(composed: bytes, sidecar: dict, fmt: str,
     doc = pymupdf.open(stream=BytesIO(composed), filetype="pdf")
 
     try:
-        if not vocab_pages.interleave_vocab(doc, vocab, anchors):
+        if not vocab_pages.attach_vocab(doc, vocab, anchors):
             return composed
 
         out = BytesIO()
@@ -254,12 +343,28 @@ def compose_dual(original_bytes: bytes, translated_bytes: bytes,
     original = _read(original_bytes, "original")
     translated = _read(translated_bytes, "translated")
 
+    positions = _artifact_content_positions(sidecar, len(translated.pages))
+    strips = _artifact_strip_heights(sidecar) if positions is not None else {}
+    vocab_ok = True
+
+    if strips:
+        try:
+            translated = _read(
+                _crop_baked_strips(translated_bytes, positions, strips),
+                "translated")
+        except Exception:  # noqa: BLE001 - best-effort, never 422 over vocab
+            # The baked strips stay on the pages then — still correct
+            # content. The fresh vocab layer is skipped so nothing doubles.
+            logger.exception("compose: cropping baked strips failed; "
+                             "keeping the baked layout")
+            vocab_ok = False
+
     translated_pages = list(translated.pages)
-    positions = _artifact_content_positions(sidecar, len(translated_pages))
 
     if positions is not None:
-        # The baked mono's own interleaved vocab pages (and any appendix
-        # tail) are dropped here; the vocab is rendered fresh below, at the
+        # The baked mono's own vocab is undone here — inserted fallback pages
+        # (and any appendix tail) dropped, baked bottom strips already
+        # cropped back off above; the vocab is rendered fresh below, at the
         # composed layout.
         translated_pages = [translated_pages[i] for i in positions]
     elif isinstance(sidecar, dict):
@@ -274,8 +379,8 @@ def compose_dual(original_bytes: bytes, translated_bytes: bytes,
     build(original, translated_pages).write(out)
     composed = out.getvalue()
 
-    # The vocab pages live in the body, right after each pair. Best-effort.
-    if config.VOCAB_PAGES and isinstance(sidecar, dict):
+    # The vocab strips live in the body, on each pair's unit. Best-effort.
+    if config.VOCAB_PAGES and vocab_ok and isinstance(sidecar, dict):
         try:
             composed = _insert_vocab_pages(composed, sidecar, fmt,
                                            len(original.pages),
