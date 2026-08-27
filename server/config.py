@@ -32,6 +32,7 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 GLOSSARY_PATH = SERVER_DIR / "glossary_ar_cs.csv"
 OCR_PREP_SCRIPT = SERVER_DIR / "ocr_prep.py"
+IMAGE_PREP_SCRIPT = SERVER_DIR / "image_prep.py"
 FIX_LAYER_ORDER_SCRIPT = SERVER_DIR / "fix_layer_order.py"
 
 VALID_FORMATS = ("translated", "alternating", "side_by_side")

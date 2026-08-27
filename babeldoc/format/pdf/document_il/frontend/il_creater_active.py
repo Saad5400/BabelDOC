@@ -1392,6 +1392,12 @@ class ActiveILCreater:
             render_order=char.render_order,
             sub_render_order=0,
         )
+        # Image-text lane: keep the text render mode so downstream passes can
+        # recognise injected invisible (Tr 3) OCR runs over raster images.
+        # Only non-default modes are recorded; the field stays None otherwise.
+        char_render_mode = getattr(char, "render_mode", 0)
+        if char_render_mode:
+            pdf_char.render_mode = char_render_mode
         if self.translation_config.ocr_workaround:
             pdf_char.pdf_style.graphic_state = BLACK
             pdf_char.render_order = None

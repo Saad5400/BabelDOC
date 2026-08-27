@@ -578,6 +578,15 @@ class PdfRectangle:
             "type": "Attribute",
         },
     )
+    raster_region: list[float] = field(
+        default_factory=list,
+        metadata={
+            "name": "rasterRegion",
+            "type": "Attribute",
+            "length": 4,
+            "tokens": True,
+        },
+    )
 
 
 @dataclass(slots=True)
@@ -711,6 +720,13 @@ class PdfCharacter:
         default=None,
         metadata={
             "name": "subRenderOrder",
+            "type": "Attribute",
+        },
+    )
+    render_mode: int | None = field(
+        default=None,
+        metadata={
+            "name": "renderMode",
             "type": "Attribute",
         },
     )
@@ -1237,6 +1253,15 @@ class PdfParagraph:
         metadata={
             "name": "renderOrder",
             "type": "Attribute",
+        },
+    )
+    raster_region: list[float] = field(
+        default_factory=list,
+        metadata={
+            "name": "rasterRegion",
+            "type": "Attribute",
+            "length": 4,
+            "tokens": True,
         },
     )
 

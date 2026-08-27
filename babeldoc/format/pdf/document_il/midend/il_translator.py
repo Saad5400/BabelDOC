@@ -117,6 +117,27 @@ def _fix_arabic_operator_spacing(text: str) -> str:
     return _ARABIC_OP_CANDIDATE_RE.sub(repl, text)
 
 
+# A parenthetical whose content is pure Latin: the terminology rule's
+# «مصطلح (English)» gloss. Wanted in running text, ruinous on a diagram
+# label — the label box is the drawn shape it sits in, and the suffix can
+# triple its width.
+_LATIN_GLOSS_RE = re.compile(r"\s*[(（]\s*[A-Za-z][A-Za-z0-9 .&/'’-]*\s*[)）]")
+
+
+def strip_latin_gloss_parentheticals(text: str) -> str:
+    """«التغليف (Encapsulation)» -> «التغليف», for image-text labels only.
+
+    The English original is not lost to the reader: it is right there in the
+    side-by-side and interlinear layouts, and on the raster itself everywhere
+    else. Stripping is refused when it would leave no Arabic (a label the
+    model legitimately kept Latin must survive whole).
+    """
+    stripped = re.sub(r"\s{2,}", " ", _LATIN_GLOSS_RE.sub("", text)).strip()
+    if stripped and any(_is_arabic_char(ch) for ch in stripped):
+        return stripped
+    return text
+
+
 def postprocess_arabic_translation(source_text: str, translated_text: str) -> str:
     """Deterministic safety net for Arabic output quality.
 
@@ -1105,6 +1126,8 @@ class ILTranslator:
                 translate_input if isinstance(translate_input, str) else "",
                 translated_text,
             )
+        if getattr(paragraph, "raster_region", None):
+            translated_text = strip_latin_gloss_parentheticals(translated_text)
         tracker.set_output(translated_text)
         if translated_text == translate_input:
             if llm_translate_tracker := tracker.last_llm_translate_tracker():

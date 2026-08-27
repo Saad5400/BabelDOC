@@ -11,6 +11,7 @@ without paying for the translation twice.
 """
 
 import asyncio
+import json
 import logging
 import shutil
 import subprocess
@@ -90,7 +91,8 @@ def _run_cmd(argv: list[str], job_id: str, stage: str) -> None:
 
 def _run_babeldoc(job_id: str, input_pdf: Path, out_dir: Path, *, lang_in: str,
                   lang_out: str, fmt: str, scanned: bool, progress_base: float,
-                  sidecar_path: Path | None = None):
+                  sidecar_path: Path | None = None,
+                  image_text_regions: Path | None = None):
     """Run the fork through its Python API; returns (TranslateResult, translator)."""
     from babeldoc.format.pdf.high_level import async_translate
     from babeldoc.format.pdf.translation_config import (
@@ -139,6 +141,7 @@ def _run_babeldoc(job_id: str, input_pdf: Path, out_dir: Path, *, lang_in: str,
         glossaries=glossaries,
         auto_extract_glossary=False,
         translation_sidecar_path=sidecar_path,
+        image_text_regions=image_text_regions,
     )
 
     span = _P_BABELDOC_END - progress_base
@@ -261,6 +264,26 @@ def run_job(job_id: str) -> None:
     _set_progress(job_id, _P_DETECT, "scanned" if scanned else "digital")
 
     babeldoc_input = input_pdf
+    image_text_regions: Path | None = None
+    if not scanned:
+        # Text inside embedded raster images (diagram labels, figure scans on
+        # otherwise-digital slides): OCR it into invisible runs so babeldoc
+        # translates it in place. Best-effort — a deck whose diagrams cannot
+        # be prepped still deserves its text-layer translation, so a prep
+        # failure degrades to the old behaviour instead of failing the job.
+        prep_pdf = work / "image_prep.pdf"
+        regions_json = work / "image_regions.json"
+        _set_progress(job_id, _P_DETECT, "image_prep")
+        try:
+            _run_cmd([sys.executable, str(config.IMAGE_PREP_SCRIPT),
+                      str(input_pdf), str(prep_pdf), str(regions_json)],
+                     job_id, "image_prep")
+            regions = json.loads(regions_json.read_text())
+            if regions.get("pages"):
+                babeldoc_input = prep_pdf
+                image_text_regions = regions_json
+        except Exception:  # noqa: BLE001 - degrade, loudly, to text-only
+            logger.exception("image_prep failed; translating without image text")
     if scanned:
         ocr_pdf = work / "ocr.pdf"
         prep_pdf = work / "prep.pdf"
@@ -287,7 +310,7 @@ def run_job(job_id: str) -> None:
     result, translator = _run_babeldoc(
         job_id, babeldoc_input, out_dir, lang_in=lang_in, lang_out=lang_out,
         fmt=fmt, scanned=scanned, progress_base=progress_base,
-        sidecar_path=sidecar)
+        sidecar_path=sidecar, image_text_regions=image_text_regions)
 
     _set_progress(job_id, _P_BABELDOC_END, "finalizing")
     if fmt == "translated":

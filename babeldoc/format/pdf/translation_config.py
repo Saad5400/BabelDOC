@@ -1,4 +1,5 @@
 import enum
+import json
 import logging
 import shutil
 import tempfile
@@ -224,6 +225,13 @@ class TranslationConfig:
         # parts would overwrite one file with part-local page numbers.
         # See document_il/midend/translation_sidecar.py.
         translation_sidecar_path: str | Path | None = None,
+        # Image-text lane (fork): regions of embedded raster images on
+        # DIGITAL pages that carry injected invisible OCR runs (see
+        # server/image_prep.py). A path to a regions.json file, or the
+        # parsed dict: {"version": 1, "pages": {"<0-based page>": [
+        # {"image_bbox": [x0, y0, x1, y1]}, ...]}} in PDF user space
+        # (y-up, unrotated). None (default) leaves every code path inert.
+        image_text_regions: str | Path | dict | None = None,
     ):
         self.translator = translator
         self.term_extraction_translator = term_extraction_translator or translator
@@ -232,6 +240,14 @@ class TranslationConfig:
         self.translation_sidecar_path = (
             Path(translation_sidecar_path) if translation_sidecar_path else None
         )
+        self.image_text_regions = self._parse_image_text_regions(
+            image_text_regions
+        )
+        # Declaring image-text regions asserts the document IS digital (the
+        # prep step only runs on digital decks): a slice of whole-figure
+        # pages would otherwise trip the scanned-page detector.
+        if self.image_text_regions:
+            skip_scanned_detection = True
         self.input_file = input_file
         self.lang_in = lang_in
         self.lang_out = lang_out
@@ -389,6 +405,51 @@ class TranslationConfig:
 
         if self.ocr_workaround:
             self.remove_non_formula_lines = False
+
+    @staticmethod
+    def _parse_image_text_regions(
+        regions: str | Path | dict | None,
+    ) -> dict[int, list[tuple[float, float, float, float]]] | None:
+        """Normalise the image-text regions declaration (see __init__).
+
+        Returns {0-based page index: [(x0, y0, x1, y1), ...]} or None when the
+        feature is off. Rejects unknown versions loudly rather than translating
+        against coordinates it might misread.
+        """
+        if regions is None:
+            return None
+        if not isinstance(regions, dict):
+            with Path(regions).open(encoding="utf-8") as f:
+                regions = json.load(f)
+        version = regions.get("version")
+        if version != 1:
+            raise ValueError(
+                f"Unsupported image_text_regions version: {version!r}"
+            )
+        parsed: dict[int, list[tuple[float, float, float, float]]] = {}
+        for page_key, page_regions in (regions.get("pages") or {}).items():
+            boxes = []
+            for region in page_regions or []:
+                bbox = region.get("image_bbox")
+                if not bbox or len(bbox) != 4:
+                    raise ValueError(
+                        f"image_text_regions page {page_key}: bad image_bbox "
+                        f"{bbox!r}"
+                    )
+                x0, x1 = sorted((float(bbox[0]), float(bbox[2])))
+                y0, y1 = sorted((float(bbox[1]), float(bbox[3])))
+                boxes.append((x0, y0, x1, y1))
+            if boxes:
+                parsed[int(page_key)] = boxes
+        return parsed or None
+
+    def image_text_regions_for_page(
+        self, page_number: int | None
+    ) -> list[tuple[float, float, float, float]]:
+        """Declared image regions of one 0-based page ([] when none)."""
+        if self.image_text_regions is None or page_number is None:
+            return []
+        return self.image_text_regions.get(page_number, [])
 
     def parse_pages(self, pages_str: str | None) -> list[tuple[int, int]] | None:
         """解析页码字符串，返回页码范围列表

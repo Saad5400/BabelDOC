@@ -76,6 +76,12 @@ def _sidecar(blocks: list[dict], *, size: tuple[float, float] = PAGE,
                 "target": b["target"],
                 "font_size": b.get("font_size", 11.0),
                 "label": "plain text",
+                # A block whose text lives inside an embedded image: the same
+                # display-coordinate flip as the box.
+                **({"on_raster": True,
+                    "region": [b["region"][0], height - b["region"][3],
+                               b["region"][2], height - b["region"][1]]}
+                   if "region" in b else {}),
             } for b in blocks],
             "obstacles": [],
         }],
@@ -117,7 +123,8 @@ def test_gloss_lands_in_the_band_above_its_paragraph():
 
     pdf, report = _render(original, sidecar)
 
-    assert report == {"pages": 1, "drawn": 1, "skipped": 0}
+    assert report == {"pages": 1, "drawn": 1, "skipped": 0,
+                      "raster_drawn": 0, "raster_skipped": 0}
 
     arabic = [rect for rect, text in _drawn_spans(pdf) if _is_arabic(text)]
     assert arabic, "no Arabic was drawn"
@@ -276,7 +283,8 @@ def test_a_merged_bullet_list_is_spread_over_its_own_lines():
 
     pdf, report = _render(original, sidecar)
 
-    assert report == {"pages": 1, "drawn": 1, "skipped": 0}
+    assert report == {"pages": 1, "drawn": 1, "skipped": 0,
+                      "raster_drawn": 0, "raster_skipped": 0}
     # One gloss band per bullet, each above its own bullet — not one lump.
     bands = sorted({round(rect.y0, 1) for rect, text in _drawn_spans(pdf)
                     if _is_arabic(text)})
@@ -397,7 +405,8 @@ def test_a_paragraph_at_the_very_top_is_skipped_not_pushed_off_the_page():
 
     pdf, report = _render(original, sidecar)
 
-    assert report == {"pages": 1, "drawn": 0, "skipped": 1}
+    assert report == {"pages": 1, "drawn": 0, "skipped": 1,
+                      "raster_drawn": 0, "raster_skipped": 0}
     assert not [rect for rect, text in _drawn_spans(pdf) if _is_arabic(text)]
 
 
@@ -422,7 +431,8 @@ def test_a_stroked_frame_frees_its_inside_but_keeps_its_edge():
     pdf, report = _render(framed.getvalue(), sidecar)
 
     # Drawn — the inside of the frame was free all along…
-    assert report == {"pages": 1, "drawn": 1, "skipped": 0}
+    assert report == {"pages": 1, "drawn": 1, "skipped": 0,
+                      "raster_drawn": 0, "raster_skipped": 0}
 
     # …and still clear of the edge the frame actually drew.
     glosses = [rect for rect, text in _drawn_spans(pdf) if _is_arabic(text)]
@@ -487,6 +497,226 @@ def test_bad_options_are_refused(kwargs):
 
 
 # --------------------------------------------------------------------------
+# raster glosses — blocks whose text lives inside an embedded image
+# --------------------------------------------------------------------------
+
+# The stand-in for a diagram: an embedded raster whose "label" is a dark bar
+# on a flat fill. Small enough (300 x 240 pt of an A4 page) that the image is
+# real furniture to the normal pass, never a backdrop.
+IMAGE = (100.0, 100.0, 400.0, 340.0)
+LABEL = (200.0, 200.0, 300.0, 212.0)
+
+
+def _raster_pdf(label=LABEL, image=IMAGE, busy=()) -> bytes:
+    """A page whose only content is an embedded image.
+
+    The image carries a flat light fill, a dark bar where its "label" sits,
+    and optionally BUSY areas — 1 pt stripes, which is what arrows and
+    borders look like to a pixel mask — all given in page coordinates.
+    """
+    scale = 4
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(
+        0, 0, int((image[2] - image[0]) * scale),
+        int((image[3] - image[1]) * scale)))
+    pix.set_rect(pix.irect, (205, 210, 215))
+
+    def px(rect):
+        return pymupdf.IRect(int((rect[0] - image[0]) * scale),
+                             int((rect[1] - image[1]) * scale),
+                             int((rect[2] - image[0]) * scale),
+                             int((rect[3] - image[1]) * scale))
+
+    pix.set_rect(px(label), (40, 40, 60))
+
+    for area in busy:
+        top = area[1]
+        while top < area[3]:
+            pix.set_rect(px((area[0], top, area[2], min(top + 1, area[3]))),
+                         (30, 30, 30))
+            top += 2
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=PAGE[0], height=PAGE[1])
+    page.insert_image(pymupdf.Rect(image), pixmap=pix)
+
+    out = BytesIO()
+    doc.save(out)
+    doc.close()
+
+    return out.getvalue()
+
+
+def _plates(pdf_bytes: bytes) -> list[pymupdf.Rect]:
+    """Every translucent filled drawing on page 1 — the legibility plates."""
+    doc = pymupdf.open(stream=BytesIO(pdf_bytes), filetype="pdf")
+
+    try:
+        return [pymupdf.Rect(drawing["rect"]) for drawing in doc[0].get_drawings()
+                if drawing.get("fill") is not None
+                and (drawing.get("fill_opacity") or 1.0) < 1.0]
+    finally:
+        doc.close()
+
+
+def test_a_raster_block_is_glossed_inside_its_image():
+    sidecar = _sidecar([{"box": LABEL, "target": AR_ONE, "font_size": 10.0,
+                         "region": IMAGE}])
+
+    pdf, report = _render(_raster_pdf(), sidecar)
+
+    assert report == {"pages": 1, "drawn": 0, "skipped": 0,
+                      "raster_drawn": 1, "raster_skipped": 0}
+
+    arabic = [rect for rect, text in _drawn_spans(pdf) if _is_arabic(text)]
+    assert arabic, "no Arabic was drawn"
+
+    image = pymupdf.Rect(IMAGE)
+    label = pymupdf.Rect(LABEL)
+
+    for rect in arabic:
+        # Inside the image, in the band directly above the label, and clear
+        # of the label's own pixels.
+        assert image.contains(rect)
+        assert rect.y1 <= label.y0
+
+
+def test_a_raster_gloss_sits_on_a_translucent_plate():
+    sidecar = _sidecar([{"box": LABEL, "target": AR_ONE, "font_size": 10.0,
+                         "region": IMAGE}])
+
+    pdf, _report = _render(_raster_pdf(), sidecar)
+
+    plates = _plates(pdf)
+    assert plates, "no plate was drawn"
+
+    arabic = [rect for rect, text in _drawn_spans(pdf) if _is_arabic(text)]
+    image = pymupdf.Rect(IMAGE)
+
+    # The plate sits under the text — it contains every gloss span — and stays
+    # inside the image it was licensed onto.
+    for span in arabic:
+        assert any(plate.contains(span) for plate in plates)
+
+    for plate in plates:
+        assert image.contains(plate)
+
+
+def test_the_image_vetoes_a_normal_gloss_but_licenses_a_raster_one():
+    """The relaxation the raster lane exists for, and its exact boundary.
+
+    The same box, the same image: as an ordinary block its band above is
+    image ink and the gloss is skipped; marked on_raster, the image is its
+    canvas and the gloss is drawn. Ordinary blocks keep their veto.
+    """
+    original = _raster_pdf()
+    plain = _sidecar([{"box": LABEL, "target": AR_ONE, "font_size": 10.0}])
+    raster = _sidecar([{"box": LABEL, "target": AR_ONE, "font_size": 10.0,
+                        "region": IMAGE}])
+
+    _pdf, plain_report = _render(original, plain)
+    _pdf, raster_report = _render(original, raster)
+
+    assert plain_report["drawn"] == 0
+    assert plain_report["skipped"] == 1
+    assert raster_report["raster_drawn"] == 1
+
+
+def test_a_busy_band_above_falls_back_below_the_label():
+    # Stripes — a pixel mask's view of arrows and borders — fill the whole
+    # band above the label; the band below stays flat.
+    original = _raster_pdf(busy=[(IMAGE[0], IMAGE[1], IMAGE[2], LABEL[1])])
+    sidecar = _sidecar([{"box": LABEL, "target": AR_ONE, "font_size": 10.0,
+                         "region": IMAGE}])
+
+    pdf, report = _render(original, sidecar)
+
+    assert report["raster_drawn"] == 1
+
+    arabic = [rect for rect, text in _drawn_spans(pdf) if _is_arabic(text)]
+    label = pymupdf.Rect(LABEL)
+    image = pymupdf.Rect(IMAGE)
+
+    for rect in arabic:
+        assert rect.y0 >= label.y1
+        assert image.contains(rect)
+
+
+def test_a_label_with_no_quiet_pixels_is_skipped_and_counted():
+    # Busy above AND below: nowhere inside the image is quiet enough.
+    original = _raster_pdf(busy=[(IMAGE[0], IMAGE[1], IMAGE[2], LABEL[1]),
+                                 (IMAGE[0], LABEL[3], IMAGE[2], IMAGE[3])])
+    sidecar = _sidecar([{"box": LABEL, "target": AR_ONE, "font_size": 10.0,
+                         "region": IMAGE}])
+
+    pdf, report = _render(original, sidecar)
+
+    assert report == {"pages": 1, "drawn": 0, "skipped": 0,
+                      "raster_drawn": 0, "raster_skipped": 1}
+    assert not [rect for rect, text in _drawn_spans(pdf) if _is_arabic(text)]
+    assert not _plates(pdf)
+
+
+def test_two_raster_glosses_competing_for_one_band_do_not_overlap():
+    """The one collision the pixels cannot see: another plate.
+
+    The first label's band above is made busy, pushing its gloss below —
+    straight into the band the second label wants for its own gloss above.
+    The pixels there are flat both times; only the taken-plates account keeps
+    the two apart.
+    """
+    other = (200.0, 242.0, 300.0, 254.0)
+    original = _raster_pdf(busy=[(IMAGE[0], IMAGE[1], IMAGE[2], LABEL[1])])
+    sidecar = _sidecar([
+        {"box": LABEL, "target": AR_ONE, "font_size": 10.0, "region": IMAGE},
+        {"box": other, "target": AR_TWO, "font_size": 10.0, "region": IMAGE},
+    ])
+
+    pdf, report = _render(original, sidecar)
+
+    assert report["raster_drawn"] >= 1
+    assert report["raster_drawn"] + report["raster_skipped"] == 2
+
+    plates = _plates(pdf)
+
+    for index, plate in enumerate(plates):
+        for second in plates[index + 1:]:
+            overlap = plate & second
+            assert not overlap.is_valid or overlap.is_empty, (
+                f"plates {plate} and {second} overlap")
+
+
+def test_a_region_reaching_off_the_page_is_clamped_not_refused():
+    """A full-bleed figure's placement can overrun the page box (a real
+    Sommerville deck bleeds 185 pt past every edge); the mask must be built
+    from the part of it that exists."""
+    region = (-50.0, -50.0, PAGE[0] + 50.0, PAGE[1] + 50.0)
+    sidecar = _sidecar([{"box": LABEL, "target": AR_ONE, "font_size": 10.0,
+                         "region": region}])
+
+    pdf, report = _render(_raster_pdf(), sidecar)
+
+    assert report["raster_drawn"] == 1
+
+    page_rect = pymupdf.Rect(0, 0, *PAGE)
+
+    for rect, text in _drawn_spans(pdf):
+        if _is_arabic(text):
+            assert page_rect.contains(rect)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"plate_opacity": 1.5},
+    {"plate_color": "red} body {display:none"},
+    {"plate_padding": -1.0},
+])
+def test_bad_plate_options_are_refused(kwargs):
+    with pytest.raises(interlinear.OverlayError):
+        _render(_raster_pdf(),
+                _sidecar([{"box": LABEL, "target": AR_ONE, "region": IMAGE}]),
+                **kwargs)
+
+
+# --------------------------------------------------------------------------
 # /v1/overlay
 # --------------------------------------------------------------------------
 
@@ -512,6 +742,9 @@ def test_endpoint_returns_a_pdf_and_reports_the_fit(client):
     assert resp.content.startswith(b"%PDF-")
     assert resp.headers["x-overlay-drawn"] == "1"
     assert resp.headers["x-overlay-skipped"] == "0"
+    # The raster lane's fit rides its own headers, zero when nothing rode it.
+    assert resp.headers["x-overlay-raster-drawn"] == "0"
+    assert resp.headers["x-overlay-raster-skipped"] == "0"
 
 
 def test_endpoint_names_the_download_after_the_original(client):
@@ -554,6 +787,15 @@ def test_endpoint_refuses_bad_options(client):
     resp = _post(client, original,
                  _sidecar([{"box": (60, 300, 400, 314), "target": AR_ONE}]),
                  align="middle")
+
+    assert resp.status_code == 422
+
+
+def test_endpoint_refuses_bad_plate_options(client):
+    original = _page_pdf([(60, 300, 500, 340, "x")])
+    resp = _post(client, original,
+                 _sidecar([{"box": (60, 300, 400, 314), "target": AR_ONE}]),
+                 plate_opacity="1.5")
 
     assert resp.status_code == 422
 

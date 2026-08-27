@@ -878,10 +878,14 @@ class PDFCreater:
                     FormRenderUnit(form, render_order, sub_render_order)
                 )
 
-        # Convert rectangles to render units (only for OCR workaround or debug)
+        # Convert rectangles to render units (only for OCR workaround, image
+        # -text masks, or debug). An image-text mask (it carries its raster
+        # region) must render on digital pages too: it covers the source
+        # label pixels inside an embedded raster image.
         for i, rect in enumerate(page.pdf_rectangle):
+            is_image_text_mask = bool(getattr(rect, "raster_region", None))
             if (
-                translation_config.ocr_workaround
+                (translation_config.ocr_workaround or is_image_text_mask)
                 and not rect.debug_info
                 and rect.fill_background
             ) or (translation_config.debug and rect.debug_info):
