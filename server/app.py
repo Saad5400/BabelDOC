@@ -26,6 +26,7 @@ from server import config
 from server import convert
 from server import interlinear
 from server import jobs
+from server import notes_space
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
@@ -349,6 +350,40 @@ async def strip_vocab(
 
     return Response(content=result, media_type="application/pdf",
                     headers=_pdf_attachment(translated.filename))
+
+
+@app.post("/v1/notes-space", dependencies=[Depends(require_token)])
+async def add_notes_space(
+    file: UploadFile = File(...),
+    sides: str = Form(...),
+    size: str = Form("md"),
+):
+    """Stateless margin builder: any PDF in, the same PDF with ruled note
+    space out.
+
+    Every page grows a band of blank, faintly-ruled writing space (أسطر) on
+    each requested side — `sides` is a comma-separated subset of top, bottom,
+    left, right; `size` is sm/md/lg. The content never moves (the mediabox
+    grows outward, vocab-strip style), so this composes with whatever the PDF
+    already is: a mono with baked strips, a dual, an overlay. Rotated pages
+    are left untouched.
+    """
+    data = await file.read()
+
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="file too large")
+
+    if not data.startswith(b"%PDF-"):
+        raise HTTPException(status_code=422, detail="file is not a PDF")
+
+    try:
+        result = notes_space.add_notes_space(data, notes_space.parse_sides(sides),
+                                             size=size)
+    except notes_space.NotesSpaceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return Response(content=result, media_type="application/pdf",
+                    headers=_pdf_attachment(file.filename, "notes"))
 
 
 def _get_job_or_404(job_id: str) -> dict:
