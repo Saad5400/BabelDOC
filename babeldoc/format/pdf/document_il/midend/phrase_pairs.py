@@ -268,22 +268,43 @@ _ARABIC_PROCLITICS = frozenset(
 )
 
 
-def _merge_repeated_targets(pairs: list[dict]) -> list[dict]:
+_TRAILING_PUNCT = ".،,;:؟?!؛"
+
+
+def _merge_repeated_targets(pairs: list[dict], target_text: str) -> list[dict]:
     """Consecutive pairs sharing one "t" merged into one multi-word pair.
 
     Word-level granularity invites fertility repeats: the model answers
     "software"→«أنظمة برمجية» and "systems"→«أنظمة برمجية» although the target
     contains «أنظمة برمجية» once. While pair i and i+1 have the same "t"
-    (string equality after whitespace normalization), they are one pair:
-    "s" values joined with a space, "t" kept once. A single left-to-right
+    (word-list equality, tolerating a trailing-punctuation difference on the
+    last word — the model is sloppy about where the sentence's period rides),
+    they are one pair: "s" values joined with a space, "t" kept once. When
+    the two variants differ only in that trailing punctuation, the survivor
+    is whichever variant's last word actually occurs in the target text —
+    that is the word the tiling must later consume. A single left-to-right
     pass with accumulation reaches the fixed point — a run of any length
     collapses into its head.
     """
+    target_words = set(target_text.split())
+
+    def _folded(t: str) -> list[str]:
+        words = t.split()
+        if words:
+            words[-1] = words[-1].rstrip(_TRAILING_PUNCT)
+        return words
+
     merged: list[dict] = []
     for pair in pairs:
-        if merged and merged[-1]["t"].split() == pair["t"].split():
-            merged[-1] = {"s": f"{merged[-1]['s']} {pair['s']}",
-                          "t": merged[-1]["t"]}
+        if merged and _folded(merged[-1]["t"]) == _folded(pair["t"]):
+            keep = merged[-1]["t"]
+            if keep != pair["t"]:
+                keep = next(
+                    (t for t in (merged[-1]["t"], pair["t"])
+                     if t.split() and t.split()[-1] in target_words),
+                    keep,
+                )
+            merged[-1] = {"s": f"{merged[-1]['s']} {pair['s']}", "t": keep}
         else:
             merged.append(dict(pair))
     return merged
@@ -311,8 +332,13 @@ def _merge_clitic_targets(pairs: list[dict]) -> list[dict] | None:
         clitic = pair["t"].replace(_TATWEEL, "").strip()
         if merged and clitic in _ARABIC_PROCLITICS:
             following = merged[0]
+            fused_t = following["t"]
+            if clitic == "ل" and fused_t.startswith("ال"):
+                # Orthographic assimilation: ل + ال… fuses to لل… (the
+                # article's alef drops — «لـ» + «الشركات» = «للشركات»).
+                fused_t = fused_t[1:]
             merged[0] = {"s": f"{pair['s']} {following['s']}",
-                         "t": f"{clitic}{following['t']}"}
+                         "t": f"{clitic}{fused_t}"}
             changed = True
         else:
             merged.insert(0, dict(pair))
@@ -361,7 +387,7 @@ def validate_pairs(
     if not raw_pairs or not source_text or not target_text:
         return None
 
-    candidate = _merge_repeated_targets(raw_pairs)
+    candidate = _merge_repeated_targets(raw_pairs, target_text)
     validated = _validate_candidate(candidate, source_text, target_text)
     if validated is not None:
         return validated

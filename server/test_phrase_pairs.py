@@ -1033,3 +1033,24 @@ def test_a_token_the_model_dropped_from_its_output_discards_at_the_seam():
     assert translator.translation_config.phrase_pair_store == {}
     assert translator.pairs_kept == 0
     assert translator.pairs_discarded == 1
+
+
+def test_fertility_merge_tolerates_a_trailing_period_difference():
+    pairs = [{"s": "software", "t": "مشاريع برمجية"},
+             {"s": "projects.", "t": "مشاريع برمجية."}]
+    merged = phrase_pairs._merge_repeated_targets(
+        pairs, "ويتم تطويرها ضمن مشاريع برمجية مخصصة.")
+
+    assert merged == [{"s": "software projects.", "t": "مشاريع برمجية"}]
+
+
+def test_lam_before_the_article_assimilates_to_double_lam():
+    raw = [{"s": "important", "t": "مهمة"},
+           {"s": "for", "t": "لـ"},
+           {"s": "large companies", "t": "الشركات الكبيرة"}]
+    validated = phrase_pairs.validate_pairs(
+        raw, "important for large companies", "مهمة للشركات الكبيرة")
+
+    assert validated is not None
+    pairs, _perm = validated
+    assert pairs[1] == {"s": "for large companies", "t": "للشركات الكبيرة"}
