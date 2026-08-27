@@ -398,3 +398,53 @@ def compose_dual(original_bytes: bytes, translated_bytes: bytes,
 
     return composed
 
+
+def strip_vocab(translated_bytes: bytes, sidecar) -> bytes:
+    """The stored mono with its baked «كلمات هذه الصفحة» layer taken back out.
+
+    The un-bake half of what {@link compose_dual} does before it pairs pages,
+    offered on its own: the sidecar's artifact_layout says exactly what the
+    pipeline baked in, so inserted fallback vocab pages are dropped (keep the
+    content_pages positions, nothing else) and baked bottom strips are
+    PHYSICALLY redacted off with the mediabox restored afterwards
+    ({@link _crop_baked_strips}). A sidecar without a usable layout means a
+    pre-vocab mono — there is nothing to strip, and the input bytes come back
+    byte-for-byte unchanged rather than pointlessly re-serialized.
+
+    Unlike compose, where the vocab layer is best-effort garnish on a free
+    dual, stripping IS this call's whole job — so a crop that fails raises
+    ComposeError (HTTP 422) instead of quietly returning the vocab it was
+    asked to remove.
+    """
+    translated = _read(translated_bytes, "translated")
+    positions = _artifact_content_positions(sidecar, len(translated.pages))
+
+    if positions is None:
+        return translated_bytes
+
+    strips = _artifact_strip_heights(sidecar)
+
+    if strips:
+        try:
+            translated_bytes = _crop_baked_strips(translated_bytes,
+                                                  positions, strips)
+        except Exception as exc:  # noqa: BLE001 - pymupdf raises many types
+            raise ComposeError(
+                f"could not remove the baked vocab strips: {exc}") from exc
+
+        translated = _read(translated_bytes, "translated")
+
+    if positions == list(range(len(translated.pages))):
+        # Strip-era mono: every page is a content page, and the strips (if
+        # any) are already gone from the bytes above.
+        return translated_bytes
+
+    writer = PdfWriter()
+
+    for position in positions:
+        writer.add_page(translated.pages[position])
+
+    out = BytesIO()
+    writer.write(out)
+
+    return out.getvalue()

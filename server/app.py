@@ -310,6 +310,47 @@ async def convert_to_pdf(file: UploadFile = File(...)):
                     headers=_pdf_attachment(filename))
 
 
+@app.post("/v1/strip-vocab", dependencies=[Depends(require_token)])
+async def strip_vocab(
+    translated: UploadFile = File(...),
+    sidecar: UploadFile = File(...),
+):
+    """Stateless un-baker: the stored mono in, the mono WITHOUT its vocab out.
+
+    The pipeline bakes the «كلمات هذه الصفحة» layer into the mono it stores;
+    a reader who wants the translation clean gets it back here, exactly, via
+    the sidecar's artifact_layout — baked bottom strips are physically
+    redacted off and inserted fallback pages dropped (compose.strip_vocab, the
+    same undo /v1/compose performs before pairing). A sidecar without a usable
+    layout means a pre-vocab mono: nothing to strip, the bytes come back
+    unchanged.
+    """
+    translated_bytes = await translated.read()
+    sidecar_bytes = await sidecar.read()
+
+    for name, data in (("translated", translated_bytes),
+                       ("sidecar", sidecar_bytes)):
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"{name} too large")
+
+    if not translated_bytes.startswith(b"%PDF-"):
+        raise HTTPException(status_code=422, detail="translated is not a PDF")
+
+    try:
+        sidecar_data = json.loads(sidecar_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=422,
+                            detail=f"sidecar is not valid JSON: {exc}") from exc
+
+    try:
+        result = compose.strip_vocab(translated_bytes, sidecar_data)
+    except compose.ComposeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return Response(content=result, media_type="application/pdf",
+                    headers=_pdf_attachment(translated.filename))
+
+
 def _get_job_or_404(job_id: str) -> dict:
     job = jobs.read_job(job_id)
     if job is None:
