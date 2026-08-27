@@ -49,6 +49,8 @@ from typing import Any
 
 import pymupdf
 
+from server import config
+
 logger = logging.getLogger("doctranslate.interlinear")
 
 OVERLAY_STYLES = ("interlinear",)
@@ -179,7 +181,7 @@ class _GlossFont:
 
     def __init__(self, texts: list[str], options: OverlayOptions) -> None:
         self.archive = pymupdf.Archive()
-        self.archive.add(self._font_bytes(texts), "gloss.ttf")
+        self.archive.add(subset_font_bytes(_font_path(), texts), "gloss.ttf")
         self.css = (
             "@font-face {font-family: gloss; src: url(gloss.ttf);}"
             " body {margin: 0;}"
@@ -187,38 +189,41 @@ class _GlossFont:
             f" line-height: {options.line_height};}}"
         )
 
-    @staticmethod
-    def _font_bytes(texts: list[str]) -> bytes:
-        source = _font_path()
 
-        try:
-            from fontTools import subset
-        except ImportError:
-            # Correct, just fat and slow. Never a reason to refuse the render.
-            logger.warning("fontTools is unavailable; embedding the full gloss "
-                           "font (large output)")
-            return source.read_bytes()
+def subset_font_bytes(source: Path, texts: list[str]) -> bytes:
+    """`source` subset to what `texts` need — or whole, never refused.
 
-        try:
-            options = subset.Options()
-            options.layout_features = ["*"]
-            options.name_IDs = ["*"]
-            options.notdef_outline = True
-            options.drop_tables += ["DSIG"]
+    Shared with `server/glossary_pages.py`, which sets its cards in the same
+    face (plus its bold) and has the same 15 MB problem to solve.
+    """
+    try:
+        from fontTools import subset
+    except ImportError:
+        # Correct, just fat and slow. Never a reason to refuse the render.
+        logger.warning("fontTools is unavailable; embedding the full gloss "
+                       "font (large output)")
+        return source.read_bytes()
 
-            font = subset.load_font(str(source), options)
-            subsetter = subset.Subsetter(options=options)
-            subsetter.populate(unicodes=_subset_codepoints(texts))
-            subsetter.subset(font)
+    try:
+        options = subset.Options()
+        options.layout_features = ["*"]
+        options.name_IDs = ["*"]
+        options.notdef_outline = True
+        options.drop_tables += ["DSIG"]
 
-            buffer = BytesIO()
-            subset.save_font(font, buffer, options)
+        font = subset.load_font(str(source), options)
+        subsetter = subset.Subsetter(options=options)
+        subsetter.populate(unicodes=_subset_codepoints(texts))
+        subsetter.subset(font)
 
-            return buffer.getvalue()
-        except Exception:  # noqa: BLE001 - subsetting is an optimisation
-            logger.exception("subsetting the gloss font failed; using it whole")
+        buffer = BytesIO()
+        subset.save_font(font, buffer, options)
 
-            return source.read_bytes()
+        return buffer.getvalue()
+    except Exception:  # noqa: BLE001 - subsetting is an optimisation
+        logger.exception("subsetting the gloss font failed; using it whole")
+
+        return source.read_bytes()
 
 
 def _subset_codepoints(texts: list[str]) -> set[int]:
@@ -828,6 +833,23 @@ def render_overlay(original_bytes: bytes, sidecar: Any,
             skipped += page_skipped
             pages += 1
 
+        # A sidecar that carries "glossary" entries (server/terms.py wrote them
+        # after the mono run) gets the same «شرح المصطلحات» pages the mono
+        # result has, appended after the overlaid document. Best-effort: an
+        # overlay must not fail over its appendix. Lazy import — glossary_pages
+        # imports this module for the font subsetter.
+        glossary_added = 0
+
+        if config.GLOSSARY_PAGES and sidecar.get("glossary"):
+            from server import glossary_pages
+
+            try:
+                glossary_added = glossary_pages.append_glossary_pages(
+                    doc, sidecar["glossary"])
+            except Exception:  # noqa: BLE001 - the appendix is optional
+                logger.exception("interlinear: appending glossary pages failed;"
+                                 " returning the overlay without them")
+
         out = BytesIO()
         # garbage=4 is what collapses the one-font-copy-per-box the Story
         # engine leaves behind into a single embedded subset.
@@ -837,6 +859,8 @@ def render_overlay(original_bytes: bytes, sidecar: Any,
             logger.info("interlinear: %s gloss(es) had no room and were skipped "
                         "(%s drawn over %s page(s))", skipped, drawn, pages)
 
-        return out.getvalue(), {"pages": pages, "drawn": drawn, "skipped": skipped}
+        return out.getvalue(), {"pages": pages, "drawn": drawn,
+                                "skipped": skipped,
+                                "glossary_pages": glossary_added}
     finally:
         doc.close()
