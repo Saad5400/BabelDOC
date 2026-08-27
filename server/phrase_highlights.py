@@ -49,12 +49,12 @@ from babeldoc.format.pdf.document_il.midend.phrase_pairs import MAX_PAIRS
 logger = logging.getLogger("doctranslate.phrase_highlights")
 
 # The owner-approved chip palette, cycled per paragraph: phrase i (on both
-# sides) gets PALETTE[i % 5]. Amber, sky, green, violet, pink — deliberately
-# desaturated (owner asked for subtle) and further faded by FILL_OPACITY.
-PALETTE = ("#F3E5B5", "#C8E4F5", "#CBEEDA", "#DFDAF5", "#F3D8E7")
+# sides) gets PALETTE[i % 5]. Amber, sky, green, violet, pink. Subtlety is
+# ONE knob — FILL_OPACITY — by owner ruling; do not also desaturate these.
+PALETTE = ("#FDE68A", "#BAE6FD", "#BBF7D0", "#DDD6FE", "#FBCFE8")
 
 # Chips draw like a text highlighter: soft, borderless, on top.
-FILL_OPACITY = 0.35
+FILL_OPACITY = 0.30
 PADDING = 1.5  # points of breathing room around the text rect
 CORNER_RADIUS = 2.0  # points
 
