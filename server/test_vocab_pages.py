@@ -193,3 +193,64 @@ def test_a_page_too_small_for_the_layout_is_skipped_not_raised():
     assert vocab_pages.interleave_vocab(doc, {"0": _rows(2)}, {0: 0}) == {}
     assert doc.page_count == 1
     doc.close()
+
+
+# --------------------------------------------------------------------------
+# interleave_vocab: same-named conflicting subsets in the target
+# --------------------------------------------------------------------------
+
+def _conflicting_target(size=PAGE):
+    """A raw saved-and-reopened doc that embeds its OWN GoNotoKurrent subsets.
+
+    The page's Arabic is a different text set than the vocab rows', so its
+    subsets carry a different glyph numbering under the very same face names —
+    what a babeldoc-produced mono embeds. Vocab pages are drawn directly into
+    the target ({@link vocab_pages.draw_vocab_pages}); this fixture pins that
+    the drawn text keeps rendering from its own subsets, pixel-identical to a
+    blank-document render, with the same-named strangers alongside.
+    """
+    doc = pymupdf.open()
+    page = doc.new_page(width=size[0], height=size[1])
+    fonts = glossary_pages.PageFonts(
+        ["غضب الخط شيء آخر تماما وليس من كلمات الصفحة"],
+        "div.x {font-family: glossbold; font-size: 14px;}")
+    page.insert_htmlbox(
+        pymupdf.Rect(48, 48, size[0] - 48, 200),
+        '<div class="x" dir="rtl">غضب الخط شيء آخر تماما</div>',
+        css=fonts.css, archive=fonts.archive)
+    data = doc.tobytes(garbage=4, deflate=True)
+    doc.close()
+
+    return pymupdf.open(stream=data, filetype="pdf")
+
+
+def _saved_page_pixmap(doc, index):
+    """Page `index` as rendered from the SAVED file (garbage=4, reopened)."""
+    data = doc.tobytes(garbage=4, deflate=True)
+    saved = pymupdf.open(stream=data, filetype="pdf")
+    try:
+        return saved[index].get_pixmap(dpi=96)
+    finally:
+        saved.close()
+
+
+def test_vocab_arabic_survives_a_conflicting_embedded_subset():
+    rows = _rows(5)
+
+    # The reference: the same rows into a blank document — the standalone
+    # render, known-correct. Pixels, not extracted text: extraction reads
+    # ToUnicode, which stayed correct even in the broken files.
+    reference = _doc(pages=1)
+    assert vocab_pages.interleave_vocab(reference, {"0": rows}, {0: 0})
+    want = _saved_page_pixmap(reference, 1)
+    reference.close()
+
+    target = _conflicting_target()
+    assert vocab_pages.interleave_vocab(target, {"0": rows}, {0: 0})
+    got = _saved_page_pixmap(target, 1)
+    target.close()
+
+    assert (got.width, got.height) == (want.width, want.height)
+    mismatch = sum(a != b for a, b in zip(got.samples, want.samples,
+                                          strict=True))
+    assert mismatch / len(want.samples) < 0.005

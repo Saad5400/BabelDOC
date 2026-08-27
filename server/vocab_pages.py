@@ -161,13 +161,22 @@ def make_fonts(pages: dict[int, list[dict]]) -> PageFonts:
     return PageFonts(texts, _CSS)
 
 
-def render_vocab_doc(rows: list[dict], page_size: tuple[float, float],
-                     fonts: PageFonts) -> pymupdf.Document | None:
-    """One page's rows as a fresh document of 1+ pages, or None.
+def draw_vocab_pages(doc: pymupdf.Document, at_index: int, rows: list[dict],
+                     page_size: tuple[float, float], fonts: PageFonts) -> int:
+    """One content page's rows drawn as 1+ new pages in `doc` at `at_index`;
+    returns pages added.
 
-    None when nothing can be rendered — no usable rows, or a page too small
-    for the layout (the deliberate skip, not an exception). The caller owns
-    inserting the pages and closing the returned document.
+    The pages are created and drawn DIRECTLY in `doc` (new_page +
+    insert_htmlbox — the glossary appendix's way), never rendered into a
+    scratch document and grafted in with insert_pdf: the target usually
+    already embeds its own identically-named GoNotoKurrent subsets (every
+    babeldoc output does), and drawing in place keeps the vocab pages'
+    subsets out of the page-grafting machinery instead of trusting it to
+    keep same-named, differently-numbered subsets apart.
+
+    0 when nothing can be drawn — no usable rows, or a page too small for
+    the layout (the deliberate skip, not an exception); `doc` is untouched
+    then.
     """
     width, height = float(page_size[0]), float(page_size[1])
     content_width = width - 2 * _MARGIN_X
@@ -181,10 +190,10 @@ def render_vocab_doc(rows: list[dict], page_size: tuple[float, float],
         if rows:
             logger.warning("vocab: page %sx%s too small for rows; skipped",
                            width, height)
-        return None
+        return 0
 
-    doc = pymupdf.open()
-    page = doc.new_page(width=width, height=height)
+    page = doc.new_page(pno=at_index, width=width, height=height)
+    added = 1
 
     title = _title_html()
     title_height = measure(title, fonts, content_width)
@@ -216,8 +225,11 @@ def render_vocab_doc(rows: list[dict], page_size: tuple[float, float],
             if column < len(columns):
                 y = column_top
             else:
-                # Overflow: continue onto a further page (no repeated title).
-                page = doc.new_page(width=width, height=height)
+                # Overflow: continue onto a further page (no repeated title),
+                # created right after the one that just filled up.
+                page = doc.new_page(pno=at_index + added,
+                                    width=width, height=height)
+                added += 1
                 column = 0
                 column_top = _MARGIN_TOP
                 split = None  # continuation pages just flow
@@ -239,7 +251,7 @@ def render_vocab_doc(rows: list[dict], page_size: tuple[float, float],
             html, css=fonts.css, archive=fonts.archive, scale_low=0)
         y = row_rect.y1 + _ROW_GAP
 
-    return doc
+    return added
 
 
 def interleave_vocab(doc: pymupdf.Document, vocab: object,
@@ -252,8 +264,10 @@ def interleave_vocab(doc: pymupdf.Document, vocab: object,
     because it differs per artifact (page N itself in the mono and the
     overlay, the end of page N's pair in a dual). Anchors outside `doc` are
     skipped, insertion runs back-to-front so the pre-insertion indices stay
-    true, and each inserted page is sized like its anchor page. The caller
-    owns the save (`garbage=4`, as everywhere the Story engine draws).
+    true, each inserted page is sized like its anchor page, and the pages are
+    drawn directly into `doc` ({@link draw_vocab_pages}) — never grafted from
+    a scratch document. The caller owns the save (`garbage=4`, as everywhere
+    the Story engine draws).
     """
     pages = sanitize_vocab(vocab)
     plan = [(anchors[number], number) for number in pages
@@ -267,17 +281,11 @@ def interleave_vocab(doc: pymupdf.Document, vocab: object,
 
     for anchor, number in sorted(plan, reverse=True):
         rect = doc[anchor].rect
-        vocab_doc = render_vocab_doc(pages[number], (rect.width, rect.height),
-                                     fonts)
+        count = draw_vocab_pages(doc, anchor + 1, pages[number],
+                                 (rect.width, rect.height), fonts)
 
-        if vocab_doc is None:
-            continue
-
-        try:
-            doc.insert_pdf(vocab_doc, start_at=anchor + 1)
-            added[number] = vocab_doc.page_count
-        finally:
-            vocab_doc.close()
+        if count:
+            added[number] = count
 
     if added:
         logger.info("vocab: %s page(s) inserted for %s content page(s)",
