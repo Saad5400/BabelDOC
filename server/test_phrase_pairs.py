@@ -22,8 +22,10 @@ from babeldoc.format.pdf.document_il.midend.il_translator import (
 )
 from babeldoc.format.pdf.document_il.midend.il_translator_llm_only import (
     ILTranslatorLLMOnly,
+    MAX_PAIR_FORMULAS,
     PHRASE_PAIRS_PROMPT_BLOCK,
     PROMPT_TEMPLATE,
+    formula_expansions,
     pairs_eligible,
     strip_style_placeholders,
 )
@@ -78,6 +80,16 @@ def test_the_pairs_instruction_covers_the_plain_text_of_styled_inputs():
     assert "PLAIN text" in PHRASE_PAIRS_PROMPT_BLOCK
     assert "<style id='N'>...</style>" in PHRASE_PAIRS_PROMPT_BLOCK
     assert "keeping each tag's inner text in place" in PHRASE_PAIRS_PROMPT_BLOCK
+
+
+def test_the_pairs_instruction_treats_formula_tokens_as_opaque_words():
+    # A {vN} token is a word of both texts: it sits inside exactly one phrase
+    # on each side, is never split or dropped, and never forms a phrase alone
+    # (the bullet case: the leading token joins the phrase that follows).
+    assert "OPAQUE WORDS" in PHRASE_PAIRS_PROMPT_BLOCK
+    assert "NEVER split, alter, or drop such a token" in PHRASE_PAIRS_PROMPT_BLOCK
+    assert "NEVER make a phrase that is ONLY tokens" in PHRASE_PAIRS_PROMPT_BLOCK
+    assert '{"s": "{v1} Software products"' in PHRASE_PAIRS_PROMPT_BLOCK
 
 
 # --- parsing: items with and without pairs -----------------------------------
@@ -526,14 +538,18 @@ def test_attach_target_rects_swallows_a_broken_state(tmp_path):
             ("wrong", "shape")]})  # even the tuple arity is untrusted
 
 
-# --- styled paragraphs: style wrappers no longer exclude a paragraph ---------
+# --- styled and formula paragraphs: placeholders no longer exclude ----------
 #
-# On real lecture slides nearly every body bullet is a styled paragraph — the
-# bullet glyph «•» alone is a different font run and becomes a <style id='N'>
-# wrapper — and under the old all-placeholders-excluded rule only titles and
-# footers ever got pairs. Style tags merely WRAP text the model sees, so such
-# paragraphs are eligible; formula placeholders ({vN}) REPLACE text the model
-# never sees, so those stay excluded.
+# On real lecture slides nearly every body bullet is a placeholder paragraph:
+# the bullet glyph «•» is its own font run — a <style id='N'> wrapper when it
+# shares the body font, a {vN} FORMULA placeholder when babeldoc classifies it
+# as one (the Sommerville deck: every body bullet). Under the old rules only
+# titles and footers ever got pairs. Style tags merely WRAP text the model
+# sees, so the phrases cover the tag-stripped plain text; formula tokens are
+# OPAQUE WORDS the phrases carry — validated like any word, then expanded to
+# the formula's own text before the store — so those paragraphs pair too.
+# Only degenerate formula-HEAVY paragraphs (> MAX_PAIR_FORMULAS tokens) sit
+# out.
 
 
 def _style_placeholder(pid=1):
@@ -560,15 +576,22 @@ def _capture_translator():
     return translator
 
 
-def test_style_placeholders_no_longer_disqualify_but_formulas_still_do():
+def test_placeholders_no_longer_disqualify_but_formula_heavy_paragraphs_do():
     assert pairs_eligible(ILTranslator.TranslateInput("plain text", []))
     assert pairs_eligible(ILTranslator.TranslateInput(
         "<style id='1'>•</style> body", [_style_placeholder(1)]))
-    assert not pairs_eligible(ILTranslator.TranslateInput(
+    # The Sommerville bullet case: ONE formula token is the normal deck shape.
+    assert pairs_eligible(ILTranslator.TranslateInput(
         "{v1} energy", [_formula_placeholder(1)]))
-    assert not pairs_eligible(ILTranslator.TranslateInput(
+    assert pairs_eligible(ILTranslator.TranslateInput(
         "<style id='1'>E</style> = {v2}",
         [_style_placeholder(1), _formula_placeholder(2)]))
+    # The sanity bound: exactly MAX_PAIR_FORMULAS is still in, one more is a
+    # degenerate formula-heavy paragraph and sits out.
+    at_bound = [_formula_placeholder(i + 1) for i in range(MAX_PAIR_FORMULAS)]
+    assert pairs_eligible(ILTranslator.TranslateInput("x", at_bound))
+    assert not pairs_eligible(ILTranslator.TranslateInput(
+        "x", [*at_bound, _formula_placeholder(MAX_PAIR_FORMULAS + 1)]))
 
 
 def test_stripping_style_wrappers_leaves_the_plain_text():
@@ -662,18 +685,199 @@ def test_a_styled_bullet_paragraph_is_captured_end_to_end(tmp_path):
     assert all(pair["t_rects"] for pair in written)
 
 
-def test_a_formula_paragraph_is_still_excluded_at_the_capture_seam():
+def test_a_formula_heavy_paragraph_is_excluded_at_the_capture_seam():
     translator = _capture_translator()
-    paragraph = _paragraph("طاقة {v1}", _box(60, 680, 400, 714))
+    paragraph = _paragraph("طاقة", _box(60, 680, 400, 714))
+    placeholders = [_formula_placeholder(i + 1)
+                    for i in range(MAX_PAIR_FORMULAS + 1)]
+    tokens = " ".join(p.placeholder for p in placeholders)
 
     translator._capture_phrase_pairs(
         paragraph=paragraph,
         translate_input=ILTranslator.TranslateInput(
-            "{v1} energy", [_formula_placeholder(1)]),
-        source_text="{v1} energy",
-        raw_pairs=[{"s": "{v1} energy", "t": "طاقة {v1}"}])
+            f"{tokens} energy", placeholders),
+        source_text=f"{tokens} energy",
+        raw_pairs=[{"s": f"{tokens} energy", "t": f"طاقة {tokens}"}])
 
     # Not discarded — never in the game: no store entry, no counter moved.
     assert translator.translation_config.phrase_pair_store == {}
     assert translator.pairs_kept == 0
     assert translator.pairs_discarded == 0
+
+
+# --- formula tokens: opaque words in the pairs, real text in the sidecar -----
+
+
+def _bullet_formula(pid=1, *, chars="•", x0=60.0, y_top=714.0, step=6.0):
+    """A FormulaPlaceholder whose formula really spells something — the deck
+    bullet by default — exactly as the translator mints it."""
+    formula = il_version_1.PdfFormula(
+        box=_box(x0, y_top - 10, x0 + len(chars) * step, y_top),
+        pdf_character=[
+            il_version_1.PdfCharacter(
+                box=_box(x0 + i * step, y_top - 10,
+                         x0 + (i + 1) * step, y_top),
+                char_unicode=ch)
+            for i, ch in enumerate(chars)
+        ])
+    return FormulaPlaceholder(
+        pid, formula, "{v" + str(pid) + "}", f"{{\\s*v\\s*{pid}\\s*}}")
+
+
+def test_formula_expansions_read_the_formulas_own_characters():
+    bullet = _bullet_formula(1)
+    empty = _formula_placeholder(2)  # no formula object at all
+
+    assert formula_expansions(
+        [bullet, _style_placeholder(3), empty]) == {"{v1}": "•", "{v2}": ""}
+
+
+def test_a_welded_bullet_token_counts_as_its_own_word():
+    # The real deck shape: the source welds the token to the first word, the
+    # model's phrase spaces it — both tokenize to the same opaque word.
+    pairs = [{"s": "{v1} Software products", "t": "{v1} منتجات البرمجيات"},
+             {"s": "are generic systems", "t": "هي أنظمة عامة"}]
+
+    assert phrase_pairs.validate_pairs(
+        pairs,
+        "{v1}Software products are generic systems",
+        "{v1} منتجات البرمجيات هي أنظمة عامة") == (pairs, [0, 1])
+
+
+def test_a_mid_phrase_formula_token_validates_and_expands_in_place():
+    # An inline symbol mid-sentence: the token travels inside its phrase and
+    # comes out as the symbol itself.
+    validated = phrase_pairs.validate_pairs(
+        [{"s": "the energy {v2}", "t": "الطاقة {v2}"},
+         {"s": "is conserved", "t": "محفوظة"}],
+        "the energy {v2}is conserved",
+        "الطاقة {v2} محفوظة")
+
+    assert validated is not None
+    pairs, permutation = validated
+    assert permutation == [0, 1]
+    assert phrase_pairs.expand_formula_tokens(pairs, {"{v2}": "α"}) == [
+        {"s": "the energy α", "t": "الطاقة α"},
+        {"s": "is conserved", "t": "محفوظة"}]
+
+
+def test_a_formula_only_phrase_is_kept_when_its_expansion_is_real_text():
+    # The prompt forbids token-only phrases, but a model may produce one
+    # anyway; expanded to the bullet glyph it is a perfectly drawable phrase.
+    validated = phrase_pairs.validate_pairs(
+        [{"s": "{v1}", "t": "{v1}"}, {"s": "hello", "t": "مرحبا"}],
+        "{v1}hello", "{v1} مرحبا")
+
+    assert validated is not None
+    assert phrase_pairs.expand_formula_tokens(validated[0], {"{v1}": "•"}) == [
+        {"s": "•", "t": "•"}, {"s": "hello", "t": "مرحبا"}]
+
+
+def test_an_empty_expansion_drops_the_token_but_never_leaves_an_empty_phrase():
+    # A formula with nothing to show: the token vanishes from its phrase…
+    assert phrase_pairs.expand_formula_tokens(
+        [{"s": "{v1} hello", "t": "مرحبا {v1}"}], {"{v1}": " "}) == [
+        {"s": "hello", "t": "مرحبا"}]
+    # …and a phrase that would become empty discards the paragraph's pairs.
+    assert phrase_pairs.expand_formula_tokens(
+        [{"s": "{v1}", "t": "{v1}"}, {"s": "hello", "t": "مرحبا"}],
+        {"{v1}": ""}) is None
+
+
+def test_mismatched_or_unknown_tokens_discard_the_pairs():
+    # In s but not t (the model dropped it from its translation)…
+    assert phrase_pairs.expand_formula_tokens(
+        [{"s": "{v1} hello", "t": "مرحبا"}], {"{v1}": "•"}) is None
+    # …in t but not s (hallucinated on one side)…
+    assert phrase_pairs.expand_formula_tokens(
+        [{"s": "hello", "t": "مرحبا {v1}"}], {"{v1}": "•"}) is None
+    # …or a token no placeholder ever minted.
+    assert phrase_pairs.expand_formula_tokens(
+        [{"s": "{v9} hello", "t": "مرحبا {v9}"}], {"{v1}": "•"}) is None
+
+
+def test_a_bullet_formula_paragraph_is_captured_end_to_end(tmp_path):
+    # The diagnosed defect, end to end: babeldoc classifies the bullet glyph
+    # «•» as a FORMULA, so the model was sent "{v1}Software products are
+    # generic systems" — token welded to the first word — and echoed the
+    # token in its Arabic output. The pairs must validate over the tokenized
+    # texts, expand to real page text, and resolve rects on BOTH sides
+    # against character streams that include the bullet glyph.
+    paragraph = _paragraph(
+        "• Software products are generic systems", _box(60, 680, 400, 714),
+        compositions=[_char_run("• Software products", 714, 60, step=5.0),
+                      _char_run("are generic systems", 696, 60, step=5.0)])
+    docs = _document([paragraph])
+    sources = translation_sidecar.snapshot_source(docs)
+
+    # What post_translate_paragraph leaves after APPLYING the parsed output:
+    # paragraph.unicode keeps the RAW output (token intact) while the
+    # compositions hold the formula's own characters and the translated run.
+    bullet = _bullet_formula(1)
+    paragraph.unicode = "{v1} منتجات البرمجيات هي أنظمة عامة"
+    paragraph.pdf_paragraph_composition = [
+        il_version_1.PdfParagraphComposition(pdf_formula=bullet.formula),
+        il_version_1.PdfParagraphComposition(
+            pdf_same_style_unicode_characters=(
+                il_version_1.PdfSameStyleUnicodeCharacters(
+                    unicode=" منتجات البرمجيات هي أنظمة عامة"))),
+    ]
+
+    translator = _capture_translator()
+    translator._capture_phrase_pairs(
+        paragraph=paragraph,
+        translate_input=ILTranslator.TranslateInput(
+            "{v1}Software products are generic systems", [bullet]),
+        source_text="{v1}Software products are generic systems",
+        raw_pairs=[
+            {"s": "{v1} Software products", "t": "{v1} منتجات البرمجيات"},
+            {"s": "are generic systems", "t": "هي أنظمة عامة"},
+        ])
+
+    # Stored EXPANDED: the sidecar and every consumer see only real text.
+    assert translator.pairs_kept == 1
+    store = translator.translation_config.phrase_pair_store
+    assert [(p["s"], p["t"]) for p in store[id(paragraph)]["pairs"]] == [
+        ("• Software products", "• منتجات البرمجيات"),
+        ("are generic systems", "هي أنظمة عامة")]
+
+    # s_rects resolve against the snapshotted source characters (bullet
+    # included), and the block's target is the reader text, token expanded.
+    path = tmp_path / "sidecar.json"
+    state = translation_sidecar.write_sidecar(
+        docs, path, lang_in="en", lang_out="ar", sources=sources,
+        pair_store=store)
+    assert state is not None
+    block = json.loads(path.read_text(encoding="utf-8"))[
+        "pages"][0]["blocks"][0]
+    assert block["target"] == "• منتجات البرمجيات هي أنظمة عامة"
+    assert all(pair["s_rects"] for pair in block["pairs"])
+
+    # …and t_rects resolve against the typeset characters, bullet included.
+    paragraph.unicode = "• منتجات البرمجيات هي أنظمة عامة"
+    _typeset(paragraph)
+    translation_sidecar.attach_target_rects(state)
+    written = json.loads(path.read_text(encoding="utf-8"))[
+        "pages"][0]["blocks"][0]["pairs"]
+    assert all(pair["t_rects"] for pair in written)
+
+
+def test_a_token_the_model_dropped_from_its_output_discards_at_the_seam():
+    # The model translated but silently ate the bullet token: the raw output
+    # never says {v1}, so validation passes (the pairs do segment that
+    # output) and EXPANSION is what catches the missing token.
+    translator = _capture_translator()
+    bullet = _bullet_formula(1)
+    paragraph = _paragraph("منتجات البرمجيات", _box(60, 680, 400, 714))
+    paragraph.unicode = "منتجات البرمجيات"
+
+    translator._capture_phrase_pairs(
+        paragraph=paragraph,
+        translate_input=ILTranslator.TranslateInput(
+            "{v1}Software products", [bullet]),
+        source_text="{v1}Software products",
+        raw_pairs=[{"s": "{v1} Software products", "t": "منتجات البرمجيات"}])
+
+    assert translator.translation_config.phrase_pair_store == {}
+    assert translator.pairs_kept == 0
+    assert translator.pairs_discarded == 1

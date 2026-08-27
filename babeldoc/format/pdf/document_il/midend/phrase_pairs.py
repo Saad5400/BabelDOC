@@ -1,10 +1,15 @@
 """Phrase-pair alignment: the translation, segmented into aligned phrases.
 
-The LLM that translates a paragraph is also asked — for paragraphs whose input
-carries no formula placeholders; style tags are fine, the phrases cover the
-plain text with the tags stripped — to segment its own work into an ordered
-list of aligned phrase pairs: «We can not»↔«لا يمكننا», «create»↔«إنشاء», and so
-on. Captured into the sidecar (with the page rectangles of each phrase on both
+The LLM that translates a paragraph is also asked to segment its own work into
+an ordered list of aligned phrase pairs: «We can not»↔«لا يمكننا»,
+«create»↔«إنشاء», and so on. Style tags are stripped before anything is
+compared — the phrases cover the plain text — and formula placeholders ride
+along as OPAQUE WORDS: a `{vN}` token counts as one word of both texts (babeldoc
+classifies a slide bullet's «•» as a formula, so on real decks most body
+paragraphs carry one), is validated exactly like any other word, and is
+expanded back to the formula's own text afterwards
+({@link expand_formula_tokens}) so the sidecar stores only real page text.
+Captured into the sidecar (with the page rectangles of each phrase on both
 sides), those pairs are what lets a later layout draw matching soft highlights
 over the source and its translation.
 
@@ -74,6 +79,16 @@ _CONTROLS_RE = re.compile(
     "\u2060\ufeff]"  # word joiner, BOM/ZWNBSP
 )
 
+# A formula placeholder token, in the exact canonical form the translator
+# mints ({@link translator.OpenAITranslator.get_formular_placeholder}) and the
+# prompt orders the model to echo verbatim. Tokenization treats each one as a
+# word of its own even when the source welded it to a neighbour — a bulleted
+# slide line arrives as "{v1}Software products…" — because the model is asked
+# to place the token in a phrase as a separate word. A sloppy echo ("{ v1 }")
+# simply fails validation's token equality, which is the usual fate of any
+# altered word.
+FORMULA_TOKEN_RE = re.compile(r"\{v\d+\}")
+
 # Typesetting bidi-mirrors bracket-like punctuation inside RTL visual runs
 # ("(" is stored as ")"), so each mirror pair is folded to one canonical
 # member before comparison. Derived from typesetting.BIDI_MIRROR_MAP.
@@ -105,7 +120,15 @@ def _fold(text: str) -> str:
 
 
 def _words(text: str) -> list[str]:
-    return text.split()
+    """Word tokens, with each `{vN}` formula token split out as its own word.
+
+    The isolation matters on both sides: the SOURCE welds a bullet's token to
+    the first word ("{v1}Software"), and the model may weld or space its echo
+    in the output; either way the token itself is atomic — it stands for
+    characters no word boundary can enter — and everything around it splits
+    normally.
+    """
+    return FORMULA_TOKEN_RE.sub(lambda m: f" {m.group(0)} ", text).split()
 
 
 class _SearchBudgetError(Exception):
@@ -278,6 +301,65 @@ def validate_pairs(
         {"s": " ".join(_words(pair["s"])), "t": " ".join(_words(t))}
         for pair, t in zip(raw_pairs, t_phrases, strict=True)
     ], permutation
+
+
+def expand_formula_tokens(
+    pairs: list[dict],
+    expansions: dict[str, str],
+) -> list[dict] | None:
+    """VALIDATED pairs with every `{vN}` replaced by its formula's text, or None.
+
+    Validation runs over the tokenized texts, where a `{vN}` is an opaque
+    word; the sidecar must store only real page text — the snapshotted source
+    characters and the typeset target characters both spell the formula's
+    actual glyphs (the bullet «•», the inline symbol), and every downstream
+    consumer (rect matching, gloss highlighting, compose) reads the phrases
+    against those streams. So the LAST step of a capture is this substitution,
+    with `expansions` mapping each canonical token to the text its formula's
+    own characters spell (the same characters {@link
+    il_translator.ILTranslator.parse_translate_output} resolves the token back
+    to).
+
+    Fail-closed rules, in the module's spirit (wrong text is worse than none —
+    any violation discards the whole paragraph's pairs):
+
+    - Every token must be a known key, and the "s" phrases and "t" phrases
+      must carry the SAME token multiset. Validation already pins the "s" side
+      to the source's tokens; a token the model dropped from its translation —
+      or invented on one side only — leaves the sides unequal.
+    - A token whose expansion is empty or whitespace-only is dropped from its
+      phrase; a phrase left EMPTY by that is not merged into a neighbour (the
+      two sides could disagree on which neighbour) — the pairs are discarded.
+
+    Pairs without tokens pass through unchanged.
+    """
+    s_tokens: list[str] = []
+    t_tokens: list[str] = []
+    expanded: list[dict] = []
+
+    for pair in pairs:
+        new_pair: dict[str, str] = {}
+        for side, seen in (("s", s_tokens), ("t", t_tokens)):
+            words: list[str] = []
+            for word in _words(pair[side]):
+                if FORMULA_TOKEN_RE.fullmatch(word):
+                    if word not in expansions:
+                        return None
+                    seen.append(word)
+                    replacement = expansions[word].strip()
+                    if replacement:
+                        words.append(replacement)
+                else:
+                    words.append(word)
+            if not words:
+                return None
+            new_pair[side] = " ".join(words)
+        expanded.append(new_pair)
+
+    if sorted(s_tokens) != sorted(t_tokens):
+        return None
+
+    return expanded
 
 
 def _line_rects(chars: list[tuple[str, tuple | None]]) -> list[list[float]] | None:

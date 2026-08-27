@@ -22,13 +22,15 @@ from babeldoc.format.pdf.document_il.midend.il_translator import (
     DocumentTranslateTracker,
 )
 from babeldoc.format.pdf.document_il.midend import phrase_pairs
-from babeldoc.format.pdf.document_il.midend import translation_sidecar
 from babeldoc.format.pdf.document_il.midend.il_translator import ILTranslator
 from babeldoc.format.pdf.document_il.midend.il_translator import PageTranslateTracker
 from babeldoc.format.pdf.document_il.midend.il_translator import (
     ParagraphTranslateTracker,
 )
 from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper
+from babeldoc.format.pdf.document_il.utils.layout_helper import (
+    get_char_unicode_string,
+)
 from babeldoc.format.pdf.document_il.utils.paragraph_helper import is_cid_paragraph
 from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
     is_placeholder_only_paragraph,
@@ -104,18 +106,22 @@ $json_input_str"""
 
 
 # Appended to the prompt only when at least one item in the batch is marked
-# "want_pairs" (a paragraph whose input carries no formula placeholders — a
-# {vN} stands in for characters the model never sees, so full-text coverage
-# is impossible. Style tags — <style id='N'> — merely wrap text the model
-# does see, and the phrases cover the PLAIN text, tags removed).
-# The rules here are the exact contract phrase_pairs.validate_pairs enforces;
-# pairs that break it are discarded per paragraph, never repaired.
+# "want_pairs". Style tags — <style id='N'> — merely wrap text the model does
+# see, and the phrases cover the PLAIN text, tags removed. Formula
+# placeholders — {vN}, standing in for characters the model never sees (on
+# real slides, most often just the bullet glyph «•») — ride the phrases as
+# OPAQUE WORDS: each token sits inside exactly one phrase on each side, and
+# the capture seam expands it back to the formula's own text afterwards.
+# The rules here are the exact contract phrase_pairs.validate_pairs (and
+# phrase_pairs.expand_formula_tokens) enforces; pairs that break it are
+# discarded per paragraph, never repaired.
 PHRASE_PAIRS_PROMPT_BLOCK = """
 ## Phrase Pairs
 For every input item that has "want_pairs": true, ALSO add a "pairs" field to that output item: a JSON array of {"s": <source phrase>, "t": <translated phrase>} objects segmenting BOTH texts completely.
 - Align by MEANING: each "t" is the translation of its "s". List the pairs in the SOURCE text's order; each "t" phrase will be located in your output wherever your translation actually put it — the two languages may order the phrases differently, and that is fine. NEVER pair a phrase with target words that merely occupy the same position.
 - Split into 2-8 phrases; longer sentences get more phrases.
 - The phrases cover the PLAIN text: read both the item's "input" and your "output" with every <style id='N'>...</style> tag removed, keeping each tag's inner text in place. NEVER put a tag, or any part of one, inside an "s" or "t" phrase.
+- Placeholders like {v1} are OPAQUE WORDS of both texts: put each one inside EXACTLY ONE "s" phrase and EXACTLY ONE "t" phrase, at the spot where it sits in that text. NEVER split, alter, or drop such a token, and NEVER make a phrase that is ONLY tokens — a leading bullet's token belongs to the phrase that follows it, as in {"s": "{v1} Software products", "t": "{v1} منتجات البرمجيات"}.
 - Every word of that plain input must appear in exactly one "s" phrase, and every word of your plain output in exactly one "t" phrase: concatenating all "s" values with single spaces reproduces the plain input exactly, and the "t" values, rearranged into your output's own order, reproduce the plain output exactly.
 - Split ONLY between whole words. NEVER split inside a word.
 - Items without "want_pairs" must NOT get a "pairs" field.
@@ -146,23 +152,64 @@ Note how the Arabic starts with «يجب الإعلان عن» even though its p
 """
 
 
+# How many formula placeholders a paragraph may carry and still be asked for
+# pairs. A formula token is an opaque WORD to the pairing contract, so a
+# handful (a bullet glyph, an inline symbol or two) costs nothing — but a
+# paragraph that is MOSTLY formulas (a derivation, a table row of equations)
+# has next to no prose to align, and each token is one more chance for the
+# model to drop or duplicate one and void the whole paragraph's pairs. Ten is
+# comfortably past any real prose paragraph and comfortably short of the
+# degenerate ones.
+MAX_PAIR_FORMULAS = 10
+
+
 def pairs_eligible(translate_input: "ILTranslator.TranslateInput") -> bool:
     """Whether a paragraph's translate input may carry phrase pairs.
 
-    A formula placeholder ({vN}) REPLACES source characters with an opaque
-    token — the model never sees the text underneath, so its phrases cannot
-    cover the source completely, and the paragraph is excluded. A style
-    placeholder (<style id='N'>...</style>) merely WRAPS text the model does
-    see: on real lecture slides nearly every body bullet carries one (the
-    bullet glyph alone is a different font run), and excluding those would
-    exclude exactly the sentences the pairs exist for. The phrases then cover
-    the plain text, the input with the wrappers removed
-    ({@link strip_style_placeholders}).
+    A style placeholder (<style id='N'>...</style>) merely WRAPS text the
+    model does see; the phrases cover the plain text, the input with the
+    wrappers removed ({@link strip_style_placeholders}). A formula
+    placeholder ({vN}) REPLACES source characters with an opaque token — but
+    the pairing contract treats that token as an opaque WORD the model
+    carries into exactly one phrase on each side, and the capture seam
+    expands it back to the formula's own text ({@link
+    phrase_pairs.expand_formula_tokens}), so formulas no longer disqualify.
+    This matters on real decks: babeldoc classifies the bullet glyph «•» as a
+    formula, so under the old rule every bulleted body paragraph — most of a
+    slide deck's content — was excluded. Only degenerate formula-HEAVY
+    paragraphs (more than {@link MAX_PAIR_FORMULAS} tokens) stay out: barely
+    any prose to align, many chances to void the pairs.
     """
-    return not any(
-        isinstance(placeholder, il_translator.FormulaPlaceholder)
-        for placeholder in translate_input.placeholders
+    return (
+        sum(
+            isinstance(placeholder, il_translator.FormulaPlaceholder)
+            for placeholder in translate_input.placeholders
+        )
+        <= MAX_PAIR_FORMULAS
     )
+
+
+def formula_expansions(placeholders) -> dict[str, str]:
+    """Each formula token mapped to the text its formula's characters spell.
+
+    The same resolution {@link ILTranslator.parse_translate_output} performs
+    when it swaps a `{vN}` back for its formula composition: the composition's
+    `pdf_character` list, read through `get_char_unicode_string` — exactly how
+    the sidecar's `_target_text` will later read the very same characters, so
+    an expanded phrase and the block's target text agree on what the formula
+    says. A formula with no characters expands to "" (the token is simply
+    dropped from its phrase — see phrase_pairs.expand_formula_tokens).
+    """
+    return {
+        placeholder.placeholder: (
+            get_char_unicode_string(placeholder.formula.pdf_character)
+            if placeholder.formula is not None
+            and placeholder.formula.pdf_character
+            else ""
+        )
+        for placeholder in placeholders
+        if isinstance(placeholder, il_translator.FormulaPlaceholder)
+    }
 
 
 def strip_style_placeholders(text: str, placeholders) -> str:
@@ -247,9 +294,9 @@ class ILTranslatorLLMOnly:
         # Phrase-pair alignment (see phrase_pairs.py). Off when the config
         # says so — and off whenever no sidecar was asked for, because the
         # sidecar is the only place pairs can land: asking would spend prompt
-        # tokens on answers nobody keeps. Paragraphs whose input carries
-        # formula placeholders never take part ({@link pairs_eligible}), and
-        # the fallback translator (il_translator) never produces pairs at all.
+        # tokens on answers nobody keeps. Degenerate formula-heavy paragraphs
+        # never take part ({@link pairs_eligible}), and the fallback
+        # translator (il_translator) never produces pairs at all.
         self.capture_phrase_pairs = bool(
             getattr(translation_config, "capture_phrase_pairs", False)
             and getattr(translation_config, "translation_sidecar_path", None)
@@ -809,11 +856,13 @@ class ILTranslatorLLMOnly:
                     and self.translation_config.add_formula_placehold_hint
                 ):
                     obj["formula_placeholders_hint"] = placeholders_hint
-                # Pairs are requested unless the input hides characters: a
-                # {vN} formula placeholder REPLACES source text the model
-                # never sees, so its phrases could never cover it. Style
-                # placeholders merely WRAP text the model does see — the
-                # phrases cover the input with the tags stripped.
+                # Pairs are requested for formula-bearing paragraphs too: a
+                # {vN} token is an opaque WORD the model carries into exactly
+                # one phrase on each side, expanded back to the formula's own
+                # text at the capture seam. Style placeholders merely WRAP
+                # text the model does see — the phrases cover the input with
+                # the tags stripped. Only degenerate formula-heavy paragraphs
+                # sit out ({@link pairs_eligible}).
                 if self.capture_phrase_pairs and pairs_eligible(ti):
                     obj["want_pairs"] = True
                 json_format_input.append(obj)
@@ -1051,19 +1100,27 @@ class ILTranslatorLLMOnly:
     ) -> None:
         """Validate one paragraph's pairs and file them for the sidecar.
 
-        Called only after the translation was APPLIED, so the paragraph's
-        compositions hold the final parsed target (post-processing included).
-        Both sides are validated against the PLAIN texts, because for a
-        styled paragraph the raw strings still carry `<style id='N'>` tags:
-        the source side is `source_text` with the style wrappers stripped
-        ({@link strip_style_placeholders}) — the text the prompt told the
-        model its "s" phrases cover, and character-for-character the
-        snapshotted source the sidecar resolves s_rects against — and the
-        target side is `translation_sidecar._target_text`, the exact string
-        the sidecar reports as the block's target (NOT `paragraph.unicode`,
-        which is the raw tagged output), so the stored "t" phrases tile what
-        every consumer actually reads. Any violation discards the pairs for
-        this paragraph alone; the translation itself is already safe. Never
+        Called only after the translation was APPLIED, so `paragraph.unicode`
+        holds the exact string post_translate_paragraph applied: the model's
+        raw output, post-processed (Arabic diacritics stripped, operator
+        spacing fixed), with its `<style id='N'>` tags and `{vN}` tokens
+        still intact. Both sides are validated against the TOKENIZED PLAIN
+        texts — style wrappers stripped ({@link strip_style_placeholders}),
+        formula tokens KEPT, each counting as one opaque word: the source
+        side is `source_text` so stripped, the text the prompt told the model
+        its "s" phrases cover; the target side is `paragraph.unicode` so
+        stripped — the raw output rather than the sidecar's expanded target
+        text, because the model segmented ITS OWN output, tokens and all, and
+        only against that string do the token words line up.
+
+        Validation is then followed by EXPANSION ({@link
+        phrase_pairs.expand_formula_tokens} with {@link formula_expansions}):
+        each `{vN}` in the validated phrase strings becomes the formula's
+        actual text, so what lands in the store — and from there in the
+        sidecar — is only real page text, matching the snapshotted source
+        characters and the typeset target characters that rect resolution
+        reads. Any violation at either step discards the pairs for this
+        paragraph alone; the translation itself is already safe. Never
         raises: pairs are a bonus, and a bug here must not cost a paid
         paragraph its fallback accounting.
         """
@@ -1076,15 +1133,22 @@ class ILTranslatorLLMOnly:
             if store is None:
                 return
 
+            pairs = None
             validated = phrase_pairs.validate_pairs(
                 raw_pairs,
                 strip_style_placeholders(
                     source_text, translate_input.placeholders
                 ),
-                translation_sidecar._target_text(paragraph),
+                strip_style_placeholders(
+                    paragraph.unicode or "", translate_input.placeholders
+                ),
             )
             if validated:
                 pairs, permutation = validated
+                pairs = phrase_pairs.expand_formula_tokens(
+                    pairs, formula_expansions(translate_input.placeholders)
+                )
+            if pairs is not None:
                 store[id(paragraph)] = {"pairs": pairs, "perm": permutation}
                 self.pairs_kept += 1
             else:
