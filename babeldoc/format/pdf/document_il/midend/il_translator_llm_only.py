@@ -234,6 +234,11 @@ class ILTranslatorLLMOnly:
 
     def translate(self, docs: Document) -> None:
         self.il_translator.docs = docs
+        store = getattr(self.translation_config, "phrase_pair_store", None)
+        if store is not None:
+            # A reused config must not carry pairs keyed by a previous
+            # document's (since freed) paragraph ids into this one.
+            store.clear()
         tracker = DocumentTranslateTracker()
         self.mid = 0
 

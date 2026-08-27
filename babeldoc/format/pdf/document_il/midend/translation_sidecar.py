@@ -463,9 +463,13 @@ def attach_target_rects(state: dict[str, Any] | None) -> None:
                 logger.exception("sidecar: target rects failed for a paragraph")
 
         if resolved_any:
-            state["path"].write_text(
+            # Atomic rewrite: a kill or full disk mid-write must leave the
+            # valid pre-typesetting file, never a truncated one.
+            tmp = state["path"].with_suffix(".rects.tmp")
+            tmp.write_text(
                 json.dumps(state["sidecar"], ensure_ascii=False),
                 encoding="utf-8",
             )
+            tmp.replace(state["path"])
     except Exception:  # noqa: BLE001 - the PDF is finished; nothing here may fail it
         logger.exception("failed to attach target rects to the sidecar")
