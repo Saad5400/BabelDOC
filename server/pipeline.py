@@ -139,6 +139,9 @@ def _run_babeldoc(job_id: str, input_pdf: Path, out_dir: Path, *, lang_in: str,
         glossaries=glossaries,
         auto_extract_glossary=False,
         translation_sidecar_path=sidecar_path,
+        # Phrase pairs ride the sidecar; without one there is nowhere to put
+        # them, so don't spend prompt tokens asking (dual runs, PHRASE_PAIRS=0).
+        capture_phrase_pairs=config.PHRASE_PAIRS and sidecar_path is not None,
     )
 
     span = _P_BABELDOC_END - progress_base

@@ -37,6 +37,15 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 GLOSSARY_PAGES = (os.environ.get("GLOSSARY_PAGES", "1").strip().lower()
                   not in ("0", "false", "no", "off"))
 
+# Phrase-pair alignment — the translating LLM also segments each paragraph
+# into aligned source↔target phrases, captured into the sidecar ("pairs" on
+# its blocks, with the page rects of each phrase on both sides) for a later
+# highlight overlay. On by default; PHRASE_PAIRS=0 (or false/no/off) stops
+# requesting pairs entirely: prompt and sidecar are exactly as before.
+# See babeldoc/format/pdf/document_il/midend/phrase_pairs.py.
+PHRASE_PAIRS = (os.environ.get("PHRASE_PAIRS", "1").strip().lower()
+                not in ("0", "false", "no", "off"))
+
 GLOSSARY_PATH = SERVER_DIR / "glossary_ar_cs.csv"
 OCR_PREP_SCRIPT = SERVER_DIR / "ocr_prep.py"
 FIX_LAYER_ORDER_SCRIPT = SERVER_DIR / "fix_layer_order.py"
