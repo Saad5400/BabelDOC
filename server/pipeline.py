@@ -271,11 +271,7 @@ def _append_glossary(output_pdf: Path, sidecar_path: Path) -> None:
         return
 
     sidecar_data["glossary"] = entries
-    try:
-        sidecar_path.write_text(json.dumps(sidecar_data, ensure_ascii=False),
-                                encoding="utf-8")
-    except Exception:  # noqa: BLE001
-        logger.exception("glossary: could not write entries into the sidecar")
+    _write_sidecar(sidecar_path, sidecar_data)
 
     if not entries:
         return
@@ -301,6 +297,97 @@ def _append_glossary(output_pdf: Path, sidecar_path: Path) -> None:
     except Exception:  # noqa: BLE001 - the appendix must never lose the run
         logger.exception("glossary: appending pages failed; the result ships "
                          "without them")
+
+
+def _write_sidecar(sidecar_path: Path, data: dict) -> None:
+    try:
+        sidecar_path.write_text(json.dumps(data, ensure_ascii=False),
+                                encoding="utf-8")
+    except Exception:  # noqa: BLE001 - the sidecar update is best-effort
+        logger.exception("could not write the updated sidecar")
+
+
+def _insert_vocab(output_pdf: Path, sidecar_path: Path) -> None:
+    """The «كلمات هذه الصفحة» step: pick each page's new English words, record
+    them in the sidecar, interleave the compact vocab pages into the result —
+    page N's words IMMEDIATELY after page N, never deferred to the end.
+
+    Runs AFTER {@link _append_glossary} on purpose: the deep terms it selected
+    are this pass's exclusion list (the two layers never explain the same word
+    twice), and the terms tail it appended simply shifts back as body pages are
+    inserted, staying at the very end.
+
+    The baked layout is recorded in the sidecar as
+    `"artifact_layout": {"content_pages": [...]}` — where each translated
+    content page ended up in the mono file — which is what lets /v1/compose
+    later take the content pages back out EXACTLY instead of tail-trimming.
+    Written only when pages were really inserted: an untouched mono is still
+    described perfectly by `total_pages`.
+
+    Best-effort at every seam (the glossary step's posture): the paid
+    translation is on disk and NOTHING here may lose it.
+    """
+    from server import vocab
+
+    try:
+        sidecar_data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - no sidecar, no vocab
+        logger.exception("vocab: could not read the sidecar; skipping")
+        return
+
+    exclude = [entry.get("term")
+               for entry in sidecar_data.get("glossary") or []
+               if isinstance(entry, dict) and entry.get("term")]
+
+    try:
+        entries = vocab.extract_vocab(sidecar_data, exclude=exclude)
+    except Exception:  # noqa: BLE001 - belt and braces on the {} contract
+        logger.exception("vocab: extract_vocab broke its never-raise "
+                         "contract; skipping")
+        return
+
+    sidecar_data["vocab"] = entries
+    _write_sidecar(sidecar_path, sidecar_data)
+
+    if not entries:
+        return
+
+    content = sidecar_data.get("total_pages")
+
+    if not isinstance(content, int) or isinstance(content, bool) or content <= 0:
+        content = len(sidecar_data.get("pages") or [])
+
+    try:
+        import pymupdf
+
+        from server import vocab_pages
+
+        doc = pymupdf.open(str(output_pdf))
+        try:
+            content = min(content, doc.page_count) or doc.page_count
+            added = vocab_pages.interleave_vocab(
+                doc, entries, {number: number for number in range(content)})
+            if not added:
+                return
+            # A full save via a sibling temp file, garbage=4 — exactly the
+            # glossary append's reasons (see _append_glossary).
+            tmp = output_pdf.with_name(output_pdf.name + ".vocab.tmp")
+            doc.save(str(tmp), garbage=4, deflate=True)
+        finally:
+            doc.close()
+        tmp.replace(output_pdf)
+    except Exception:  # noqa: BLE001 - the vocab layer must never lose the run
+        logger.exception("vocab: inserting pages failed; the result ships "
+                         "without them")
+        return
+
+    # Only now — the mono on disk really carries the interleaved layout.
+    positions, shift = [], 0
+    for number in range(content):
+        positions.append(number + shift)
+        shift += added.get(number, 0)
+    sidecar_data["artifact_layout"] = {"content_pages": positions}
+    _write_sidecar(sidecar_path, sidecar_data)
 
 
 def run_job(job_id: str) -> None:
@@ -376,6 +463,15 @@ def run_job(job_id: str) -> None:
     if sidecar is not None and sidecar.is_file() and config.GLOSSARY_PAGES:
         _set_progress(job_id, 98.0, "glossary")
         _append_glossary(output_pdf, sidecar)
+
+    # «كلمات هذه الصفحة»: a second, lighter LLM pass picks each page's new
+    # general-English words (the glossary's chosen terms excluded), records
+    # them in the sidecar ("vocab" key) and interleaves the compact vocab
+    # pages into the result — after the glossary step, so the exclusion list
+    # exists and the terms tail stays at the very end.
+    if sidecar is not None and sidecar.is_file() and config.VOCAB_PAGES:
+        _set_progress(job_id, 98.5, "vocab")
+        _insert_vocab(output_pdf, sidecar)
 
     if job.get("title"):
         _set_pdf_title(output_pdf, job["title"])

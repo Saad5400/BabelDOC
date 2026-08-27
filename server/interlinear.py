@@ -896,6 +896,36 @@ def render_overlay(original_bytes: bytes, sidecar: Any,
             skipped += page_skipped
             pages += 1
 
+        # A sidecar that carries "vocab" (server/vocab.py wrote it after the
+        # mono run) gets the same «كلمات هذه الصفحة» pages the mono result
+        # has: each original page is followed by its own new-words page.
+        # Inserted BEFORE the glossary tail below, so the terms stay at the
+        # very end. Best-effort: an overlay must not fail over its vocab
+        # layer. Lazy import — vocab_pages shares glossary_pages' machinery,
+        # which imports this module for the font subsetter.
+        vocab_added = 0
+
+        if config.VOCAB_PAGES and isinstance(sidecar.get("vocab"), dict):
+            from server import vocab_pages
+
+            anchors = {}
+
+            for key in sidecar["vocab"]:
+                try:
+                    number = int(key)
+                except (TypeError, ValueError):
+                    continue
+
+                if 0 <= number < doc.page_count:
+                    anchors[number] = number
+
+            try:
+                vocab_added = sum(vocab_pages.interleave_vocab(
+                    doc, sidecar["vocab"], anchors).values())
+            except Exception:  # noqa: BLE001 - the vocab layer is optional
+                logger.exception("interlinear: inserting vocab pages failed; "
+                                 "returning the overlay without them")
+
         # A sidecar that carries "glossary" entries (server/terms.py wrote them
         # after the mono run) gets the same «شرح المصطلحات» pages the mono
         # result has, appended after the overlaid document. Best-effort: an
@@ -924,6 +954,7 @@ def render_overlay(original_bytes: bytes, sidecar: Any,
 
         return out.getvalue(), {"pages": pages, "drawn": drawn,
                                 "skipped": skipped,
-                                "glossary_pages": glossary_added}
+                                "glossary_pages": glossary_added,
+                                "vocab_pages": vocab_added}
     finally:
         doc.close()

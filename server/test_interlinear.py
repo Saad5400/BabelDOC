@@ -117,7 +117,8 @@ def test_gloss_lands_in_the_band_above_its_paragraph():
 
     pdf, report = _render(original, sidecar)
 
-    assert report == {"pages": 1, "drawn": 1, "skipped": 0, "glossary_pages": 0}
+    assert report == {"pages": 1, "drawn": 1, "skipped": 0, "glossary_pages": 0,
+                      "vocab_pages": 0}
 
     arabic = [rect for rect, text in _drawn_spans(pdf) if _is_arabic(text)]
     assert arabic, "no Arabic was drawn"
@@ -276,7 +277,8 @@ def test_a_merged_bullet_list_is_spread_over_its_own_lines():
 
     pdf, report = _render(original, sidecar)
 
-    assert report == {"pages": 1, "drawn": 1, "skipped": 0, "glossary_pages": 0}
+    assert report == {"pages": 1, "drawn": 1, "skipped": 0, "glossary_pages": 0,
+                      "vocab_pages": 0}
     # One gloss band per bullet, each above its own bullet — not one lump.
     bands = sorted({round(rect.y0, 1) for rect, text in _drawn_spans(pdf)
                     if _is_arabic(text)})
@@ -397,7 +399,8 @@ def test_a_paragraph_at_the_very_top_is_skipped_not_pushed_off_the_page():
 
     pdf, report = _render(original, sidecar)
 
-    assert report == {"pages": 1, "drawn": 0, "skipped": 1, "glossary_pages": 0}
+    assert report == {"pages": 1, "drawn": 0, "skipped": 1, "glossary_pages": 0,
+                      "vocab_pages": 0}
     assert not [rect for rect, text in _drawn_spans(pdf) if _is_arabic(text)]
 
 
@@ -422,7 +425,8 @@ def test_a_stroked_frame_frees_its_inside_but_keeps_its_edge():
     pdf, report = _render(framed.getvalue(), sidecar)
 
     # Drawn — the inside of the frame was free all along…
-    assert report == {"pages": 1, "drawn": 1, "skipped": 0, "glossary_pages": 0}
+    assert report == {"pages": 1, "drawn": 1, "skipped": 0, "glossary_pages": 0,
+                      "vocab_pages": 0}
 
     # …and still clear of the edge the frame actually drew.
     glosses = [rect for rect, text in _drawn_spans(pdf) if _is_arabic(text)]
@@ -618,3 +622,75 @@ def test_endpoint_requires_the_token(client):
                  token=None)
 
     assert resp.status_code == 401
+
+
+# --------------------------------------------------------------------------
+# Vocab pages: «كلمات هذه الصفحة» interleaved into the overlay
+# --------------------------------------------------------------------------
+
+VOCAB = {"0": [{"w": "inevitable", "ar": "حتمي، لا مفر منه"}]}
+
+
+def _page_texts(pdf_bytes: bytes) -> list[str]:
+    doc = pymupdf.open(stream=BytesIO(pdf_bytes), filetype="pdf")
+
+    try:
+        return [doc[i].get_text() for i in range(doc.page_count)]
+    finally:
+        doc.close()
+
+
+def test_a_pages_vocab_page_follows_it():
+    original = _page_pdf([(60, 300, 500, 340, "Software change is inevitable")])
+    sidecar = _sidecar([{"box": (60, 300, 400, 314), "target": AR_ONE}])
+    sidecar["vocab"] = VOCAB
+
+    result, report = _render(original, sidecar)
+
+    assert report["vocab_pages"] == 1
+    texts = _page_texts(result)
+    assert len(texts) == 2
+    assert "inevitable" in texts[0]  # the original page, glossed
+    assert "inevitable" in texts[1]  # its vocab page, right behind it
+
+
+def test_the_glossary_tail_still_comes_after_the_vocab_pages():
+    original = _page_pdf([(60, 300, 500, 340, "Software change is inevitable")])
+    sidecar = _sidecar([{"box": (60, 300, 400, 314), "target": AR_ONE}])
+    sidecar["vocab"] = VOCAB
+    sidecar["glossary"] = [{"term": "Wrapping", "arabic": "التغليف",
+                            "explanation": "شرح ودّي.", "page": 1,
+                            "quote": None}]
+
+    result, report = _render(original, sidecar)
+
+    assert report["vocab_pages"] == 1
+    assert report["glossary_pages"] == 1
+    texts = _page_texts(result)
+    assert len(texts) == 3
+    assert "inevitable" in texts[1]  # vocab in the body
+    assert "Wrapping" in texts[2]    # terms at the very end
+
+
+def test_a_sidecar_without_vocab_adds_nothing():
+    original = _page_pdf([(60, 300, 500, 340, "Software change is inevitable")])
+    sidecar = _sidecar([{"box": (60, 300, 400, 314), "target": AR_ONE}])
+
+    result, report = _render(original, sidecar)
+
+    assert report["vocab_pages"] == 0
+    assert len(_page_texts(result)) == 1
+
+
+def test_the_vocab_kill_switch_disables_the_insert(monkeypatch):
+    from server import config
+    monkeypatch.setattr(config, "VOCAB_PAGES", False)
+
+    original = _page_pdf([(60, 300, 500, 340, "Software change is inevitable")])
+    sidecar = _sidecar([{"box": (60, 300, 400, 314), "target": AR_ONE}])
+    sidecar["vocab"] = VOCAB
+
+    result, report = _render(original, sidecar)
+
+    assert report["vocab_pages"] == 0
+    assert len(_page_texts(result)) == 1

@@ -152,6 +152,46 @@ def _glossary_entries(sidecar) -> list | None:
     return entries
 
 
+def _artifact_content_positions(sidecar, page_count: int) -> list[int] | None:
+    """The baked mono's content-page positions, when the sidecar records them.
+
+    A mono whose vocab pages were interleaved (server/pipeline.py) records
+    `"artifact_layout": {"content_pages": [...]}` — index i is where content
+    page i sits in the baked file. That generalizes the tail-trim below: the
+    content pages are picked out EXACTLY, and everything else (interleaved
+    vocab pages, the glossary tail) is dropped and rendered fresh instead.
+
+    None means "no usable layout" and the caller falls back to the
+    total_pages tail-trim — which keeps every pre-feature sidecar working
+    unchanged. The sidecar is uploader-supplied here, so the list is
+    distrusted: anything but strictly increasing ints is refused whole, and a
+    position past the file is skipped (the layout describes a longer file
+    than the one sent; the pages that do exist still pair correctly).
+    """
+    if not isinstance(sidecar, dict):
+        return None
+
+    layout = sidecar.get("artifact_layout")
+
+    if not isinstance(layout, dict):
+        return None
+
+    positions = layout.get("content_pages")
+
+    if not isinstance(positions, list) or not positions:
+        return None
+
+    for index, position in enumerate(positions):
+        if not isinstance(position, int) or isinstance(position, bool):
+            return None
+        if position < 0 or (index and position <= positions[index - 1]):
+            return None
+
+    kept = [position for position in positions if position < page_count]
+
+    return kept or None
+
+
 def _content_page_count(sidecar: dict) -> int | None:
     """How many pages the TRANSLATION itself has, per the sidecar's records.
 
@@ -193,6 +233,62 @@ def _append_glossary(composed: bytes, entries: list) -> bytes:
         doc.close()
 
 
+def _insert_vocab_pages(composed: bytes, sidecar: dict, fmt: str,
+                        original_count: int, content_count: int) -> bytes:
+    """`composed` with each page's vocab page after its pair — or unchanged.
+
+    Content page N's vocab follows page N's whole unit in the dual: the
+    (original, translated) pair for `alternating`, the wide page for
+    `side_by_side`. A content page past the original (the translated-longer
+    tail) sits whole at the end, and its vocab page follows it there. Failure
+    posture matches _append_glossary: this dual cost the caller nothing, and
+    its vocab layer may not break it.
+    """
+    vocab = sidecar.get("vocab")
+
+    if not isinstance(vocab, dict) or not vocab:
+        return composed
+
+    import pymupdf
+
+    from server import vocab_pages
+
+    anchors: dict[int, int] = {}
+
+    for key in vocab:
+        try:
+            number = int(key)
+        except (TypeError, ValueError):
+            continue
+
+        if number < 0 or (number >= original_count
+                          and number >= content_count):
+            continue  # no such content page in this dual
+
+        if fmt == "alternating":
+            anchors[number] = (2 * number + 1 if number < original_count
+                               else original_count + number)
+        else:
+            anchors[number] = number
+
+    if not anchors:
+        return composed
+
+    doc = pymupdf.open(stream=BytesIO(composed), filetype="pdf")
+
+    try:
+        if not vocab_pages.interleave_vocab(doc, vocab, anchors):
+            return composed
+
+        out = BytesIO()
+        # garbage=4 folds the per-box copies of the subset row font into one.
+        doc.save(out, garbage=4, deflate=True)
+
+        return out.getvalue()
+    finally:
+        doc.close()
+
+
 def compose_dual(original_bytes: bytes, translated_bytes: bytes,
                  fmt: str, sidecar: dict | None = None) -> bytes:
     """Build the requested dual variant; raises ComposeError on bad input.
@@ -218,8 +314,13 @@ def compose_dual(original_bytes: bytes, translated_bytes: bytes,
 
     translated_pages = list(translated.pages)
     entries = _glossary_entries(sidecar)
+    positions = _artifact_content_positions(sidecar, len(translated_pages))
 
-    if entries is not None:
+    if positions is not None:
+        # The baked mono's own interleaved vocab pages and glossary tail are
+        # dropped here and rendered fresh below, at the composed layout.
+        translated_pages = [translated_pages[i] for i in positions]
+    elif entries is not None:
         content = _content_page_count(sidecar)
         if content is not None and content < len(translated_pages):
             # Drop the mono result's baked-in glossary tail; the entries are
@@ -230,6 +331,17 @@ def compose_dual(original_bytes: bytes, translated_bytes: bytes,
     out = BytesIO()
     build(original, translated_pages).write(out)
     composed = out.getvalue()
+
+    # Vocab pages first (they live in the body, after each pair), then the
+    # glossary (it tails the whole document). Both best-effort.
+    if config.VOCAB_PAGES and isinstance(sidecar, dict):
+        try:
+            composed = _insert_vocab_pages(composed, sidecar, fmt,
+                                           len(original.pages),
+                                           len(translated_pages))
+        except Exception:  # noqa: BLE001 - the vocab layer is optional
+            logger.exception("compose: inserting vocab pages failed; "
+                             "returning the dual without them")
 
     if entries is not None:
         try:

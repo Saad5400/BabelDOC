@@ -182,7 +182,7 @@ GLOSSARY = [{"term": "Wrapping", "arabic": "التغليف",
              "page": 1, "quote": "wrapper classes"}]
 
 
-def _sidecar_json(total_pages, glossary=None):
+def _sidecar_json(total_pages, glossary=None, vocab=None, artifact_layout=None):
     data = {"version": 1, "lang_in": "en", "lang_out": "ar",
             "total_pages": total_pages,
             "pages": [{"page_number": i, "mediabox": [0, 0, *A4],
@@ -190,6 +190,10 @@ def _sidecar_json(total_pages, glossary=None):
                       for i in range(total_pages)]}
     if glossary is not None:
         data["glossary"] = glossary
+    if vocab is not None:
+        data["vocab"] = vocab
+    if artifact_layout is not None:
+        data["artifact_layout"] = artifact_layout
     return json.dumps(data)
 
 
@@ -277,3 +281,134 @@ def test_a_malformed_sidecar_is_422(client, original_pdf, translated_pdf):
     resp = _post_with_sidecar(client, original_pdf, translated_pdf,
                               "alternating", "{not json")
     assert resp.status_code == 422
+
+
+# --------------------------------------------------------------------------
+# The vocab part: «كلمات هذه الصفحة» pages interleaved into the dual
+# --------------------------------------------------------------------------
+
+VOCAB = {"0": [{"w": "declared", "ar": "يُصرَّح عنه"}],
+         "1": [{"w": "evolved", "ar": "تطوَّر", "note": "تغيَّر مع الوقت"}]}
+
+
+def _page_text(response, index):
+    """Text of one page of the response PDF, via pymupdf (see _tail_text)."""
+    import pymupdf
+
+    doc = pymupdf.open(stream=BytesIO(response.content), filetype="pdf")
+    try:
+        return doc[index].get_text()
+    finally:
+        doc.close()
+
+
+def test_alternating_puts_each_vocab_page_after_its_pair(client):
+    original, translated = _pdf([LETTER] * 2), _pdf([A4] * 2)
+    resp = _post_with_sidecar(client, original, translated, "alternating",
+                              _sidecar_json(2, vocab=VOCAB))
+    assert resp.status_code == 200
+    pages = _pages(resp)
+    # o0 t0 v0 o1 t1 v1
+    assert len(pages) == 6
+    assert [_size(p) for p in pages] == [LETTER, A4, A4, LETTER, A4, A4]
+    assert "declared" in _page_text(resp, 2)
+    assert "evolved" in _page_text(resp, 5)
+
+
+def test_side_by_side_puts_each_vocab_page_after_its_wide_page(client):
+    original, translated = _pdf([LETTER] * 2), _pdf([A4] * 2)
+    resp = _post_with_sidecar(client, original, translated, "side_by_side",
+                              _sidecar_json(2, vocab=VOCAB))
+    assert resp.status_code == 200
+    pages = _pages(resp)
+    # wide0 v0 wide1 v1 — the vocab page is sized like the wide page before it.
+    assert len(pages) == 4
+    wide = (2 * max(LETTER[0], A4[0]), max(LETTER[1], A4[1]))
+    assert [_size(p) for p in pages] == [wide] * 4
+    assert "declared" in _page_text(resp, 1)
+    assert "evolved" in _page_text(resp, 3)
+
+
+def test_vocab_and_glossary_share_a_dual_with_the_terms_last(client):
+    original, translated = _pdf([LETTER] * 2), _pdf([A4] * 2)
+    resp = _post_with_sidecar(client, original, translated, "alternating",
+                              _sidecar_json(2, glossary=GLOSSARY, vocab=VOCAB))
+    assert resp.status_code == 200
+    pages = _pages(resp)
+    # o0 t0 v0 o1 t1 v1 + the terms tail.
+    assert len(pages) == 7
+    assert "declared" in _page_text(resp, 2)
+    assert "Wrapping" in _tail_text(resp, 6)
+
+
+def test_artifact_layout_takes_the_content_pages_back_out_exactly(client):
+    # A baked mono as the pipeline now writes it: content page 0, its vocab
+    # page (odd size marks it), content page 1, the terms tail (another odd
+    # size). The sidecar records where the content pages sit; the dual must
+    # rebuild from JUST those and render vocab + terms fresh.
+    original = _pdf([LETTER] * 2)
+    translated = _pdf([A4, (400.0, 400.0), A4, (500.0, 500.0)])
+    resp = _post_with_sidecar(
+        client, original, translated, "alternating",
+        _sidecar_json(2, glossary=GLOSSARY, vocab=VOCAB,
+                      artifact_layout={"content_pages": [0, 2]}))
+    assert resp.status_code == 200
+    pages = _pages(resp)
+    sizes = [_size(p) for p in pages]
+    assert (400.0, 400.0) not in sizes  # the baked vocab page was dropped
+    assert (500.0, 500.0) not in sizes  # the baked terms tail was dropped
+    assert sizes[:6] == [LETTER, A4, A4, LETTER, A4, A4]
+    assert "declared" in _page_text(resp, 2)  # rendered fresh, right place
+    assert "evolved" in _page_text(resp, 5)
+    assert "Wrapping" in _tail_text(resp, 6)  # terms still tail the document
+
+
+def test_a_pre_feature_sidecar_still_tail_trims_by_total_pages(client):
+    # No "vocab", no "artifact_layout" — a sidecar from before this feature.
+    # Exactly yesterday's behavior: the glossary tail past total_pages is
+    # dropped, nothing is interleaved.
+    original = _pdf([LETTER] * 2)
+    translated = _pdf([A4] * 2 + [(500.0, 500.0)])
+    resp = _post_with_sidecar(client, original, translated, "alternating",
+                              _sidecar_json(2, glossary=GLOSSARY))
+    assert resp.status_code == 200
+    pages = _pages(resp)
+    assert (500.0, 500.0) not in [_size(p) for p in pages]
+    assert [_size(p) for p in pages[:4]] == [LETTER, A4, LETTER, A4]
+    assert "Wrapping" in _tail_text(resp, 4)
+
+
+def test_a_crafted_artifact_layout_is_refused_whole(client):
+    # Duplicated / non-increasing positions would double pages; the layout is
+    # ignored and the total_pages tail-trim takes over.
+    original = _pdf([LETTER] * 2)
+    translated = _pdf([A4] * 2 + [(500.0, 500.0)])
+    resp = _post_with_sidecar(
+        client, original, translated, "alternating",
+        _sidecar_json(2, glossary=GLOSSARY,
+                      artifact_layout={"content_pages": [0, 0]}))
+    assert resp.status_code == 200
+    pages = _pages(resp)
+    assert (500.0, 500.0) not in [_size(p) for p in pages]
+    assert [_size(p) for p in pages[:4]] == [LETTER, A4, LETTER, A4]
+
+
+def test_the_vocab_kill_switch_disables_the_insert(client, monkeypatch):
+    from server import config
+    monkeypatch.setattr(config, "VOCAB_PAGES", False)
+
+    original, translated = _pdf([LETTER] * 2), _pdf([A4] * 2)
+    resp = _post_with_sidecar(client, original, translated, "alternating",
+                              _sidecar_json(2, vocab=VOCAB))
+    assert resp.status_code == 200
+    assert len(_pages(resp)) == 4  # pairs only, no vocab pages
+
+
+def test_vocab_for_a_page_neither_side_has_is_skipped(client):
+    original, translated = _pdf([LETTER] * 2), _pdf([A4] * 2)
+    resp = _post_with_sidecar(
+        client, original, translated, "alternating",
+        _sidecar_json(2, vocab={"9": [{"w": "lost", "ar": "ضائع"}],
+                                "junk": [{"w": "lost", "ar": "ضائع"}]}))
+    assert resp.status_code == 200
+    assert len(_pages(resp)) == 4

@@ -143,6 +143,46 @@ The same pages ride along on the free layouts:
 Kill switch: `GLOSSARY_PAGES=0` disables the whole feature — the extraction
 call and every append, on all three paths.
 
+## Vocab pages («كلمات هذه الصفحة»)
+
+The complementary, lighter layer under the terms pages: the readers are not
+native English speakers, and most of what stops them is ordinary English
+("declared", "scope", "evolved", "custom"), not the deep terms. After the
+glossary step, a second LLM pass over the sidecar (`server/vocab.py`) picks
+each page's NEW general-English words — first occurrence only (a word
+introduced on page 3 never comes back on page 7), the glossary's chosen terms
+excluded, ≤12 words/page and ≤150/document; a document over ~30k source words
+is split into page-aligned chunk calls that carry the already-introduced list.
+The entries land in the sidecar under a top-level **`"vocab"`** key
+(`{"<page_number>": [{w, ar, note?}]}`, string keys matching the sidecar's
+0-based `page_number`; `{}` when nothing made the cut; absent on runs from
+before this feature — consumers must tolerate both), and
+`server/vocab_pages.py` renders each page's words as one compact RTL page —
+tight rows of bold English word — Arabic meaning — optional muted note, two
+columns past six entries — **inserted IMMEDIATELY AFTER that page's content**,
+never deferred to the end. Pages without new words get nothing; the terms
+pages keep the very end of the document.
+
+Because the mono result is now interleaved, the pipeline also records where
+the content pages ended up, as a top-level
+**`"artifact_layout": {"content_pages": [i0, i1, ...]}`** (index of content
+page N in the baked mono; written only when pages were really inserted). The
+same insertion rule rides the free layouts:
+
+- **`/v1/overlay`** inserts each page's vocab page right after that original
+  page (the report gains a `vocab_pages` count); the terms tail follows last.
+- **`/v1/compose`** first takes the translated CONTENT pages back out — via
+  `artifact_layout` when the sidecar carries one (exact, drops the baked
+  vocab pages and terms tail alike), else the `total_pages` tail-trim as
+  before — assembles the dual, then inserts each vocab page after its pair:
+  after the (original, translated) pair of page N for `alternating`, after
+  wide page N for `side_by_side`. The terms pages tail the dual as before.
+
+Everything is best-effort (the terms pages' posture): any failure logs and the
+artifact ships without the vocab layer, never degraded and never failed.
+Kill switch: `VOCAB_PAGES=0` disables the extraction call and every insertion
+on all three paths — behavior is byte-identical to before the feature.
+
 ## Environment
 
 | Env | Default | Meaning |
@@ -154,6 +194,7 @@ call and every append, on all three paths.
 | `DATA_DIR` | `/data` | Job storage (volume) |
 | `JOB_TTL_HOURS` | `24` | Job retention |
 | `GLOSSARY_PAGES` | `1` | «شرح المصطلحات» terms pages; `0` disables extraction and every append |
+| `VOCAB_PAGES` | `1` | «كلمات هذه الصفحة» per-page vocabulary pages; `0` disables extraction and every insertion |
 | `PHRASE_PAIRS` | `1` | Phrase-pair alignment in the sidecar (`"pairs"` on its blocks); `0` stops requesting pairs from the LLM |
 | `PHRASE_HIGHLIGHTS` | `1` | Matching phrase-highlight chips on `/v1/compose` duals and the `/v1/overlay` gloss; `0` turns the drawing off (capture is `PHRASE_PAIRS`'s job) |
 
