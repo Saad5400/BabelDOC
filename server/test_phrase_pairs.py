@@ -10,6 +10,7 @@ including the shapes a model returns when it misbehaves.
 """
 
 import json
+import threading
 from types import SimpleNamespace
 
 from babeldoc.format.pdf.document_il import il_version_1
@@ -23,6 +24,9 @@ from babeldoc.format.pdf.document_il.midend.il_translator import (
 from babeldoc.format.pdf.document_il.midend.il_translator_llm_only import (
     ILTranslatorLLMOnly,
     MAX_PAIR_FORMULAS,
+    PAIRS_RETRY_BATCH_SIZE,
+    PAIRS_RETRY_MAX_PARAGRAPHS,
+    PAIRS_RETRY_PROMPT_TEMPLATE,
     PHRASE_PAIRS_PROMPT_BLOCK,
     PROMPT_TEMPLATE,
     formula_expansions,
@@ -718,13 +722,21 @@ def _formula_placeholder(pid=1):
         pid, None, "{v" + str(pid) + "}", f"{{\\s*v\\s*{pid}\\s*}}")
 
 
-def _capture_translator():
-    """An ILTranslatorLLMOnly reduced to its capture seam: no engine, no LLM."""
+def _capture_translator(engine=None):
+    """An ILTranslatorLLMOnly reduced to its capture seam: no real LLM ever —
+    `engine`, when given, is the mock the retry sweep will call."""
     translator = object.__new__(ILTranslatorLLMOnly)
     translator.capture_phrase_pairs = True
     translator.pairs_kept = 0
     translator.pairs_discarded = 0
-    translator.translation_config = SimpleNamespace(phrase_pair_store={})
+    translator.pairs_retry_kept = 0
+    translator._pairs_retry_lock = threading.Lock()
+    translator._pairs_retry_queue = []
+    translator.translation_config = SimpleNamespace(
+        phrase_pair_store={}, lang_out="Arabic")
+    translator.translate_engine = engine
+    translator.tokenizer = SimpleNamespace(
+        encode=lambda text, **_kwargs: text.split())
     return translator
 
 
@@ -1054,3 +1066,180 @@ def test_lam_before_the_article_assimilates_to_double_lam():
     assert validated is not None
     pairs, _perm = validated
     assert pairs[1] == {"s": "for large companies", "t": "للشركات الكبيرة"}
+
+
+# --- the one-shot pairs-only retry at coarser granularity --------------------
+#
+# Measured on a real deck, word-level granularity fails validation on long
+# multi-clause sentences and coverage dropped from 145/218 paragraphs to
+# 85/218 — the discarded ones rendering with no highlights at all. Every
+# discard is therefore recorded (the exact validation-time plain strings) and
+# swept ONCE at the end of translate() with a pairs-only prompt whose
+# granularity guidance is inverted: correct-and-coarse beats fine-and-wrong.
+# No LLM here either: the engine is a mock recording its calls.
+
+
+class _RetryEngine:
+    """The one seam the retry sweep touches on the real translate engine."""
+
+    def __init__(self, responses=()):
+        self.calls = []
+        self._responses = list(responses)
+
+    def llm_translate(self, text, ignore_cache=False, rate_limit_params=None):
+        self.calls.append((text, rate_limit_params))
+        return self._responses.pop(0)
+
+
+def _discarded_bullet_paragraph(translator):
+    """One bullet-formula paragraph through a FAILED main pass: the model's
+    word-level pairs missegment, the capture seam discards and records."""
+    bullet = _bullet_formula(1)
+    paragraph = _paragraph(
+        "• Software products are generic systems", _box(60, 680, 400, 714))
+    paragraph.unicode = "{v1} منتجات البرمجيات هي أنظمة عامة"
+    translator._capture_phrase_pairs(
+        paragraph=paragraph,
+        translate_input=ILTranslator.TranslateInput(
+            "{v1}Software products are generic systems", [bullet]),
+        source_text="{v1}Software products are generic systems",
+        raw_pairs=[{"s": "Software", "t": "منتجات"}])  # covers neither side
+    return paragraph
+
+
+def test_a_failed_main_pass_records_the_exact_validation_time_strings():
+    translator = _capture_translator(_RetryEngine())
+
+    paragraph = _discarded_bullet_paragraph(translator)
+
+    assert translator.pairs_discarded == 1
+    assert translator.translation_config.phrase_pair_store == {}
+    (entry,) = translator._pairs_retry_queue
+    assert entry["paragraph"] is paragraph
+    # The plain tokenized texts validation ran on: style tags stripped (none
+    # here), the {v1} formula token KEPT on both sides.
+    assert entry["source"] == "{v1}Software products are generic systems"
+    assert entry["target"] == "{v1} منتجات البرمجيات هي أنظمة عامة"
+    assert entry["expansions"] == {"{v1}": "•"}
+
+
+def test_a_valid_retry_response_stores_exactly_what_the_main_path_would():
+    retry_pairs = [
+        {"s": "{v1} Software products", "t": "{v1} منتجات البرمجيات"},
+        {"s": "are generic systems", "t": "هي أنظمة عامة"},
+    ]
+    engine = _RetryEngine([json.dumps(
+        [{"id": 0, "pairs": retry_pairs}], ensure_ascii=False)])
+    translator = _capture_translator(engine)
+    paragraph = _discarded_bullet_paragraph(translator)
+
+    translator._retry_phrase_pairs()
+
+    # The one retry call mirrors the main request path: json mode on, the
+    # batch's token count riding the rate limiter, and the prompt carrying
+    # the recorded strings verbatim plus the coarser-granularity guidance.
+    (prompt, rate_limit_params), = engine.calls
+    assert rate_limit_params["request_json_mode"] is True
+    assert rate_limit_params["paragraph_token_count"] > 0
+    assert '"{v1}Software products are generic systems"' in prompt
+    assert '"{v1} منتجات البرمجيات هي أنظمة عامة"' in prompt
+    assert "A correct 4-pair segmentation beats a wrong 10-pair one" in prompt
+    assert "want_pairs" not in prompt
+
+    # Stored through the very same validate → expand path as the main pass:
+    # a translator whose MAIN pass got these pairs stores the same record.
+    assert translator.pairs_kept == 0
+    assert translator.pairs_retry_kept == 1
+    assert translator.pairs_discarded == 0
+    normal = _capture_translator()
+    normal_paragraph = _discarded_bullet_paragraph(normal)
+    normal.pairs_discarded = 0
+    normal._capture_phrase_pairs(
+        paragraph=normal_paragraph,
+        translate_input=ILTranslator.TranslateInput(
+            "{v1}Software products are generic systems", [_bullet_formula(1)]),
+        source_text="{v1}Software products are generic systems",
+        raw_pairs=retry_pairs)
+    assert (translator.translation_config.phrase_pair_store[id(paragraph)]
+            == normal.translation_config.phrase_pair_store[id(normal_paragraph)]
+            == {"pairs": [
+                    {"s": "• Software products", "t": "• منتجات البرمجيات"},
+                    {"s": "are generic systems", "t": "هي أنظمة عامة"}],
+                "perm": [0, 1]})
+    # One attempt per paragraph: nothing is queued for a second retry.
+    assert translator._pairs_retry_queue == []
+
+
+def test_garbage_and_mismatched_retry_responses_are_skipped_not_raised():
+    for response in (
+        "MODEL MELTDOWN, no json at all",
+        json.dumps([{"id": 7, "pairs": PAIRS}]),  # id names nobody
+        json.dumps([{"id": 0, "pairs": [{"s": "wrong", "t": "خطأ"}]}]),
+        json.dumps([{"id": 0}]),  # no pairs at all
+        json.dumps("a bare string"),
+    ):
+        translator = _capture_translator(_RetryEngine([response]))
+        _discarded_bullet_paragraph(translator)
+
+        translator._retry_phrase_pairs()
+
+        assert translator.translation_config.phrase_pair_store == {}
+        assert translator.pairs_retry_kept == 0
+        assert translator.pairs_discarded == 1
+
+
+def test_nothing_to_retry_means_no_llm_call():
+    engine = _RetryEngine()
+    translator = _capture_translator(engine)
+
+    translator._retry_phrase_pairs()
+
+    assert engine.calls == []
+
+
+def test_the_retry_batcher_batches_like_the_main_flow_and_survives_a_bad_batch():
+    # 7 recorded discards → two calls (5 + 2); the first call's garbage
+    # answer is logged and skipped, the second batch still runs.
+    engine = _RetryEngine(["not json", "[]"])
+    translator = _capture_translator(engine)
+    for i in range(PAIRS_RETRY_BATCH_SIZE + 2):
+        translator._record_pairs_retry(
+            paragraph=SimpleNamespace(),
+            plain_source=f"source {i}",
+            plain_target=f"هدف {i}",
+            expansions={})
+
+    translator._retry_phrase_pairs()
+
+    assert len(engine.calls) == 2
+    first, second = engine.calls[0][0], engine.calls[1][0]
+    for i in range(PAIRS_RETRY_BATCH_SIZE):
+        assert f'"source {i}"' in first and f'"source {i}"' not in second
+    for i in range(PAIRS_RETRY_BATCH_SIZE, PAIRS_RETRY_BATCH_SIZE + 2):
+        assert f'"source {i}"' in second and f'"source {i}"' not in first
+
+
+def test_the_retry_queue_is_capped():
+    translator = _capture_translator()
+    for i in range(PAIRS_RETRY_MAX_PARAGRAPHS + 5):
+        translator._record_pairs_retry(
+            paragraph=SimpleNamespace(),
+            plain_source=f"source {i}",
+            plain_target=f"هدف {i}",
+            expansions={})
+
+    assert len(translator._pairs_retry_queue) == PAIRS_RETRY_MAX_PARAGRAPHS
+
+
+def test_the_retry_prompt_shares_the_pairing_contract():
+    prompt = PAIRS_RETRY_PROMPT_TEMPLATE.substitute(
+        lang_out="Arabic", json_input_str="[]")
+
+    # The field-agnostic rules are the SAME strings the main block teaches…
+    assert "NEVER emit a clitic alone" in prompt
+    assert "OPAQUE WORDS" in prompt
+    assert "NEVER split inside a word" in prompt
+    assert "do NOT retranslate" in prompt
+    # …while the granularity guidance is inverted: correctness over fineness.
+    assert "NEVER guess an alignment" in prompt
+    assert "Split as FINELY as possible" not in prompt
