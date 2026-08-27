@@ -93,6 +93,17 @@ RING_FLAT_MAD = 16.0
 SX_MIN, SX_MAX = 0.2, 3.0
 SEG_GAP_H = 1.0          # split a line at word gaps wider than this many
                          # median glyph heights (sentence spacing is ~0.3)
+TILE_MIN_PX = 2000       # renders at least this tall AND wide also get a
+                         # TILED sparse pass: tesseract drops labels inside
+                         # closed shapes (the Fig 1.2 «Software» ellipse) on
+                         # a full page, but reads them once a tile edge cuts
+                         # the shape open
+TILE_TARGET_PX = 1200    # approximate tile size (20% overlap between tiles)
+# glyphs that reach below the baseline: a segment containing none of these
+# has its ink bottom ON the baseline, so the hOCR baseline can be clamped to
+# the word boxes (tesseract floats all-caps labels ~5pt high otherwise —
+# their tight line box lacks the descender room its baseline offset assumes)
+DESCENDER_CHARS = set("gjpqyQ_;,()[]{}@")
 
 
 # --------------------------------------------------------------------------
@@ -176,29 +187,79 @@ def ocr_region(img_path, out_stem):
     """
     lines = _run_tesseract(img_path, out_stem)
     im = Image.open(img_path).convert("RGB")
+    gray = im.convert("L")
     gray_path = out_stem + "_gray.png"
-    im.convert("L").save(gray_path)
+    gray.save(gray_path)
     sat_path = out_stem + "_sat.png"
     im.convert("HSV").split()[1].save(sat_path)
 
-    for tag, path, psm in (("gray3", gray_path, None),
-                           ("gray11", gray_path, "11"),
-                           ("sat11", sat_path, "11")):
+    passes = [("gray3", gray_path, None),
+              ("gray11", gray_path, "11"),
+              ("sat11", sat_path, "11")]
+
+    for tag, path, psm in passes:
         extra = _run_tesseract(path, out_stem + "_" + tag, psm=psm)
-        # only CONFIDENT earlier words block a sparse discovery: a garbage
-        # box an earlier pass hallucinated over a navy hexagon must not
-        # shadow the «Class» the saturation pass reads there
-        seen = [w for ln in lines for w in ln.words if w.conf >= CONF_KILL]
-        for ln in extra:
-            ln.words = [w for w in ln.words
-                        if not any(boxes_overlap(w, b) for b in seen)]
-            if ln.words:
-                ln.x = min(w.x for w in ln.words)
-                ln.x2 = max(w.x2 for w in ln.words)
-                ln.y = min(w.y for w in ln.words)
-                ln.y2 = max(w.y2 for w in ln.words)
-                lines.append(ln)
+        _merge_lines(lines, extra)
+    if gray.width >= TILE_MIN_PX and gray.height >= TILE_MIN_PX:
+        _merge_lines(lines, _ocr_tiled(gray, out_stem))
     return lines
+
+
+def _merge_lines(lines, extra):
+    """Append extra hOCR lines, dropping words an earlier pass already read.
+
+    Only CONFIDENT existing words block a discovery: a garbage box an
+    earlier pass hallucinated over a navy hexagon must not shadow the
+    «Class» the saturation pass reads there.
+    """
+    seen = [w for ln in lines for w in ln.words if w.conf >= CONF_KILL]
+    for ln in extra:
+        ln.words = [w for w in ln.words
+                    if not any(boxes_overlap(w, b) for b in seen)]
+        if ln.words:
+            ln.x = min(w.x for w in ln.words)
+            ln.x2 = max(w.x2 for w in ln.words)
+            ln.y = min(w.y for w in ln.words)
+            ln.y2 = max(w.y2 for w in ln.words)
+            lines.append(ln)
+
+
+def _ocr_tiled(gray, out_stem):
+    """Sparse pass over overlapping tiles of a large region render.
+
+    Tile edges cut closed shapes open, so tesseract reads the labels it
+    refuses on the whole page. Overlap means a word can appear in two tiles
+    (whole in one, truncated in the other): keep the longest reading of any
+    overlapping cluster.
+    """
+    nx = max(1, round(gray.width / TILE_TARGET_PX))
+    ny = max(1, round(gray.height / TILE_TARGET_PX))
+    tw, th = gray.width // nx, gray.height // ny
+    tiled = []
+    for iy in range(ny):
+        for ix in range(nx):
+            x0, y0 = ix * tw, iy * th
+            x1 = min(gray.width, x0 + tw + tw // 5)
+            y1 = min(gray.height, y0 + th + th // 5)
+            stem = f"{out_stem}_tile{ix}_{iy}"
+            gray.crop((x0, y0, x1, y1)).save(stem + ".png")
+            for ln in _run_tesseract(stem + ".png", stem, psm="11"):
+                for w in ln.words:
+                    w.x, w.x2 = w.x + x0, w.x2 + x0
+                    w.y, w.y2 = w.y + y0, w.y2 + y0
+                ln.x, ln.x2 = ln.x + x0, ln.x2 + x0
+                ln.y, ln.y2 = ln.y + y0, ln.y2 + y0
+                tiled.append(ln)
+    # intra-pass dedupe, longest text first («engineering» beats the
+    # tile-edge fragment «engin» covering the same pixels)
+    kept = []
+    for ln in sorted(tiled,
+                     key=lambda ln: -max(len(w.text) for w in ln.words)):
+        ln.words = [w for w in ln.words
+                    if w.conf >= CONF_KILL
+                    and not any(boxes_overlap(w, k) for k in kept)]
+        kept.extend(ln.words)
+    return [ln for ln in tiled if ln.words]
 
 
 def ring_mad(raster, x0, y0, x1, y1, pad, max_samples=1200):
@@ -442,6 +503,11 @@ def build_region_ops(lines, clip, px_per_pt, inv_ptm, font, visible=False):
             text = text.encode("latin-1", "ignore").decode("latin-1")
             if not text.strip():
                 continue
+            if not set(text) & DESCENDER_CHARS:
+                # descender-less text: ink bottom IS the baseline; clamp
+                # DOWN only (a correct hOCR baseline equals the ink bottom
+                # already, a floated all-caps one sits ~5pt above it)
+                baseline = max(baseline, max(w.y2 for w in ws))
             natural = font.text_length(text, fontsize=size_pt)
             if natural <= 0:
                 continue
