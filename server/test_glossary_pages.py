@@ -145,3 +145,50 @@ def test_the_output_stays_small_after_a_garbage_save(tmp_path):
     doc.close()
 
     assert out.stat().st_size < 2_000_000
+
+
+def test_a_markup_page_value_is_coerced_away_not_rendered():
+    doc = _doc()
+    hostile = _entry(page='<div class="title">INJECTED</div>')
+
+    added = glossary_pages.append_glossary_pages(doc, [hostile])
+
+    assert added == 1
+    text = _text(doc, 2)
+    assert "INJECTED" not in text
+    # a non-int page falls back to the document label («المستند»; asserted
+    # by a lam-free substring — medial lam extracts as junk, see module doc)
+    assert "مستند" in text
+    doc.close()
+
+
+def test_entries_beyond_the_cap_are_not_rendered():
+    doc = _doc()
+    entries = [_entry(term=f"Notion{i}") for i in range(30)]
+
+    glossary_pages.append_glossary_pages(doc, entries)
+
+    text = _text(doc, 2)
+    # digits extract unreliably (contextual forms), so count the cards
+    assert text.count("Notion") == 10
+    doc.close()
+
+
+def test_oversized_fields_are_clipped_before_rendering():
+    doc = _doc()
+    fat = _entry(explanation="x" * 500_000, quote="q" * 500_000)
+
+    added = glossary_pages.append_glossary_pages(doc, [fat])
+
+    assert 1 <= added <= 3  # bounded, not one page per unclipped kilobyte
+    doc.close()
+
+
+def test_pages_too_small_for_the_layout_skip_the_appendix():
+    doc = _doc(size=(100.0, 200.0))
+
+    added = glossary_pages.append_glossary_pages(doc, [_entry()])
+
+    assert added == 0
+    assert doc.page_count == 2
+    doc.close()

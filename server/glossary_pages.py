@@ -56,6 +56,13 @@ _CARD_RADIUS = 6.0
 
 _FALLBACK_PAGE = (595.0, 842.0)  # A4, for the pathological empty-doc caller
 
+# The pipeline's own entries are already clean and capped (terms._clean_entry,
+# terms.MAX_TERMS), but the compose/overlay sidecar is uploader-supplied, so
+# the same bounds are re-imposed here before anything is measured or subset —
+# a crafted sidecar must not buy unbounded pages or CPU out of one request.
+_MAX_CARDS = 10  # mirrors terms.MAX_TERMS
+_CLIP = {"term": 200, "arabic": 200, "explanation": 2000, "quote": 300}
+
 
 def _font_path(font_file: str) -> Path:
     """A face from babeldoc's font cache; the bold falls back to the regular."""
@@ -107,15 +114,29 @@ def _title_html() -> str:
     return '<div class="title" dir="rtl">شرح المصطلحات — Terms</div>'
 
 
-def _card_html(entry: dict) -> str:
-    term = _escape(entry.get("term") or "")
-    arabic = _escape(entry.get("arabic") or "")
+def _fields(entry: dict) -> dict:
+    """The renderable slice of an entry: clipped strings, `page` an int or None."""
+    out = {}
+    for key, limit in _CLIP.items():
+        value = entry.get(key)
+        out[key] = str(value)[:limit] if value is not None else ""
+    try:
+        out["page"] = int(entry.get("page"))
+    except (TypeError, ValueError):
+        out["page"] = None
+
+    return out
+
+
+def _card_html(fields: dict) -> str:
+    term = _escape(fields["term"])
+    arabic = _escape(fields["arabic"])
     header = f"{term} — {arabic}" if arabic else term
 
     parts = [f'<div class="term">{header}</div>',
-             f'<div class="body">{_escape(entry.get("explanation") or "")}</div>']
+             f'<div class="body">{_escape(fields["explanation"])}</div>']
 
-    page, quote = entry.get("page"), entry.get("quote")
+    page, quote = fields["page"], fields["quote"]
     if page or quote:
         where = f"الشريحة {page}" if page else "المستند"
         source = f"وردت في: {where}"
@@ -153,7 +174,8 @@ def append_glossary_pages(doc: pymupdf.Document, entries: list,
     does): like the interlinear overlay, each drawn box embeds its own copy of
     the subset font until garbage collection folds them into one.
     """
-    cards = [entry for entry in entries or [] if _usable(entry)]
+    cards = [_fields(entry)
+             for entry in entries or [] if _usable(entry)][:_MAX_CARDS]
 
     if not cards:
         return 0
@@ -174,6 +196,13 @@ def append_glossary_pages(doc: pymupdf.Document, entries: list,
     content_width = width - 2 * _MARGIN_X
     text_width = content_width - 2 * _CARD_PAD
     bottom = height - _MARGIN_BOTTOM
+
+    if text_width <= 0 or bottom <= _MARGIN_TOP:
+        # Pages too small for the layout (the Story fit loop would diverge);
+        # skipping the appendix is the deliberate outcome, not an exception.
+        logger.warning("glossary: page %sx%s too small for cards; skipped",
+                       width, height)
+        return 0
 
     page = doc.new_page(width=width, height=height)
     added = 1
