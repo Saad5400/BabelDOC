@@ -1131,6 +1131,10 @@ class _RtlBidiElement:
 class Typesetting:
     stage_name = "Typesetting"
 
+    # How far past its source width an image-OCR label box may widen
+    # (see _prefit_raster_label_box).
+    RASTER_LABEL_MAX_GROWTH = 2.2
+
     def __init__(self, translation_config: TranslationConfig):
         self.font_mapper = FontMapper(translation_config)
         self.translation_config = translation_config
@@ -2165,6 +2169,12 @@ class Typesetting:
             return
         natural_width = sum(unit.width for unit in typesetting_units)
         needed = natural_width * 1.05 + 2.0
+        # The label usually sits on a shape (a hexagon, an ellipse) the IL
+        # cannot see: growing to the translation's full natural width would
+        # walk the text off the shape onto whatever is behind it. Grow at
+        # most this factor past the source label and let the normal
+        # shrink-to-fit scale handle the rest.
+        needed = min(needed, (box.x2 - box.x) * self.RASTER_LABEL_MAX_GROWTH)
         if needed <= box.x2 - box.x:
             return
         center = (box.x + box.x2) / 2

@@ -1123,6 +1123,11 @@ class ParagraphFinder:
     # Mask padding beyond the label's glyph box, to swallow the raster
     # glyphs' anti-aliasing halo and OCR-tight ascender undershoot (pt).
     IMAGE_TEXT_MASK_PAD = 2.0
+    # Vertical mask padding as a fraction of the label height: the injected
+    # helv run's metrics drift from the raster glyphs' true extents by up to
+    # a third of the line (bold all-caps baselines), and an uncovered glyph
+    # strip reads worse than a slightly taller color-matched mask.
+    IMAGE_TEXT_MASK_VPAD_FRACTION = 0.35
 
     def _extract_image_text_paragraphs(self, page: Page) -> list[PdfParagraph]:
         """Pull image-OCR characters off the page into label paragraphs.
@@ -1310,10 +1315,13 @@ class ParagraphFinder:
                         gy1 = min(gy1, char_box.y)
                         gx2 = max(gx2, char_box.x2)
                         gy2 = max(gy2, char_box.y2)
+            vpad = max(
+                pad, (gy2 - gy1) * self.IMAGE_TEXT_MASK_VPAD_FRACTION
+            )
             x1 = max(gx1 - pad, rx0)
-            y1 = max(gy1 - pad, ry0)
+            y1 = max(gy1 - vpad, ry0)
             x2 = min(gx2 + pad, rx1)
-            y2 = min(gy2 + pad, ry1)
+            y2 = min(gy2 + vpad, ry1)
             if x2 <= x1 or y2 <= y1:
                 continue
             fill_state = WHITE
