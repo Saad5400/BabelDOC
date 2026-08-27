@@ -194,14 +194,14 @@ def _sidecar_json(total_pages, vocab=None, artifact_layout=None):
     return json.dumps(data)
 
 
-def _post_with_sidecar(client, original, translated, fmt, sidecar):
+def _post_with_sidecar(client, original, translated, fmt, sidecar, **data):
     return client.post(
         "/v1/compose",
         headers={"X-Internal-Token": TOKEN},
         files={"original": ("orig.pdf", original, "application/pdf"),
                "translated": ("trans.pdf", translated, "application/pdf"),
                "sidecar": ("sidecar.json", sidecar, "application/json")},
-        data={"format": fmt},
+        data={"format": fmt, **data},
     )
 
 
@@ -398,4 +398,73 @@ def test_an_unknown_sidecar_key_is_tolerated(client):
 def test_a_malformed_sidecar_is_422(client, original_pdf, translated_pdf):
     resp = _post_with_sidecar(client, original_pdf, translated_pdf,
                               "alternating", "{not json")
+    assert resp.status_code == 422
+
+
+# --------------------------------------------------------------------------
+# vocab=0: the caller opts one download out of the vocab layer
+# --------------------------------------------------------------------------
+
+def _strip_baked_translated() -> bytes:
+    """A strip-baked mono like the pipeline's: content pages whose mediabox
+    reaches 100pt below zero, with the baked strip text in that band."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    for index in range(2):
+        page = doc.new_page(width=A4[0], height=A4[1])
+        page.insert_text((72, 72), f"CONTENT{index}", fontsize=24)
+        media = page.mediabox
+        page.set_mediabox(pymupdf.Rect(media.x0, media.y0 - 100.0,
+                                       media.x1, media.y1))
+        page.insert_text((72, A4[1] + 50), f"BAKEDSTRIP{index}", fontsize=18)
+    try:
+        return doc.tobytes()
+    finally:
+        doc.close()
+
+
+def test_vocab_0_still_unbakes_but_draws_no_fresh_strips(client):
+    # The opt-out only governs what goes IN: the baked strips still come
+    # back out (undoing what the input carries), and then nothing replaces
+    # them — the pages end at exactly their pristine sizes.
+    original = _pdf([LETTER] * 2)
+    resp = _post_with_sidecar(
+        client, original, _strip_baked_translated(), "alternating",
+        _sidecar_json(2, vocab=VOCAB,
+                      artifact_layout={"content_pages": [0, 1],
+                                       "vocab_strips": {"0": 100.0,
+                                                        "1": 100.0}}),
+        vocab="0")
+    assert resp.status_code == 200
+    pages = _pages(resp)
+    assert [_size(p) for p in pages] == [LETTER, A4, LETTER, A4]  # no growth
+    text = " ".join(_page_text(resp, i) for i in range(4))
+    assert "CONTENT0" in text and "CONTENT1" in text
+    assert "BAKEDSTRIP" not in text  # the baked band is still removed
+    assert "declared" not in text    # and nothing fresh went in
+    assert "evolved" not in text
+
+
+def test_vocab_false_is_tolerated_as_a_spelling(client):
+    original, translated = _pdf([LETTER] * 2), _pdf([A4] * 2)
+    resp = _post_with_sidecar(client, original, translated, "alternating",
+                              _sidecar_json(2, vocab=VOCAB), vocab="false")
+    assert resp.status_code == 200
+    assert [_size(p) for p in _pages(resp)] == [LETTER, A4] * 2
+
+
+def test_vocab_1_is_the_default_and_explicit_1_matches_it(client):
+    original, translated = _pdf([LETTER] * 2), _pdf([A4] * 2)
+    resp = _post_with_sidecar(client, original, translated, "alternating",
+                              _sidecar_json(2, vocab=VOCAB), vocab="1")
+    assert resp.status_code == 200
+    sizes = [_size(p) for p in _pages(resp)]
+    assert sizes[1][1] > A4[1]  # the strips still land when asked for
+
+
+def test_a_junk_vocab_value_is_422(client, original_pdf, translated_pdf):
+    resp = _post_with_sidecar(client, original_pdf, translated_pdf,
+                              "alternating", _sidecar_json(2, vocab=VOCAB),
+                              vocab="maybe")
     assert resp.status_code == 422

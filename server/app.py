@@ -26,8 +26,26 @@ from server import config
 from server import convert
 from server import interlinear
 from server import jobs
+from server import notes_space
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+
+
+def _parse_flag(value: str, name: str) -> bool:
+    """A form field carrying a boolean: "1"/"0" (or "true"/"false").
+
+    The Laravel caller sends "1"/"0"; the tolerant spellings cost nothing.
+    Anything else is a typo'd request, refused rather than guessed at.
+    """
+    lowered = (value or "").strip().lower()
+
+    if lowered in ("1", "true"):
+        return True
+    if lowered in ("0", "false"):
+        return False
+
+    raise HTTPException(status_code=422,
+                        detail=f"{name} must be 1 or 0")
 
 
 @asynccontextmanager
@@ -127,6 +145,7 @@ async def compose_dual(
     translated: UploadFile = File(...),
     format: str = Form(...),
     sidecar: UploadFile | None = File(None),
+    vocab: str = Form("1"),
 ):
     """Stateless dual builder: original + translated (mono) in, dual PDF out.
 
@@ -136,7 +155,12 @@ async def compose_dual(
     translated input's own baked-in vocab pages are taken back out via the
     sidecar's artifact_layout, so nothing appears twice). Without it,
     behavior is exactly as before.
+
+    `vocab=0` opts this download out of the vocab layer: the baked-in vocab
+    still comes back out (that is undoing what the input carries, not adding
+    a feature), but no fresh strips go in.
     """
+    want_vocab = _parse_flag(vocab, "vocab")
     if format not in compose.COMPOSE_FORMATS:
         raise HTTPException(status_code=422,
                             detail=f"format must be one of {compose.COMPOSE_FORMATS}")
@@ -161,7 +185,8 @@ async def compose_dual(
 
     try:
         result = compose.compose_dual(parts["original"], parts["translated"],
-                                      format, sidecar=sidecar_data)
+                                      format, sidecar=sidecar_data,
+                                      vocab=want_vocab)
     except compose.ComposeError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -186,6 +211,7 @@ async def overlay(
     plate_color: str | None = Form(None),
     plate_opacity: float | None = Form(None),
     plate_padding: float | None = Form(None),
+    vocab: str = Form("1"),
 ):
     """Stateless layout builder for the layouts that need the translated TEXT.
 
@@ -193,7 +219,11 @@ async def overlay(
     the ones that have to know what each paragraph says and where it belongs,
     from the run's sidecar. Like compose, it is stateless, LLM-free and
     therefore free: one paid translation, any number of layouts.
+
+    `vocab=0` opts this render out of the «كلمات هذه الصفحة» strips the
+    sidecar's "vocab" would otherwise add to the overlay pages.
     """
+    want_vocab = _parse_flag(vocab, "vocab")
     if style not in interlinear.OVERLAY_STYLES:
         raise HTTPException(
             status_code=422,
@@ -227,7 +257,8 @@ async def overlay(
                 ("plate_padding", plate_padding))
                if value is not None})
         result, report = interlinear.render_overlay(original_bytes, parsed,
-                                                    style=style, options=options)
+                                                    style=style, options=options,
+                                                    vocab=want_vocab)
     except interlinear.OverlayError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -278,6 +309,81 @@ async def convert_to_pdf(file: UploadFile = File(...)):
 
     return Response(content=pdf_bytes, media_type="application/pdf",
                     headers=_pdf_attachment(filename))
+
+
+@app.post("/v1/strip-vocab", dependencies=[Depends(require_token)])
+async def strip_vocab(
+    translated: UploadFile = File(...),
+    sidecar: UploadFile = File(...),
+):
+    """Stateless un-baker: the stored mono in, the mono WITHOUT its vocab out.
+
+    The pipeline bakes the «كلمات هذه الصفحة» layer into the mono it stores;
+    a reader who wants the translation clean gets it back here, exactly, via
+    the sidecar's artifact_layout — baked bottom strips are physically
+    redacted off and inserted fallback pages dropped (compose.strip_vocab, the
+    same undo /v1/compose performs before pairing). A sidecar without a usable
+    layout means a pre-vocab mono: nothing to strip, the bytes come back
+    unchanged.
+    """
+    translated_bytes = await translated.read()
+    sidecar_bytes = await sidecar.read()
+
+    for name, data in (("translated", translated_bytes),
+                       ("sidecar", sidecar_bytes)):
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"{name} too large")
+
+    if not translated_bytes.startswith(b"%PDF-"):
+        raise HTTPException(status_code=422, detail="translated is not a PDF")
+
+    try:
+        sidecar_data = json.loads(sidecar_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=422,
+                            detail=f"sidecar is not valid JSON: {exc}") from exc
+
+    try:
+        result = compose.strip_vocab(translated_bytes, sidecar_data)
+    except compose.ComposeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return Response(content=result, media_type="application/pdf",
+                    headers=_pdf_attachment(translated.filename))
+
+
+@app.post("/v1/notes-space", dependencies=[Depends(require_token)])
+async def add_notes_space(
+    file: UploadFile = File(...),
+    sides: str = Form(...),
+    size: str = Form("md"),
+):
+    """Stateless margin builder: any PDF in, the same PDF with ruled note
+    space out.
+
+    Every page grows a band of blank, faintly-ruled writing space (أسطر) on
+    each requested side — `sides` is a comma-separated subset of top, bottom,
+    left, right; `size` is sm/md/lg. The content never moves (the mediabox
+    grows outward, vocab-strip style), so this composes with whatever the PDF
+    already is: a mono with baked strips, a dual, an overlay. Rotated pages
+    are left untouched.
+    """
+    data = await file.read()
+
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="file too large")
+
+    if not data.startswith(b"%PDF-"):
+        raise HTTPException(status_code=422, detail="file is not a PDF")
+
+    try:
+        result = notes_space.add_notes_space(data, notes_space.parse_sides(sides),
+                                             size=size)
+    except notes_space.NotesSpaceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return Response(content=result, media_type="application/pdf",
+                    headers=_pdf_attachment(file.filename, "notes"))
 
 
 def _get_job_or_404(job_id: str) -> dict:
