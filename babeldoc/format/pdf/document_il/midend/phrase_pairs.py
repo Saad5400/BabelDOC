@@ -17,7 +17,16 @@ This module is the data discipline around that idea, in three parts:
 
 - {@link pairs_from_item}: pull a response item's raw "pairs" without trusting
   its shape.
-- {@link validate_pairs}: the strict per-paragraph contract. The pairs are
+- {@link validate_pairs}: the strict per-paragraph contract, preceded by a
+  deterministic NORMALIZATION pass over the raw pairs. Word-level granularity
+  makes the model produce two systematic, mechanically recoverable shapes:
+  consecutive source words that each repeat the same "t" (a fertility group —
+  "software"/"systems" both answering «أنظمة برمجية») are merged into one
+  multi-word pair, and — only as a retry when strict validation still fails —
+  a "t" that is nothing but an Arabic proclitic («و», «لـ») is fused into the
+  FOLLOWING pair, the way the output actually spells it («ومختلفة»). The
+  merged pairs are what validation checks and what the sidecar stores.
+- The strict contract itself: the pairs are
   listed in SOURCE order and aligned by MEANING, so the two sides obey
   different disciplines. The "s" phrases must be a COMPLETE, ORDERED
   segmentation of the source: their word tokens, concatenated, equal the
@@ -244,12 +253,87 @@ def pairs_from_item(item) -> list[dict] | None:
     return pairs
 
 
+# Arabic tatweel (kashida): a typographic filler the model uses to write a
+# clitic "as attached" («لـ»). Meaningful only to the clitic merge below —
+# real outputs may legitimately contain it («الـ API» is house style), so it
+# is never blanket-stripped from phrases or targets.
+_TATWEEL = "ـ"
+
+# Arabic proclitic prefixes the model sometimes emits as a "t" of their own
+# while its actual output fuses them into the following word. Conjunctions
+# (و ف), prepositions (ب ل ك), future س, and the definite article with its
+# fused preposition/conjunction forms.
+_ARABIC_PROCLITICS = frozenset(
+    ["و", "ف", "ب", "ل", "ك", "س", "ال", "لل", "وال", "بال", "كال", "فال"]
+)
+
+
+def _merge_repeated_targets(pairs: list[dict]) -> list[dict]:
+    """Consecutive pairs sharing one "t" merged into one multi-word pair.
+
+    Word-level granularity invites fertility repeats: the model answers
+    "software"→«أنظمة برمجية» and "systems"→«أنظمة برمجية» although the target
+    contains «أنظمة برمجية» once. While pair i and i+1 have the same "t"
+    (string equality after whitespace normalization), they are one pair:
+    "s" values joined with a space, "t" kept once. A single left-to-right
+    pass with accumulation reaches the fixed point — a run of any length
+    collapses into its head.
+    """
+    merged: list[dict] = []
+    for pair in pairs:
+        if merged and merged[-1]["t"].split() == pair["t"].split():
+            merged[-1] = {"s": f"{merged[-1]['s']} {pair['s']}",
+                          "t": merged[-1]["t"]}
+        else:
+            merged.append(dict(pair))
+    return merged
+
+
+def _merge_clitic_targets(pairs: list[dict]) -> list[dict] | None:
+    """Proclitic-only "t" values fused into the FOLLOWING pair, or None.
+
+    The model sometimes splits an Arabic clitic off as its own pair —
+    "and"→«و», "to"→«لـ» — while its actual output fuses the clitic into the
+    next word («ومختلفة», «لمجموعة»). Any pair whose whole "t" is one of
+    {@link _ARABIC_PROCLITICS} (after stripping tatweel and whitespace) is
+    merged into its successor: "s" values joined with a space, "t" values
+    joined with NO space using the tatweel-stripped clitic (the successor's
+    own "t" is kept verbatim — it may carry a legitimate tatweel). Walking
+    right to left lets chained clitics fold into an already-merged successor.
+
+    A trailing clitic has no successor and is left alone — that candidate
+    simply fails validation, which is the point: this is a RETRY shape, and
+    None (nothing merged) tells the caller there is no retry to run.
+    """
+    merged: list[dict] = []
+    changed = False
+    for pair in reversed(pairs):
+        clitic = pair["t"].replace(_TATWEEL, "").strip()
+        if merged and clitic in _ARABIC_PROCLITICS:
+            following = merged[0]
+            merged[0] = {"s": f"{pair['s']} {following['s']}",
+                         "t": f"{clitic}{following['t']}"}
+            changed = True
+        else:
+            merged.insert(0, dict(pair))
+    return merged if changed else None
+
+
 def validate_pairs(
     raw_pairs: list[dict] | None,
     source_text: str,
     target_text: str,
 ) -> tuple[list[dict], list[int]] | None:
-    """The strict segmentation contract — (pairs, permutation) — or None.
+    """Normalization, then the strict contract — (pairs, permutation) — or None.
+
+    The raw pairs first pass through a deterministic, purely mechanical
+    normalization ({@link _merge_repeated_targets}); the strict validation
+    below then runs UNCHANGED on the result. If it fails, one retry candidate
+    is built ({@link _merge_clitic_targets}) and validated the same way; if
+    both fail, the paragraph's pairs are discarded exactly as before. No
+    model recall, no fuzzy matching — every merge is forced by the pairs
+    themselves, and a merged pair behaves downstream exactly like a
+    hand-written multi-word pair.
 
     The pairs are listed in SOURCE order and aligned by meaning, so the two
     sides are checked differently. SOURCE: the flattened word tokens of the
@@ -277,10 +361,27 @@ def validate_pairs(
     if not raw_pairs or not source_text or not target_text:
         return None
 
-    if [w for p in raw_pairs for w in _words(p["s"])] != _words(source_text):
+    candidate = _merge_repeated_targets(raw_pairs)
+    validated = _validate_candidate(candidate, source_text, target_text)
+    if validated is not None:
+        return validated
+
+    retry = _merge_clitic_targets(candidate)
+    if retry is None:
+        return None
+    return _validate_candidate(retry, source_text, target_text)
+
+
+def _validate_candidate(
+    pairs: list[dict],
+    source_text: str,
+    target_text: str,
+) -> tuple[list[dict], list[int]] | None:
+    """{@link validate_pairs}' strict contract, checked on ONE candidate."""
+    if [w for p in pairs for w in _words(p["s"])] != _words(source_text):
         return None
 
-    t_phrases = [p["t"] for p in raw_pairs]
+    t_phrases = [p["t"] for p in pairs]
 
     permutation = tile_permutation(
         [_words(p) for p in t_phrases], _words(target_text)
@@ -299,7 +400,7 @@ def validate_pairs(
 
     return [
         {"s": " ".join(_words(pair["s"])), "t": " ".join(_words(t))}
-        for pair, t in zip(raw_pairs, t_phrases, strict=True)
+        for pair, t in zip(pairs, t_phrases, strict=True)
     ], permutation
 
 

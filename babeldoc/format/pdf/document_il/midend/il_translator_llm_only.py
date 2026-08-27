@@ -113,13 +113,16 @@ $json_input_str"""
 # OPAQUE WORDS: each token sits inside exactly one phrase on each side, and
 # the capture seam expands it back to the formula's own text afterwards.
 # The rules here are the exact contract phrase_pairs.validate_pairs (and
-# phrase_pairs.expand_formula_tokens) enforces; pairs that break it are
-# discarded per paragraph, never repaired.
+# phrase_pairs.expand_formula_tokens) enforces — after its deterministic
+# normalization pass, which is why repeated-"t" runs and (per its clitic
+# retry) split-off proclitics are declared acceptable above; anything else
+# that breaks the contract is discarded per paragraph, never repaired.
 PHRASE_PAIRS_PROMPT_BLOCK = """
 ## Phrase Pairs
 For every input item that has "want_pairs": true, ALSO add a "pairs" field to that output item: a JSON array of {"s": <source phrase>, "t": <translated phrase>} objects segmenting BOTH texts completely.
 - Align by MEANING: each "t" is the translation of its "s". List the pairs in the SOURCE text's order; each "t" phrase will be located in your output wherever your translation actually put it — the two languages may order the phrases differently, and that is fine. NEVER pair a phrase with target words that merely occupy the same position.
 - Split as FINELY as possible — the ideal unit is ONE word: "Software products" is TWO pairs ("Software" and "products"), never one. Merge words into one unit only when the mapping forces it: glue an article/preposition to its content word when it has no standalone counterpart ("of products" → «المنتجات»), and keep grammar-fused forms together when word-by-word units would not be contiguous on both sides ("two local variables" → «متغيرين محليين»). A 12-word sentence should typically produce 8-12 pairs, not 3.
+- When consecutive source words share ONE inseparable translation, either group them into a single pair OR let each of them repeat that same "t" verbatim — both are accepted ("software systems" → «أنظمة برمجية» as one pair, or "software" → «أنظمة برمجية» then "systems" → «أنظمة برمجية»). Arabic clitic prefixes (و، ف، ب، ل، ك، س) are part of the word they attach to: NEVER emit a clitic alone as a "t" phrase — "and different" → «ومختلفة» pairs the clitic with its word.
 - The phrases cover the PLAIN text: read both the item's "input" and your "output" with every <style id='N'>...</style> tag removed, keeping each tag's inner text in place. NEVER put a tag, or any part of one, inside an "s" or "t" phrase.
 - Placeholders like {v1} are OPAQUE WORDS of both texts: put each one inside EXACTLY ONE "s" phrase and EXACTLY ONE "t" phrase, at the spot where it sits in that text. NEVER split, alter, or drop such a token, and NEVER make a phrase that is ONLY tokens — a leading bullet's token belongs to the phrase that follows it, as in {"s": "{v1} Software products", "t": "{v1} منتجات البرمجيات"}.
 - Every word of that plain input must appear in exactly one "s" phrase, and every word of your plain output in exactly one "t" phrase: concatenating all "s" values with single spaces reproduces the plain input exactly, and the "t" values, rearranged into your output's own order, reproduce the plain output exactly.

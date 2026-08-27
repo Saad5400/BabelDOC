@@ -92,6 +92,15 @@ def test_the_pairs_instruction_treats_formula_tokens_as_opaque_words():
     assert '{"s": "{v1} Software products"' in PHRASE_PAIRS_PROMPT_BLOCK
 
 
+def test_the_pairs_instruction_allows_fertility_repeats_and_binds_clitics():
+    # The two shapes validation now normalizes are declared acceptable to the
+    # model too: repeating one "t" across the words that share it, and never
+    # emitting an Arabic clitic prefix as a "t" of its own.
+    assert "repeat that same" in PHRASE_PAIRS_PROMPT_BLOCK
+    assert "NEVER emit a clitic alone" in PHRASE_PAIRS_PROMPT_BLOCK
+    assert "«ومختلفة»" in PHRASE_PAIRS_PROMPT_BLOCK
+
+
 # --- parsing: items with and without pairs -----------------------------------
 
 
@@ -235,6 +244,149 @@ def test_empty_inputs_never_validate():
     assert phrase_pairs.validate_pairs(None, SOURCE, TARGET) is None
     assert phrase_pairs.validate_pairs(PAIRS, "", TARGET) is None
     assert phrase_pairs.validate_pairs(PAIRS, SOURCE, "") is None
+
+
+# --- normalization: fertility repeats and split clitics ----------------------
+#
+# Word-level granularity (the owner's ruling) makes the model produce two
+# systematic shapes that are mechanically recoverable, never ambiguous:
+# consecutive source words each repeating the same "t" (a fertility group),
+# and an Arabic proclitic emitted as a "t" of its own while the output fuses
+# it into the next word. Validation normalizes those before its strict
+# contract; everything else still discards.
+
+# A live run's paragraph, raw pairs exactly as logged: four fertility groups
+# ("software"/"systems", "that"/"provide", "that"/"is"/"useful", "a"/"range")
+# plus one split clitic ("to" → «لـ» while the output says «لمجموعة»).
+FERTILITY_SOURCE = (
+    "{v1}Software products are generic software systems that provide "
+    "functionality that is useful to a range of customers."
+)
+FERTILITY_TARGET = (
+    "{v1}المنتجات البرمجية هي أنظمة برمجية عامة توفر وظائف مفيدة لمجموعة "
+    "واسعة من العملاء."
+)
+FERTILITY_RAW = [
+    {"s": "{v1}Software", "t": "{v1}المنتجات"},
+    {"s": "products", "t": "البرمجية"},
+    {"s": "are", "t": "هي"},
+    {"s": "generic", "t": "عامة"},
+    {"s": "software", "t": "أنظمة برمجية"},
+    {"s": "systems", "t": "أنظمة برمجية"},
+    {"s": "that", "t": "توفر"},
+    {"s": "provide", "t": "توفر"},
+    {"s": "functionality", "t": "وظائف"},
+    {"s": "that", "t": "مفيدة"},
+    {"s": "is", "t": "مفيدة"},
+    {"s": "useful", "t": "مفيدة"},
+    {"s": "to", "t": "لـ"},
+    {"s": "a", "t": "مجموعة"},
+    {"s": "range", "t": "مجموعة"},
+    {"s": "of", "t": "واسعة من"},
+    {"s": "customers.", "t": "العملاء."},
+]
+# What normalization resolves that to: each fertility group is one multi-word
+# pair, and the clitic retry folds "to"'s «لـ» (tatweel dropped) into the
+# following group — «لمجموعة», the word the output actually contains.
+FERTILITY_PAIRS = [
+    {"s": "{v1} Software", "t": "{v1} المنتجات"},
+    {"s": "products", "t": "البرمجية"},
+    {"s": "are", "t": "هي"},
+    {"s": "generic", "t": "عامة"},
+    {"s": "software systems", "t": "أنظمة برمجية"},
+    {"s": "that provide", "t": "توفر"},
+    {"s": "functionality", "t": "وظائف"},
+    {"s": "that is useful", "t": "مفيدة"},
+    {"s": "to a range", "t": "لمجموعة"},
+    {"s": "of", "t": "واسعة من"},
+    {"s": "customers.", "t": "العملاء."},
+]
+# «عامة» follows «أنظمة برمجية» in the Arabic although "generic" precedes
+# "software systems" in the source — pairs 3 and 4 swap in the target order.
+FERTILITY_PERM = [0, 1, 2, 4, 3, 5, 6, 7, 8, 9, 10]
+
+
+def test_a_live_fertility_paragraph_validates_after_normalization():
+    assert phrase_pairs.validate_pairs(
+        FERTILITY_RAW, FERTILITY_SOURCE, FERTILITY_TARGET) == (
+        FERTILITY_PAIRS, FERTILITY_PERM)
+
+
+def test_the_normalized_fertility_pairs_still_expand_their_formula_token():
+    pairs, _perm = phrase_pairs.validate_pairs(
+        FERTILITY_RAW, FERTILITY_SOURCE, FERTILITY_TARGET)
+
+    expanded = phrase_pairs.expand_formula_tokens(pairs, {"{v1}": "•"})
+
+    assert expanded is not None
+    assert expanded[0] == {"s": "• Software", "t": "• المنتجات"}
+    assert expanded[1:] == FERTILITY_PAIRS[1:]
+
+
+def test_a_fertility_run_merges_even_with_sloppy_whitespace():
+    # Same-"t" equality is judged after whitespace normalization, nothing else.
+    raw = [
+        {"s": "We can not", "t": "لا يمكننا"},
+        {"s": "create", "t": "إنشاء"},
+        {"s": "two", "t": "متغيرين  محليين"},
+        {"s": "local", "t": "متغيرين محليين"},
+        {"s": "variables", "t": "متغيرين محليين"},
+        {"s": "with the same name", "t": "بالاسم نفسه"},
+    ]
+
+    assert phrase_pairs.validate_pairs(raw, SOURCE, TARGET) == (
+        PAIRS, IDENTITY)
+
+
+def test_a_split_clitic_fuses_into_the_following_word():
+    # The model paired "and" with a bare «و», but its output fused the clitic
+    # into the next word — the retry candidate spells it the output's way.
+    raw = [
+        {"s": "simple", "t": "بسيطة"},
+        {"s": "and", "t": "و"},
+        {"s": "different", "t": "مختلفة"},
+    ]
+
+    assert phrase_pairs.validate_pairs(
+        raw, "simple and different", "بسيطة ومختلفة") == (
+        [{"s": "simple", "t": "بسيطة"},
+         {"s": "and different", "t": "ومختلفة"}],
+        [0, 1])
+
+
+def test_a_genuinely_standalone_conjunction_is_left_alone():
+    # The clitic merge is a RETRY shape: when the strict contract already
+    # holds — the output really contains a standalone «و» — nothing merges.
+    raw = [
+        {"s": "read", "t": "اقرأ"},
+        {"s": "and", "t": "و"},
+        {"s": "write", "t": "اكتب"},
+    ]
+
+    assert phrase_pairs.validate_pairs(
+        raw, "read and write", "اقرأ و اكتب") == (raw, [0, 1, 2])
+
+
+def test_a_trailing_clitic_has_nothing_to_fuse_into_and_discards():
+    raw = [
+        {"s": "different", "t": "مختلفة"},
+        {"s": "and", "t": "و"},
+    ]
+
+    assert phrase_pairs.validate_pairs(
+        raw, "different and", "مختلفة") is None
+
+
+def test_a_cosmetic_fathatan_is_absorbed_by_the_diacritic_fallback():
+    # Live run: the model wrote «بدءاً من» in its pairs while the applied
+    # output says «بدءا من» — U+064B sits in the post-processor's strip set,
+    # so the existing fallback already covers it.
+    raw = [{"s": "starting", "t": "بدءاً"}, {"s": "from", "t": "من"}]
+
+    assert phrase_pairs.validate_pairs(
+        raw, "starting from", "بدءا من") == (
+        [{"s": "starting", "t": "بدءا"}, {"s": "from", "t": "من"}],
+        [0, 1])
 
 
 # --- rect resolution: phrases onto characters, per visual line ---------------
