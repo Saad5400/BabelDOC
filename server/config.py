@@ -37,6 +37,16 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 GLOSSARY_PAGES = (os.environ.get("GLOSSARY_PAGES", "1").strip().lower()
                   not in ("0", "false", "no", "off"))
 
+# «كلمات هذه الصفحة» — the per-page vocabulary layer: each page's NEW general
+# English words, explained in Arabic on a compact page inserted right after it
+# (first occurrence only; the deep «شرح المصطلحات» terms are excluded and keep
+# their own end-of-document pages). On by default; VOCAB_PAGES=0 (or
+# false/no/off) kills the whole feature: the extraction pass after a mono run
+# AND every insertion (mono result, /v1/overlay, /v1/compose). See
+# server/vocab.py and server/vocab_pages.py.
+VOCAB_PAGES = (os.environ.get("VOCAB_PAGES", "1").strip().lower()
+               not in ("0", "false", "no", "off"))
+
 # Phrase-pair alignment — the translating LLM also segments each paragraph
 # into aligned source↔target phrases, captured into the sidecar ("pairs" on
 # its blocks, with the page rects of each phrase on both sides) for a later
