@@ -3,7 +3,7 @@
 Phrase-pair capture (babeldoc/.../midend/phrase_pairs.py) leaves each sidecar
 block with ordered `{s, t, s_rects, t_rects}` entries. This module is the
 drawing side of that data: phrase i of a paragraph gets colour i on BOTH sides,
-as a soft background chip — filled at ~0.4 opacity ON TOP of the existing page
+as a soft background chip — filled at FILL_OPACITY ON TOP of the existing page
 content, the way a text highlighter marks a printed page, which is also what
 makes it work on scanned/opaque-background pages. No border, small rounded
 corners, a little padding around the text rect. The palette cycles per
@@ -49,11 +49,12 @@ from babeldoc.format.pdf.document_il.midend.phrase_pairs import MAX_PAIRS
 logger = logging.getLogger("doctranslate.phrase_highlights")
 
 # The owner-approved chip palette, cycled per paragraph: phrase i (on both
-# sides) gets PALETTE[i % 5]. Amber, sky, green, violet, pink.
-PALETTE = ("#FDE68A", "#BAE6FD", "#BBF7D0", "#DDD6FE", "#FBCFE8")
+# sides) gets PALETTE[i % 5]. Amber, sky, green, violet, pink — deliberately
+# desaturated (owner asked for subtle) and further faded by FILL_OPACITY.
+PALETTE = ("#F3E5B5", "#C8E4F5", "#CBEEDA", "#DFDAF5", "#F3D8E7")
 
 # Chips draw like a text highlighter: soft, borderless, on top.
-FILL_OPACITY = 0.4
+FILL_OPACITY = 0.35
 PADDING = 1.5  # points of breathing room around the text rect
 CORNER_RADIUS = 2.0  # points
 
@@ -64,6 +65,19 @@ MAX_RECTS_PER_PAGE = 400
 def chip_color(index: int) -> str:
     """Phrase `index`'s colour, as hex — the palette, cycled."""
     return PALETTE[index % len(PALETTE)]
+
+
+def span_color(index: int) -> str:
+    """`chip_color` pre-blended toward white by FILL_OPACITY.
+
+    The Story engine paints span backgrounds solid, while drawn chips get
+    `fill_opacity` over white paper — blending here keeps the overlay's
+    Arabic side the same visual weight as the drawn chips beside it.
+    """
+    code = chip_color(index).lstrip("#")
+    blended = (round(255 - (255 - int(code[i:i + 2], 16)) * FILL_OPACITY)
+               for i in (0, 2, 4))
+    return "#" + "".join(f"{c:02x}" for c in blended)
 
 
 def _chip_fill(index: int) -> tuple[float, float, float]:
@@ -365,7 +379,7 @@ class GlossHighlighter:
                 segments.append((color_index, [word]))
 
         return " ".join(
-            f'<span style="background-color:{chip_color(color_index)}">'
+            f'<span style="background-color:{span_color(color_index)}">'
             f'{html.escape(" ".join(words))}</span>'
             for color_index, words in segments)
 

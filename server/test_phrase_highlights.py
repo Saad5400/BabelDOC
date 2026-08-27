@@ -73,7 +73,7 @@ def _fills(pdf_bytes: bytes, page_index: int) -> list[tuple]:
 
 
 def _chips(pdf_bytes: bytes, page_index: int) -> list[tuple]:
-    """The translucent fills — chips draw at 0.4, everything else at 1."""
+    """The translucent fills — chips draw at FILL_OPACITY, all else at 1."""
     return [f for f in _fills(pdf_bytes, page_index) if f[2] < 0.99]
 
 
@@ -86,9 +86,9 @@ def _close(a, b) -> bool:
 # --------------------------------------------------------------------------
 
 def test_the_palette_cycles_per_paragraph():
-    assert phrase_highlights.chip_color(0) == "#FDE68A"
-    assert phrase_highlights.chip_color(4) == "#FBCFE8"
-    assert phrase_highlights.chip_color(5) == "#FDE68A"
+    assert phrase_highlights.chip_color(0) == phrase_highlights.PALETTE[0]
+    assert phrase_highlights.chip_color(4) == phrase_highlights.PALETTE[4]
+    assert phrase_highlights.chip_color(5) == phrase_highlights.PALETTE[0]
 
 
 @pytest.mark.parametrize("garbage", [
@@ -191,8 +191,10 @@ def test_highlight_pairs_bounds_the_rects_per_page():
 # The gloss highlighter (the overlay's Arabic side)
 # --------------------------------------------------------------------------
 
-AMBER = '<span style="background-color:#FDE68A">'
-SKY = '<span style="background-color:#BAE6FD">'
+AMBER = ('<span style="background-color:'
+         f'{phrase_highlights.span_color(0)}">')
+SKY = ('<span style="background-color:'
+       f'{phrase_highlights.span_color(1)}">')
 
 
 def test_the_gloss_splits_into_matching_coloured_spans():
@@ -284,7 +286,8 @@ def test_alternating_highlights_both_sides_in_matching_colours(client):
         fills = sorted(chips, key=lambda chip: chip[0].y0)
         assert _close(fills[0][1], phrase_highlights._chip_fill(0))
         assert _close(fills[1][1], phrase_highlights._chip_fill(1))
-        assert all(math.isclose(chip[2], 0.4, abs_tol=0.01) for chip in chips)
+        assert all(math.isclose(chip[2], phrase_highlights.FILL_OPACITY,
+                        abs_tol=0.01) for chip in chips)
 
     # And the chips sit where the sidecar's y-up rects say, flipped to
     # display space (plus the 1.5 pt padding): S_RECT on the LETTER page…
@@ -512,7 +515,7 @@ def test_a_spread_gloss_keeps_its_phrase_colours_chunk_by_chunk(built_markup):
     # drawn in order with the palette's first three colours.
     assert len(highlighted) == 3
     for index, markup in enumerate(highlighted):
-        assert phrase_highlights.chip_color(index) in markup
+        assert phrase_highlights.span_color(index) in markup
 
 
 def test_a_mismatch_falls_back_to_the_plain_gloss_but_keeps_the_chips(
