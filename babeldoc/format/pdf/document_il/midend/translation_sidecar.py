@@ -35,6 +35,15 @@ moves the content, so a point here is the same point in the untouched original
 the caller pairs the sidecar with. A renderer maps them with the target page's
 own `transformation_matrix` (and must neutralise page rotation first — see
 `server/interlinear.py`).
+
+PHRASE PAIRS are the one late arrival. When the LLM translator also returned a
+validated phrase segmentation (see `phrase_pairs.py`), a block carries "pairs":
+ordered `{s, t, s_rects, t_rects}` entries. `s_rects` live in the same
+original-page space as everything above; `t_rects` are the phrases' rectangles
+in the TRANSLATED output page — they only exist once Typesetting has drawn the
+translation, so {@link attach_target_rects} adds them after the fact and
+rewrites the file. Either rect key is simply absent when its side could not be
+mapped exactly.
 """
 
 from __future__ import annotations
@@ -45,6 +54,7 @@ from pathlib import Path
 from typing import Any
 
 from babeldoc.format.pdf.document_il import il_version_1
+from babeldoc.format.pdf.document_il.midend import phrase_pairs
 from babeldoc.format.pdf.document_il.utils.layout_helper import get_char_unicode_string
 
 logger = logging.getLogger(__name__)
@@ -135,6 +145,29 @@ def _source_lines(paragraph: il_version_1.PdfParagraph) -> list[list[float]]:
             if line[2] - line[0] >= _MIN_BOX_SIDE and line[3] - line[1] >= _MIN_BOX_SIDE]
 
 
+def _char_tuples(paragraph: il_version_1.PdfParagraph) -> list[tuple[str, list[float] | None]]:
+    """A paragraph's characters as plain (text, [x0, y0, x1, y1]) copies.
+
+    Copies rather than references on purpose: on the SOURCE side the snapshot
+    must outlive ILTranslator, which replaces the paragraph's compositions —
+    and with them the original PdfCharacter objects — in place. Boxes stay in
+    the character's own coordinate space (PDF user space, y up), exactly as
+    the IL carries them; degenerate boxes become None, never a guessed rect.
+    """
+    tuples: list[tuple[str, list[float] | None]] = []
+
+    for character in _characters(paragraph):
+        box = character.box
+        if box is None or None in (box.x, box.y, box.x2, box.y2):
+            tuples.append((character.char_unicode or "", None))
+            continue
+        x0, x1 = sorted((float(box.x), float(box.x2)))
+        y0, y1 = sorted((float(box.y), float(box.y2)))
+        tuples.append((character.char_unicode or "", [x0, y0, x1, y1]))
+
+    return tuples
+
+
 # Where a run boundary must NOT become a space: punctuation that hugs the word
 # before it, and brackets that hug the word after.
 _HUGS_LEFT = ")]}»،؛؟,.;:!?%"
@@ -218,12 +251,45 @@ def snapshot_source(docs: il_version_1.Document) -> dict[int, dict[int, dict]]:
     return {
         page_index: {
             para_index: {"text": paragraph.unicode,
-                         "lines": _source_lines(paragraph)}
+                         "lines": _source_lines(paragraph),
+                         # The original characters with their boxes, for
+                         # mapping phrase pairs back onto the source page
+                         # (build_sidecar's s_rects). Copies, because the
+                         # originals are replaced by the translation.
+                         "chars": _char_tuples(paragraph)}
             for para_index, paragraph in enumerate(page.pdf_paragraph)
             if paragraph.unicode
         }
         for page_index, page in enumerate(docs.page)
     }
+
+
+def _pairs_entries(
+    pairs: list[dict],
+    source: dict,
+) -> list[dict[str, Any]]:
+    """One block's "pairs" value: the aligned phrases, with source rects.
+
+    `s_rects` come from the snapshotted ORIGINAL characters, so they live in
+    the same space as the block's own box and lines — the original page's PDF
+    user space (y up). They are attached only when every phrase maps onto the
+    character stream exactly ({@link phrase_pairs.match_phrases_to_rects});
+    otherwise the entries carry the text alignment alone, because a phrase
+    highlight in the wrong place is worse than none. `t_rects` cannot exist
+    yet — the translated characters only get boxes at typesetting — and are
+    filled in by {@link attach_target_rects} afterwards.
+    """
+    entries = [{"s": pair["s"], "t": pair["t"]} for pair in pairs]
+
+    source_chars = source.get("chars") or []
+    rects = phrase_pairs.match_phrases_to_rects(
+        source_chars, [pair["s"] for pair in pairs]
+    )
+    if rects is not None:
+        for entry, phrase_rects in zip(entries, rects, strict=True):
+            entry["s_rects"] = phrase_rects
+
+    return entries
 
 
 def build_sidecar(
@@ -232,9 +298,20 @@ def build_sidecar(
     lang_in: str,
     lang_out: str,
     sources: dict[int, dict[int, dict]] | None = None,
+    pair_store: dict[int, list[dict]] | None = None,
+    pending_pairs: list[tuple[list[dict], il_version_1.PdfParagraph]] | None = None,
 ) -> dict[str, Any]:
-    """The sidecar document for a translated, NOT YET typeset, IL."""
+    """The sidecar document for a translated, NOT YET typeset, IL.
+
+    `pair_store` (id(paragraph) → validated phrase pairs, filled by
+    ILTranslatorLLMOnly) adds a "pairs" key to the blocks whose paragraphs
+    have one; blocks without pairs — and every sidecar from a run without the
+    feature — are unchanged. `pending_pairs`, when given, collects
+    (entries, paragraph) for {@link attach_target_rects} to resolve target
+    rects after typesetting.
+    """
     sources = sources or {}
+    pair_store = pair_store or {}
     pages: list[dict[str, Any]] = []
 
     for page_index, page in enumerate(docs.page):
@@ -261,7 +338,7 @@ def build_sidecar(
 
             source = page_sources.get(para_index) or {}
 
-            blocks.append({
+            block = {
                 "box": box,
                 "source": (source.get("text") or "").strip() or None,
                 "lines": source.get("lines") or [],
@@ -269,7 +346,22 @@ def build_sidecar(
                 "font_size": (paragraph.pdf_style.font_size
                               if paragraph.pdf_style is not None else None),
                 "label": paragraph.layout_label,
-            })
+            }
+
+            pairs = pair_store.get(id(paragraph))
+            if pairs:
+                try:
+                    entries = _pairs_entries(pairs, source)
+                    block["pairs"] = entries
+                    if pending_pairs is not None:
+                        pending_pairs.append((entries, paragraph))
+                except Exception:  # noqa: BLE001 - pairs are a bonus, never a risk
+                    logger.exception(
+                        "sidecar: dropping phrase pairs for a paragraph on "
+                        "page %s", page_index,
+                    )
+
+            blocks.append(block)
 
         # Figures are not glossed, but they are the other thing that occupies
         # vertical space: a renderer looking for room above a paragraph has to
@@ -300,17 +392,80 @@ def write_sidecar(
     lang_in: str,
     lang_out: str,
     sources: dict[int, dict[int, dict]] | None = None,
-) -> None:
+    pair_store: dict[int, list[dict]] | None = None,
+) -> dict[str, Any] | None:
     """Write the sidecar beside a run's output.
 
     Best-effort by construction: the sidecar buys FUTURE layouts, and a run
     whose PDF is finished must not fail over one. The caller logs and carries
     on, which is why nothing here raises.
+
+    When phrase pairs were captured, the return value is the state
+    {@link attach_target_rects} needs to add their `t_rects` after
+    typesetting; runs without pairs (including every run before this feature)
+    return None, write once, and the file never changes again.
     """
     try:
+        pending_pairs: list[tuple[list[dict], il_version_1.PdfParagraph]] = []
         sidecar = build_sidecar(docs, lang_in=lang_in, lang_out=lang_out,
-                                sources=sources)
+                                sources=sources, pair_store=pair_store,
+                                pending_pairs=pending_pairs)
         Path(path).write_text(json.dumps(sidecar, ensure_ascii=False),
                               encoding="utf-8")
+        if pending_pairs:
+            return {"path": Path(path), "sidecar": sidecar,
+                    "pending": pending_pairs}
     except Exception:  # noqa: BLE001 - a lost sidecar must never lose the run
         logger.exception("failed to write the translation sidecar to %s", path)
+    return None
+
+
+def attach_target_rects(state: dict[str, Any] | None) -> None:
+    """Fill in each phrase pair's `t_rects` and rewrite the sidecar.
+
+    Must run AFTER Typesetting, which is the pass that gives the translated
+    text page boxes at all: it re-renders every translated paragraph into
+    per-character compositions, one PdfCharacter per glyph, each with its
+    final box. Those boxes are in the TRANSLATED output page's space — for
+    RTL runs the page layout was mirrored and the paragraph may have moved or
+    grown — which is exactly what `t_rects` are for: highlights drawn over
+    the translated PDF. (`box`/`lines`/`s_rects` stay in the ORIGINAL page's
+    space; both spaces are PDF user space, y up, with the mediabox normalised
+    to [0 0 w h].)
+
+    The glyphs the typeset paragraph stores are Arabic PRESENTATION forms in
+    logical order (typesetting reshapes before rendering and its RTL pass
+    only moves boxes); {@link phrase_pairs.match_phrases_to_rects} folds that
+    back to comparable text. A paragraph whose typeset characters no longer
+    spell its own translation — a formula slipped in, glyphs were dropped —
+    keeps its pairs and `s_rects` but gets no `t_rects`: partial data is
+    fine, wrong boxes are not. Never raises; the sidecar on disk (written
+    before typesetting) survives any failure here untouched.
+    """
+    if not state:
+        return
+
+    try:
+        resolved_any = False
+
+        for entries, paragraph in state["pending"]:
+            try:
+                rects = phrase_pairs.match_phrases_to_rects(
+                    _char_tuples(paragraph),
+                    [entry["t"] for entry in entries],
+                )
+                if rects is None:
+                    continue
+                for entry, phrase_rects in zip(entries, rects, strict=True):
+                    entry["t_rects"] = phrase_rects
+                resolved_any = True
+            except Exception:  # noqa: BLE001 - one paragraph never spoils the rest
+                logger.exception("sidecar: target rects failed for a paragraph")
+
+        if resolved_any:
+            state["path"].write_text(
+                json.dumps(state["sidecar"], ensure_ascii=False),
+                encoding="utf-8",
+            )
+    except Exception:  # noqa: BLE001 - the PDF is finished; nothing here may fail it
+        logger.exception("failed to attach target rects to the sidecar")

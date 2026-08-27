@@ -1029,13 +1029,18 @@ def _do_translate_single(
     # is still the box in the ORIGINAL page — Typesetting below starts moving
     # and growing both. Writing the sidecar anywhere else would capture a
     # layout for text that no longer matches it.
+    # When phrase pairs were captured, the write returns the state needed to
+    # add their target rects — those only exist after Typesetting gives the
+    # translated text boxes at all (see attach_target_rects below).
+    sidecar_pairs_state = None
     if translation_config.translation_sidecar_path:
-        translation_sidecar.write_sidecar(
+        sidecar_pairs_state = translation_sidecar.write_sidecar(
             docs,
             translation_config.translation_sidecar_path,
             lang_in=translation_config.lang_in,
             lang_out=translation_config.lang_out,
             sources=sidecar_sources,
+            pair_store=getattr(translation_config, "phrase_pair_store", None),
         )
 
     if translation_config.debug:
@@ -1069,6 +1074,14 @@ def _do_translate_single(
 
     Typesetting(translation_config).typesetting_document(docs)
     logger.debug(f"finish typsetting from {temp_pdf_path}")
+
+    # The typeset paragraphs now hold the translated characters WITH boxes
+    # (in the translated page's own space); resolve each phrase pair's
+    # t_rects and rewrite the sidecar. Never raises, and the sidecar written
+    # above stays on disk exactly as before if anything here goes wrong.
+    if sidecar_pairs_state:
+        translation_sidecar.attach_target_rects(sidecar_pairs_state)
+
     if translation_config.debug:
         xml_converter.write_json(
             docs,
