@@ -10,13 +10,33 @@ Conventions:
 - alternating: original page 1, translated page 1, original page 2, ...
 - side_by_side: one double-width page per pair, translated half on the
   RIGHT (Arabic/RTL readers scan right-first).
-- Page-count mismatch: the shorter document is padded with blanks sized
-  like the twin page, so every pair stays aligned.
+- Original longer: the translated side is padded with blanks sized like the
+  twin page, so every pair stays aligned.
+- Translated longer: the extra TAIL pages are appended whole at the end
+  rather than paired with blanks — since the mono result gained its
+  «شرح المصطلحات» appendix (server/glossary_pages.py) that tail is glossary
+  pages, and a glossary page facing a blank reads as a mistake.
+
+GLOSSARY: a caller may also send the run's sidecar. When it carries the
+"glossary" entries server/terms.py selected, the composed output gets the same
+styled pages appended, rendered fresh at the composed page size — and the
+translated input's own glossary tail (everything past the page count the
+sidecar records) is IGNORED, so the appendix is never in the document twice.
+Without a sidecar the tail-append rule above keeps a glossary-tailed mono
+usable as-is.
 """
 
+import logging
 from io import BytesIO
 
-from pypdf import PageObject, PdfReader, PdfWriter, Transformation
+from pypdf import PageObject
+from pypdf import PdfReader
+from pypdf import PdfWriter
+from pypdf import Transformation
+
+from server import config
+
+logger = logging.getLogger("doctranslate.compose")
 
 COMPOSE_FORMATS = ("alternating", "side_by_side")
 
@@ -48,23 +68,29 @@ def _size(page: PageObject) -> tuple[float, float]:
     return float(box.width), float(box.height)
 
 
-def _pairs(original: PdfReader, translated: PdfReader):
-    """Yield (original_page, translated_page) with None past the shorter end."""
-    for i in range(max(len(original.pages), len(translated.pages))):
-        yield (original.pages[i] if i < len(original.pages) else None,
-               translated.pages[i] if i < len(translated.pages) else None)
+def _split(original: PdfReader,
+           translated_pages: list[PageObject]) -> tuple[list, list]:
+    """`translated_pages` as (body paired with the original, appended tail)."""
+    count = len(original.pages)
+    return list(translated_pages[:count]), list(translated_pages[count:])
 
 
-def _alternating(original: PdfReader, translated: PdfReader) -> PdfWriter:
+def _alternating(original: PdfReader,
+                 translated_pages: list[PageObject]) -> PdfWriter:
     writer = PdfWriter()
-    for orig, trans in _pairs(original, translated):
-        # A missing page becomes a blank sized like its twin (one of the two
-        # always exists — both inputs are non-empty).
-        twin_w, twin_h = _size(orig if orig is not None else trans)
-        writer.add_page(orig if orig is not None else
-                        PageObject.create_blank_page(width=twin_w, height=twin_h))
-        writer.add_page(trans if trans is not None else
-                        PageObject.create_blank_page(width=twin_w, height=twin_h))
+    body, tail = _split(original, translated_pages)
+    for index, orig in enumerate(original.pages):
+        trans = body[index] if index < len(body) else None
+        writer.add_page(orig)
+        # A missing translated page becomes a blank sized like its twin.
+        if trans is not None:
+            writer.add_page(trans)
+        else:
+            twin_w, twin_h = _size(orig)
+            writer.add_page(PageObject.create_blank_page(width=twin_w,
+                                                         height=twin_h))
+    for page in tail:
+        writer.add_page(page)
     return writer
 
 
@@ -81,30 +107,114 @@ def _merge_into_half(target: PageObject, source: PageObject,
         source, Transformation().scale(scale).translate(tx, ty))
 
 
-def _side_by_side(original: PdfReader, translated: PdfReader) -> PdfWriter:
+def _side_by_side(original: PdfReader,
+                  translated_pages: list[PageObject]) -> PdfWriter:
     writer = PdfWriter()
-    for orig, trans in _pairs(original, translated):
+    body, tail = _split(original, translated_pages)
+    for index, orig in enumerate(original.pages):
+        trans = body[index] if index < len(body) else None
         sizes = [_size(p) for p in (orig, trans) if p is not None]
         half_width = max(w for w, _ in sizes)
         height = max(h for _, h in sizes)
         page = writer.add_blank_page(width=2 * half_width, height=height)
         # Original on the left, translated on the right; a missing twin
         # simply leaves its half blank.
-        if orig is not None:
-            _merge_into_half(page, orig, 0.0, half_width, height)
+        _merge_into_half(page, orig, 0.0, half_width, height)
         if trans is not None:
             _merge_into_half(page, trans, half_width, half_width, height)
+    # Tail pages carry no original twin; appended whole, at their own size.
+    for page in tail:
+        writer.add_page(page)
     return writer
 
 
+def _glossary_entries(sidecar) -> list | None:
+    """The sidecar's usable glossary, or None when there is nothing to render."""
+    if not config.GLOSSARY_PAGES or not isinstance(sidecar, dict):
+        return None
+
+    entries = sidecar.get("glossary")
+
+    if not isinstance(entries, list) or not entries:
+        return None
+
+    return entries
+
+
+def _content_page_count(sidecar: dict) -> int | None:
+    """How many pages the TRANSLATION itself has, per the sidecar's records.
+
+    Everything past this count in the translated input is the mono result's
+    own appended glossary — rendered fresh here instead, never copied.
+    """
+    count = sidecar.get("total_pages")
+
+    if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+        return count
+
+    pages = sidecar.get("pages")
+
+    return len(pages) if isinstance(pages, list) and pages else None
+
+
+def _append_glossary(composed: bytes, entries: list) -> bytes:
+    """`composed` with the glossary pages appended — or unchanged on failure.
+
+    Best-effort on purpose: the dual the caller paid nothing for must not 422
+    over its appendix.
+    """
+    import pymupdf
+
+    from server import glossary_pages
+
+    doc = pymupdf.open(stream=BytesIO(composed), filetype="pdf")
+
+    try:
+        if not glossary_pages.append_glossary_pages(doc, entries):
+            return composed
+
+        out = BytesIO()
+        # garbage=4 folds the per-box copies of the subset card font into one.
+        doc.save(out, garbage=4, deflate=True)
+
+        return out.getvalue()
+    finally:
+        doc.close()
+
+
 def compose_dual(original_bytes: bytes, translated_bytes: bytes,
-                 fmt: str) -> bytes:
-    """Build the requested dual variant; raises ComposeError on bad input."""
+                 fmt: str, sidecar: dict | None = None) -> bytes:
+    """Build the requested dual variant; raises ComposeError on bad input.
+
+    `sidecar` is optional and changes nothing when absent (or when it carries
+    no "glossary", or when GLOSSARY_PAGES is off) — see the module docstring
+    for what a glossary-bearing sidecar adds.
+    """
     if fmt not in COMPOSE_FORMATS:
         raise ComposeError(f"format must be one of {COMPOSE_FORMATS}")
     original = _read(original_bytes, "original")
     translated = _read(translated_bytes, "translated")
+
+    translated_pages = list(translated.pages)
+    entries = _glossary_entries(sidecar)
+
+    if entries is not None:
+        content = _content_page_count(sidecar)
+        if content is not None and content < len(translated_pages):
+            # Drop the mono result's baked-in glossary tail; the entries are
+            # rendered fresh below, at the composed page size.
+            translated_pages = translated_pages[:content]
+
     build = _alternating if fmt == "alternating" else _side_by_side
     out = BytesIO()
-    build(original, translated).write(out)
-    return out.getvalue()
+    build(original, translated_pages).write(out)
+    composed = out.getvalue()
+
+    if entries is not None:
+        try:
+            composed = _append_glossary(composed, entries)
+        except Exception:  # noqa: BLE001 - the appendix is optional
+            logger.exception("compose: appending glossary pages failed; "
+                             "returning the dual without them")
+
+    return composed
