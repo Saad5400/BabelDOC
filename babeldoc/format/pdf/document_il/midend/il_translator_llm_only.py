@@ -119,7 +119,7 @@ PHRASE_PAIRS_PROMPT_BLOCK = """
 ## Phrase Pairs
 For every input item that has "want_pairs": true, ALSO add a "pairs" field to that output item: a JSON array of {"s": <source phrase>, "t": <translated phrase>} objects segmenting BOTH texts completely.
 - Align by MEANING: each "t" is the translation of its "s". List the pairs in the SOURCE text's order; each "t" phrase will be located in your output wherever your translation actually put it — the two languages may order the phrases differently, and that is fine. NEVER pair a phrase with target words that merely occupy the same position.
-- Split into 2-8 phrases; longer sentences get more phrases.
+- Split as FINELY as possible — the ideal unit is ONE word: "Software products" is TWO pairs ("Software" and "products"), never one. Merge words into one unit only when the mapping forces it: glue an article/preposition to its content word when it has no standalone counterpart ("of products" → «المنتجات»), and keep grammar-fused forms together when word-by-word units would not be contiguous on both sides ("two local variables" → «متغيرين محليين»). A 12-word sentence should typically produce 8-12 pairs, not 3.
 - The phrases cover the PLAIN text: read both the item's "input" and your "output" with every <style id='N'>...</style> tag removed, keeping each tag's inner text in place. NEVER put a tag, or any part of one, inside an "s" or "t" phrase.
 - Placeholders like {v1} are OPAQUE WORDS of both texts: put each one inside EXACTLY ONE "s" phrase and EXACTLY ONE "t" phrase, at the spot where it sits in that text. NEVER split, alter, or drop such a token, and NEVER make a phrase that is ONLY tokens — a leading bullet's token belongs to the phrase that follows it, as in {"s": "{v1} Software products", "t": "{v1} منتجات البرمجيات"}.
 - Every word of that plain input must appear in exactly one "s" phrase, and every word of your plain output in exactly one "t" phrase: concatenating all "s" values with single spaces reproduces the plain input exactly, and the "t" values, rearranged into your output's own order, reproduce the plain output exactly.
@@ -142,13 +142,15 @@ Output:
     "id": 0,
     "output": "يجب الإعلان عن المتغير المحلي قبل استخدامه.",
     "pairs": [
-        {"s": "A local variable", "t": "المتغير المحلي"},
+        {"s": "A local", "t": "المحلي"},
+        {"s": "variable", "t": "المتغير"},
         {"s": "must be declared", "t": "يجب الإعلان عن"},
-        {"s": "before it is used.", "t": "قبل استخدامه."}
+        {"s": "before", "t": "قبل"},
+        {"s": "it is used.", "t": "استخدامه."}
     ]
     }
 ]
-Note how the Arabic starts with «يجب الإعلان عن» even though its pair is listed second: the pairs follow the SOURCE order and the meaning, not the output's word positions.
+Note how the Arabic starts with «يجب الإعلان عن» even though its pair is listed third: the pairs follow the SOURCE order and the meaning, not the output's word positions. Note also the granularity — "variable" and "before" stand alone; "must be declared" stays whole only because «يجب الإعلان عن» cannot be split against it word by word.
 """
 
 

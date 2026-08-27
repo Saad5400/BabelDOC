@@ -52,9 +52,12 @@ from babeldoc.format.pdf.document_il.midend.phrase_pairs import tile_permutation
 logger = logging.getLogger("doctranslate.phrase_highlights")
 
 # The owner-approved chip palette, cycled per paragraph: phrase i (on both
-# sides) gets PALETTE[i % 5]. Amber, sky, green, violet, pink. Subtlety is
+# sides) gets PALETTE[i % len]. Eight hues since the word-level granularity
+# ruling (2026-08-27), ordered so neighbours in the cycle sit far apart on
+# the wheel: amber, sky, green, pink, violet, teal, peach, lime. Subtlety is
 # ONE knob — FILL_OPACITY — by owner ruling; do not also desaturate these.
-PALETTE = ("#FDE68A", "#BAE6FD", "#BBF7D0", "#DDD6FE", "#FBCFE8")
+PALETTE = ("#FDE68A", "#BAE6FD", "#BBF7D0", "#FBCFE8",
+           "#DDD6FE", "#5EEAD4", "#FDBA74", "#D9F99D")
 
 # Chips draw like a text highlighter: soft, borderless, on top.
 FILL_OPACITY = 0.30

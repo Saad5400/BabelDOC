@@ -88,7 +88,8 @@ def _close(a, b) -> bool:
 def test_the_palette_cycles_per_paragraph():
     assert phrase_highlights.chip_color(0) == phrase_highlights.PALETTE[0]
     assert phrase_highlights.chip_color(4) == phrase_highlights.PALETTE[4]
-    assert phrase_highlights.chip_color(5) == phrase_highlights.PALETTE[0]
+    n = len(phrase_highlights.PALETTE)
+    assert phrase_highlights.chip_color(n) == phrase_highlights.PALETTE[0]
 
 
 @pytest.mark.parametrize("garbage", [
