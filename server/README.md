@@ -14,7 +14,7 @@ wrapper included, is public).
 | `GET` | `/v1/jobs/{id}/result` | token | The output PDF (`409` until `done`). |
 | `GET` | `/v1/jobs/{id}/sidecar` | token | The run's **translation sidecar** — its translated text as data (`409` until `done`, `404` when the run produced none). See below. |
 | `POST` | `/v1/compose` | token | Stateless dual builder. Multipart `original` + `translated` PDFs, field `format` = `alternating` \| `side_by_side`. Returns the composed PDF. Pure page shuffling — no LLM, no job, no charge. |
-| `POST` | `/v1/overlay` | token | Stateless **overlay** builder. Multipart `original` PDF + `sidecar` JSON, field `style` = `interlinear`, optional `scale`, `min_font_size`, `max_font_size`, `color` (hex), `align`, `plate_color` (hex), `plate_opacity`, `plate_padding`. Returns the overlaid PDF plus `X-Overlay-Pages` / `X-Overlay-Drawn` / `X-Overlay-Skipped` (and `X-Overlay-Raster-Drawn` / `X-Overlay-Raster-Skipped` for glosses inside embedded images). No LLM, no job, no charge. |
+| `POST` | `/v1/overlay` | token | Stateless **overlay** builder. Multipart `original` PDF + `sidecar` JSON, field `style` = `interlinear` \| `interlinear_compact`, optional `scale`, `min_font_size`, `max_font_size`, `gap`, `color` (hex), `align`, `plate_color` (hex), `plate_opacity`, `plate_padding` (each defaults to the tuning of the style asked for). Returns the overlaid PDF plus `X-Overlay-Pages` / `X-Overlay-Drawn` / `X-Overlay-Skipped` (and `X-Overlay-Raster-Drawn` / `X-Overlay-Raster-Skipped` for glosses inside embedded images). No LLM, no job, no charge. |
 | `POST` | `/v1/convert` | token | Stateless office-to-PDF normaliser (LibreOffice). Multipart `file` (docx/pptx/…). Returns the PDF. |
 | `GET` | `/healthz` | open | `200 {"status":"ok","versions":{babeldoc,tesseract,ocrmypdf,libreoffice}}`; `503 degraded` if a binary is missing. Deploy health check. |
 
@@ -63,22 +63,38 @@ the sidecar is for.
   user space, so they map straight onto the untouched original.
   Fetch it with the result and keep it: it is what makes every later layout
   free. Native dual runs write none (their geometry is the dual page's).
-- **`interlinear`** (`server/interlinear.py`): the original page untouched, with
-  each paragraph's translation drawn small in the whitespace directly above it.
-  Sized to the band it is given, spread down the paragraph's own source lines
-  when one band cannot hold it legibly (which is what makes a slide's merged
-  bullet list work), and SKIPPED rather than drawn over the reader's document
-  when there is no room — `X-Overlay-Skipped` reports how often that happened.
-  Arabic is shaped and bidi-resolved by PyMuPDF's Story engine; the gloss font
-  is BabelDOC's own, subset per document (a deck would otherwise carry one
-  15 MB font copy per gloss).
+- **`interlinear`** (`server/interlinear.py`): the original page, opened up so
+  that each paragraph's translation stands directly above the line it renders.
+  The page is cut along lines nothing crosses and the parts below each cut
+  slide down, making a band exactly as tall as the gloss needs; the freed space
+  is painted with a hairline of the background it was opened in, so a slide's
+  panel simply grows. A page is first divided into regions — columns at
+  full-height corridors, rows at full-width gaps — and each is opened
+  independently, so a screenshot beside the bullets is never sliced by them.
+  Nothing is scaled and nothing is reflowed: the original comes through at
+  1:1, further down a taller page. On two real 26-page decks this drew every
+  gloss (0 skipped) where the compact layout skipped a fifth of them.
+- **`interlinear_compact`**: the same idea with the page size held fixed — each
+  gloss drawn in whatever whitespace the author left above its paragraph,
+  sized to that band, spread down the paragraph's own source lines when one
+  band cannot hold it legibly, and SKIPPED rather than drawn over the reader's
+  document when there is no room (`X-Overlay-Skipped` counts those). For a
+  reader who needs the original pagination — and the fallback for a page whose
+  /Rotate the spaced layout cannot open along.
+
+  Arabic is shaped and bidi-resolved by PyMuPDF's Story engine in both; the
+  gloss font is BabelDOC's own, subset per document (a deck would otherwise
+  carry one 15 MB font copy per gloss).
+
   Sidecar blocks marked `on_raster` (text the engine found INSIDE an embedded
-  image, with the image's `region`) are glossed inside that image instead: on a
-  rounded translucent plate in the band directly above the label, placed by
-  reading the region's PIXELS — a plate may dim flat artwork but never cover a
-  mark — falling back below the label, else skipped. Their fit comes back on
-  `X-Overlay-Raster-Drawn` / `X-Overlay-Raster-Skipped`, and the plate is
-  tunable via `plate_color` / `plate_opacity` / `plate_padding` options.
+  image, with the image's `region`) are glossed inside that image in both
+  styles: on a rounded translucent plate in the band directly above the label,
+  placed by reading the region's PIXELS — a plate may dim flat artwork but
+  never cover a mark — falling back below the label, else skipped. Opening the
+  page cannot help a label that lives inside a raster, so under `interlinear`
+  the plates simply ride the image to wherever the cuts moved it. Their fit
+  comes back on `X-Overlay-Raster-Drawn` / `X-Overlay-Raster-Skipped`, and the
+  plate is tunable via `plate_color` / `plate_opacity` / `plate_padding`.
 
 ## Environment
 

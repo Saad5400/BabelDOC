@@ -89,9 +89,17 @@ def _sidecar(blocks: list[dict], *, size: tuple[float, float] = PAGE,
 
 
 def _render(original: bytes, sidecar: dict, **kwargs):
+    """The COMPACT layout — the one that may not move the original.
+
+    `interlinear` itself is the opened-up layout and has its own tests in
+    test_spaced.py; everything below is about fitting a gloss into space the
+    author happened to leave.
+    """
     options = interlinear.OverlayOptions(**kwargs) if kwargs else None
 
-    return interlinear.render_overlay(original, sidecar, options=options)
+    return interlinear.render_overlay(original, sidecar,
+                                      style=interlinear.COMPACT_STYLE,
+                                      options=options)
 
 
 def _is_arabic(text: str) -> bool:
@@ -720,7 +728,8 @@ def test_bad_plate_options_are_refused(kwargs):
 # /v1/overlay
 # --------------------------------------------------------------------------
 
-def _post(client, original, sidecar, *, style="interlinear", token=TOKEN, **data):
+def _post(client, original, sidecar, *, style=interlinear.COMPACT_STYLE,
+          token=TOKEN, **data):
     body = sidecar if isinstance(sidecar, bytes) else json.dumps(sidecar).encode()
 
     return client.post(
@@ -755,7 +764,7 @@ def test_endpoint_names_the_download_after_the_original(client):
     # The uploaded stem plus the style: a reader saving three layouts of one
     # deck ends up with three distinguishable files.
     assert resp.headers["content-disposition"] == (
-        'attachment; filename="orig.interlinear.pdf"')
+        'attachment; filename="orig.interlinear_compact.pdf"')
 
 
 def test_endpoint_refuses_an_unknown_style(client):
