@@ -1,7 +1,8 @@
 """Phrase-pair alignment: the translation, segmented into aligned phrases.
 
 The LLM that translates a paragraph is also asked — for paragraphs whose input
-carries no placeholder scaffolding — to segment its own work into an ordered
+carries no formula placeholders; style tags are fine, the phrases cover the
+plain text with the tags stripped — to segment its own work into an ordered
 list of aligned phrase pairs: «We can not»↔«لا يمكننا», «create»↔«إنشاء», and so
 on. Captured into the sidecar (with the page rectangles of each phrase on both
 sides), those pairs are what lets a later layout draw matching soft highlights

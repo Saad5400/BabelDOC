@@ -10,13 +10,22 @@ including the shapes a model returns when it misbehaves.
 """
 
 import json
+from types import SimpleNamespace
 
 from babeldoc.format.pdf.document_il import il_version_1
 from babeldoc.format.pdf.document_il.midend import phrase_pairs
 from babeldoc.format.pdf.document_il.midend import translation_sidecar
+from babeldoc.format.pdf.document_il.midend.il_translator import (
+    FormulaPlaceholder,
+    ILTranslator,
+    RichTextPlaceholder,
+)
 from babeldoc.format.pdf.document_il.midend.il_translator_llm_only import (
+    ILTranslatorLLMOnly,
     PHRASE_PAIRS_PROMPT_BLOCK,
     PROMPT_TEMPLATE,
+    pairs_eligible,
+    strip_style_placeholders,
 )
 from babeldoc.format.pdf.document_il.midend.typesetting import reshape_rtl_text
 
@@ -61,6 +70,14 @@ def test_the_pairs_instruction_teaches_the_contract_with_a_worked_example():
     for pair in REORDER_PAIRS:
         assert pair["s"] in PHRASE_PAIRS_PROMPT_BLOCK
         assert pair["t"] in PHRASE_PAIRS_PROMPT_BLOCK
+
+
+def test_the_pairs_instruction_covers_the_plain_text_of_styled_inputs():
+    # Styled paragraphs carry <style id='N'> wrappers in their input; the
+    # phrases must cover the text with those removed, content kept in place.
+    assert "PLAIN text" in PHRASE_PAIRS_PROMPT_BLOCK
+    assert "<style id='N'>...</style>" in PHRASE_PAIRS_PROMPT_BLOCK
+    assert "keeping each tag's inner text in place" in PHRASE_PAIRS_PROMPT_BLOCK
 
 
 # --- parsing: items with and without pairs -----------------------------------
@@ -507,3 +524,156 @@ def test_attach_target_rects_swallows_a_broken_state(tmp_path):
     translation_sidecar.attach_target_rects(
         {"path": tmp_path / "nope.json", "sidecar": {}, "pending": [
             ("wrong", "shape")]})  # even the tuple arity is untrusted
+
+
+# --- styled paragraphs: style wrappers no longer exclude a paragraph ---------
+#
+# On real lecture slides nearly every body bullet is a styled paragraph — the
+# bullet glyph «•» alone is a different font run and becomes a <style id='N'>
+# wrapper — and under the old all-placeholders-excluded rule only titles and
+# footers ever got pairs. Style tags merely WRAP text the model sees, so such
+# paragraphs are eligible; formula placeholders ({vN}) REPLACE text the model
+# never sees, so those stay excluded.
+
+
+def _style_placeholder(pid=1):
+    """A RichTextPlaceholder exactly as the OpenAI-shaped translator mints it."""
+    return RichTextPlaceholder(
+        pid, None,
+        f"<style id='{pid}'>", "</style>",
+        f"<\\s*style\\s*id\\s*=\\s*'\\s*{pid}\\s*'\\s*>", r"<\s*\/\s*style\s*>",
+    )
+
+
+def _formula_placeholder(pid=1):
+    return FormulaPlaceholder(
+        pid, None, "{v" + str(pid) + "}", f"{{\\s*v\\s*{pid}\\s*}}")
+
+
+def _capture_translator():
+    """An ILTranslatorLLMOnly reduced to its capture seam: no engine, no LLM."""
+    translator = object.__new__(ILTranslatorLLMOnly)
+    translator.capture_phrase_pairs = True
+    translator.pairs_kept = 0
+    translator.pairs_discarded = 0
+    translator.translation_config = SimpleNamespace(phrase_pair_store={})
+    return translator
+
+
+def test_style_placeholders_no_longer_disqualify_but_formulas_still_do():
+    assert pairs_eligible(ILTranslator.TranslateInput("plain text", []))
+    assert pairs_eligible(ILTranslator.TranslateInput(
+        "<style id='1'>•</style> body", [_style_placeholder(1)]))
+    assert not pairs_eligible(ILTranslator.TranslateInput(
+        "{v1} energy", [_formula_placeholder(1)]))
+    assert not pairs_eligible(ILTranslator.TranslateInput(
+        "<style id='1'>E</style> = {v2}",
+        [_style_placeholder(1), _formula_placeholder(2)]))
+
+
+def test_stripping_style_wrappers_leaves_the_plain_text():
+    placeholders = [_style_placeholder(1)]
+
+    assert strip_style_placeholders(
+        "<style id='1'>•</style> We can not create", placeholders,
+    ) == "• We can not create"
+    # A mid-sentence styled run (a bolded term) strips in place.
+    assert strip_style_placeholders(
+        "We can <style id='1'>not</style> create", placeholders,
+    ) == "We can not create"
+    # The model's echoed tags are matched the way parse_translate_output
+    # matches them: case-insensitive and whitespace-tolerant.
+    assert strip_style_placeholders(
+        "< STYLE id = ' 1 ' >•< / style > We can", placeholders,
+    ) == "• We can"
+    # Formula tokens are NOT text and are never stripped into it.
+    assert strip_style_placeholders(
+        "{v1} stays", [_formula_placeholder(1)]) == "{v1} stays"
+
+
+def test_a_mid_sentence_styled_run_validates_over_the_plain_text():
+    plain = strip_style_placeholders(
+        "We can <style id='1'>not</style> create", [_style_placeholder(1)])
+
+    pairs = [{"s": "We can not", "t": "لا يمكننا"}, {"s": "create", "t": "إنشاء"}]
+    assert phrase_pairs.validate_pairs(pairs, plain, "لا يمكننا إنشاء") == (
+        pairs, [0, 1])
+
+
+def test_a_styled_bullet_paragraph_is_captured_end_to_end(tmp_path):
+    # The real deck shape: the bullet glyph is its own font run, so the model
+    # was sent "<style id='1'>•</style> We can not create" and echoed the tag
+    # around the untranslated bullet.
+    paragraph = _paragraph(
+        "• We can not create", _box(60, 680, 400, 714),
+        compositions=[_char_run("• We can not", 714, 60),
+                      _char_run("create", 696, 60)])
+    docs = _document([paragraph])
+    sources = translation_sidecar.snapshot_source(docs)
+
+    # What ILTranslator leaves after APPLYING the parsed output: the styled
+    # run resolved back to its own characters, the translation as a unicode
+    # run — while paragraph.unicode keeps the RAW tagged output.
+    paragraph.unicode = "<style id='1'>•</style> لا يمكننا إنشاء"
+    paragraph.pdf_paragraph_composition = [
+        _char_run("•", 714, 60),
+        il_version_1.PdfParagraphComposition(
+            pdf_same_style_unicode_characters=(
+                il_version_1.PdfSameStyleUnicodeCharacters(
+                    unicode=" لا يمكننا إنشاء"))),
+    ]
+
+    translator = _capture_translator()
+    translate_input = ILTranslator.TranslateInput(
+        "<style id='1'>•</style> We can not create", [_style_placeholder(1)])
+    translator._capture_phrase_pairs(
+        paragraph=paragraph,
+        translate_input=translate_input,
+        source_text=translate_input.unicode,
+        raw_pairs=[{"s": "•", "t": "•"},
+                   {"s": "We can not", "t": "لا يمكننا"},
+                   {"s": "create", "t": "إنشاء"}])
+
+    # The pairs validated over the PLAIN texts on both sides.
+    assert translator.pairs_kept == 1
+    store = translator.translation_config.phrase_pair_store
+    assert [(p["s"], p["t"]) for p in store[id(paragraph)]["pairs"]] == [
+        ("•", "•"), ("We can not", "لا يمكننا"), ("create", "إنشاء")]
+
+    # s_rects resolve against the snapshotted source characters…
+    path = tmp_path / "sidecar.json"
+    state = translation_sidecar.write_sidecar(
+        docs, path, lang_in="en", lang_out="ar", sources=sources,
+        pair_store=store)
+    assert state is not None
+    block = json.loads(path.read_text(encoding="utf-8"))[
+        "pages"][0]["blocks"][0]
+    # …and the block's target — what the "t" phrases were validated
+    # against — is the PLAIN reader text, never the tagged raw output.
+    assert block["target"] == "• لا يمكننا إنشاء"
+    assert all(pair["s_rects"] for pair in block["pairs"])
+
+    # …and t_rects resolve against the typeset characters.
+    paragraph.unicode = "• لا يمكننا إنشاء"
+    _typeset(paragraph)
+    translation_sidecar.attach_target_rects(state)
+    written = json.loads(path.read_text(encoding="utf-8"))[
+        "pages"][0]["blocks"][0]["pairs"]
+    assert all(pair["t_rects"] for pair in written)
+
+
+def test_a_formula_paragraph_is_still_excluded_at_the_capture_seam():
+    translator = _capture_translator()
+    paragraph = _paragraph("طاقة {v1}", _box(60, 680, 400, 714))
+
+    translator._capture_phrase_pairs(
+        paragraph=paragraph,
+        translate_input=ILTranslator.TranslateInput(
+            "{v1} energy", [_formula_placeholder(1)]),
+        source_text="{v1} energy",
+        raw_pairs=[{"s": "{v1} energy", "t": "طاقة {v1}"}])
+
+    # Not discarded — never in the game: no store entry, no counter moved.
+    assert translator.translation_config.phrase_pair_store == {}
+    assert translator.pairs_kept == 0
+    assert translator.pairs_discarded == 0

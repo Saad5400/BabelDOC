@@ -64,8 +64,9 @@ the sidecar is for.
   Fetch it with the result and keep it: it is what makes every later layout
   free. Native dual runs write none (their geometry is the dual page's).
 - **Phrase pairs** (`babeldoc/.../midend/phrase_pairs.py`): the translating LLM
-  also segments each plain-text paragraph into aligned phrases, and blocks whose
-  segmentation survived strict validation carry a **`"pairs"`** key:
+  also segments each paragraph into aligned phrases (styled runs included — the
+  phrases cover the plain text with the `<style>` wrappers stripped), and blocks
+  whose segmentation survived strict validation carry a **`"pairs"`** key:
   `[{s, t, s_rects, t_rects}]`, ordered, a complete word-boundary segmentation
   of both `source` and `target`. `s_rects` are per-visual-line rectangles of the
   phrase on the ORIGINAL page (same space as the block's `box`); `t_rects` are
@@ -73,7 +74,8 @@ the sidecar is for.
   typesetting, where the translated text first gets boxes — RTL-mirrored page
   space and all). Either rect key may be absent when its side could not be
   mapped exactly — wrong boxes are never emitted — and `"pairs"` itself is
-  absent on paragraphs with placeholder scaffolding, fallback translations, and
+  absent on paragraphs with formula placeholders (`{vN}` hides characters the
+  model never sees), fallback translations, and
   every sidecar from before this feature: consumers must tolerate all of that.
   This is the data a highlight overlay draws matching source↔translation
   rectangles from. `PHRASE_PAIRS=0` stops requesting pairs entirely.
