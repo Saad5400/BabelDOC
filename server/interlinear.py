@@ -276,7 +276,7 @@ class _GlossFont:
 
     def __init__(self, texts: list[str], options: OverlayOptions) -> None:
         self.archive = pymupdf.Archive()
-        self.archive.add(self._font_bytes(texts), "gloss.ttf")
+        self.archive.add(subset_font_bytes(_font_path(), texts), "gloss.ttf")
         self.css = (
             "@font-face {font-family: gloss; src: url(gloss.ttf);}"
             " body {margin: 0;}"
@@ -284,38 +284,41 @@ class _GlossFont:
             f" line-height: {options.line_height};}}"
         )
 
-    @staticmethod
-    def _font_bytes(texts: list[str]) -> bytes:
-        source = _font_path()
 
-        try:
-            from fontTools import subset
-        except ImportError:
-            # Correct, just fat and slow. Never a reason to refuse the render.
-            logger.warning("fontTools is unavailable; embedding the full gloss "
-                           "font (large output)")
-            return source.read_bytes()
+def subset_font_bytes(source: Path, texts: list[str]) -> bytes:
+    """`source` subset to what `texts` need — or whole, never refused.
 
-        try:
-            options = subset.Options()
-            options.layout_features = ["*"]
-            options.name_IDs = ["*"]
-            options.notdef_outline = True
-            options.drop_tables += ["DSIG"]
+    Shared with `server/page_fonts.py`, which sets the appendix pages in the
+    same face (plus its bold) and has the same 15 MB problem to solve.
+    """
+    try:
+        from fontTools import subset
+    except ImportError:
+        # Correct, just fat and slow. Never a reason to refuse the render.
+        logger.warning("fontTools is unavailable; embedding the full gloss "
+                       "font (large output)")
+        return source.read_bytes()
 
-            font = subset.load_font(str(source), options)
-            subsetter = subset.Subsetter(options=options)
-            subsetter.populate(unicodes=_subset_codepoints(texts))
-            subsetter.subset(font)
+    try:
+        options = subset.Options()
+        options.layout_features = ["*"]
+        options.name_IDs = ["*"]
+        options.notdef_outline = True
+        options.drop_tables += ["DSIG"]
 
-            buffer = BytesIO()
-            subset.save_font(font, buffer, options)
+        font = subset.load_font(str(source), options)
+        subsetter = subset.Subsetter(options=options)
+        subsetter.populate(unicodes=_subset_codepoints(texts))
+        subsetter.subset(font)
 
-            return buffer.getvalue()
-        except Exception:  # noqa: BLE001 - subsetting is an optimisation
-            logger.exception("subsetting the gloss font failed; using it whole")
+        buffer = BytesIO()
+        subset.save_font(font, buffer, options)
 
-            return source.read_bytes()
+        return buffer.getvalue()
+    except Exception:  # noqa: BLE001 - subsetting is an optimisation
+        logger.exception("subsetting the gloss font failed; using it whole")
+
+        return source.read_bytes()
 
 
 def _subset_codepoints(texts: list[str]) -> set[int]:
