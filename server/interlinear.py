@@ -35,6 +35,14 @@ TEXT RENDERING is PyMuPDF's Story engine, which shapes Arabic into its
 contextual forms and runs the bidi algorithm over it — including the Latin
 technical terms the glossary deliberately keeps in Latin script. The sidecar
 carries logical text, so this holds for any target language, RTL or not.
+
+PHRASE HIGHLIGHTS ride along when a block carries "pairs" (the aligned phrase
+segmentation — server/phrase_highlights.py): the source phrases get soft
+colour chips over the original text (`s_rects`, the same draw the compose
+duals use), and the gloss's own words get matching background spans in the
+HTML built here. The pairs' `t_rects` are NOT used — they live in the mono
+layout's page space, and the gloss is laid out fresh by the Story engine.
+`PHRASE_HIGHLIGHTS=0` turns all of it off.
 """
 
 from __future__ import annotations
@@ -50,6 +58,7 @@ from typing import Any
 import pymupdf
 
 from server import config
+from server import phrase_highlights
 
 logger = logging.getLogger("doctranslate.interlinear")
 
@@ -273,11 +282,14 @@ def _css_align(align: str, rtl: bool) -> str:
     return "right" if align == "left" else "left"
 
 
-def _gloss_html(text: str, font_size: float, direction: str, align: str) -> str:
+def _gloss_html(text: str, font_size: float, direction: str, align: str,
+                inner_html: str | None = None) -> str:
+    """One gloss's markup. `inner_html`, when given, is ALREADY-ESCAPED body
+    markup (the phrase-highlight spans) standing in for the escaped text."""
     return (
         f'<div class="gloss" dir="{direction}"'
         f' style="font-size:{font_size:.2f}px;text-align:{align}">'
-        f"{html.escape(text)}</div>"
+        f"{html.escape(text) if inner_html is None else inner_html}</div>"
     )
 
 
@@ -376,8 +388,10 @@ class _Layout:
         self.align = _css_align(options.align, rtl)
         self.options = options
 
-    def html(self, text: str, font_size: float) -> str:
-        return _gloss_html(text, font_size, self.direction, self.align)
+    def html(self, text: str, font_size: float,
+             inner_html: str | None = None) -> str:
+        return _gloss_html(text, font_size, self.direction, self.align,
+                           inner_html)
 
     def measure(self, text: str, font_size: float, width: float) -> float:
         """The height this gloss needs at the width it will be drawn in.
@@ -425,11 +439,18 @@ class _Layout:
             size = max(floor, size * 0.85)
 
     def draw(self, page: pymupdf.Page, rect: pymupdf.Rect, text: str,
-             font_size: float) -> None:
+             font_size: float,
+             highlighter: phrase_highlights.GlossHighlighter | None = None) -> None:
+        # The phrase spans change colours only, never metrics, so the fit that
+        # was measured on the plain text still holds for the highlighted body.
+        # A None from the highlighter (this text is not the segmentation's
+        # next piece) degrades to the plain gloss.
+        inner = highlighter.html(text) if highlighter is not None else None
         # scale_low lets the renderer absorb a sub-point disagreement with the
         # measuring pass instead of dropping the gloss; fit() means it is never
         # asked for real shrinking.
-        page.insert_htmlbox(rect, self.html(text, font_size), css=self.font.css,
+        page.insert_htmlbox(rect, self.html(text, font_size, inner),
+                            css=self.font.css,
                             archive=self.font.archive, scale_low=0.75)
 
 
@@ -657,6 +678,36 @@ def _cover_ink(anchor: pymupdf.Rect, source_size: float,
     return pymupdf.Rect(anchor.x0, top, anchor.x1, anchor.y1)
 
 
+def _source_chips(page: pymupdf.Page, pairs, matrix: pymupdf.Matrix,
+                  budget: int) -> int:
+    """Draw one block's phrase chips over its ORIGINAL text. Returns the count.
+
+    The `s_rects` side of the block's pairs, tinted phrase-by-phrase with the
+    same palette the compose duals use — the gloss above carries the matching
+    colours as spans. The `t_rects` side does not apply here: the Arabic is
+    laid out fresh by the Story engine, not by the mono layout those rects
+    live in. Best-effort; the sidecar is uploader-supplied and `budget` caps
+    a page's total chips.
+    """
+    drawn = 0
+
+    try:
+        for rects, color_index in phrase_highlights.pair_chip_rects(pairs,
+                                                                    "s_rects"):
+            rects = rects[:budget - drawn]
+
+            if not rects:
+                break
+
+            drawn += phrase_highlights.draw_phrase_rects(
+                page, [_to_display(rect, matrix) for rect in rects],
+                color_index)
+    except Exception:  # noqa: BLE001 - chips are a bonus, never a risk
+        logger.exception("interlinear: phrase chips failed for a block")
+
+    return drawn
+
+
 def _render_page(page: pymupdf.Page, page_data: dict,
                  layout: _Layout) -> tuple[int, int]:
     """Draw one page's glosses. Returns `(drawn, skipped)`."""
@@ -707,9 +758,21 @@ def _render_page(page: pymupdf.Page, page_data: dict,
                            page_rect.x1)
 
         drawn = skipped = 0
+        chip_budget = phrase_highlights.MAX_RECTS_PER_PAGE
 
         for block, anchor in zip(blocks, anchors, strict=False):
             text = block["target"].strip()
+            highlighter = None
+
+            # Matching phrase highlights: chips over the source phrases, and a
+            # highlighter that colours the gloss's own spans to match. Both
+            # degrade to nothing on absent or invalid pairs.
+            if config.PHRASE_HIGHLIGHTS and block.get("pairs"):
+                chip_budget -= _source_chips(page, block["pairs"], matrix,
+                                             chip_budget)
+                highlighter = phrase_highlights.gloss_highlighter(
+                    text, block["pairs"])
+
             source_size = float(block.get("font_size") or 0) or anchor.height
             lines = [_cover_ink(_to_display(line, matrix), source_size, ink)
                      for line in (block.get("lines") or [])]
@@ -730,7 +793,7 @@ def _render_page(page: pymupdf.Page, page_data: dict,
                            or min(size for _rect, size, _chunk in spread)
                            >= single[1] * _SPREAD_TOLERANCE):
                 for rect, font_size, chunk in spread:
-                    layout.draw(page, rect, chunk, font_size)
+                    layout.draw(page, rect, chunk, font_size, highlighter)
                     obstacles.append(rect)
 
                 # The source lines are obstacles from here on too: without them
@@ -744,7 +807,7 @@ def _render_page(page: pymupdf.Page, page_data: dict,
                 continue
 
             rect, font_size = single
-            layout.draw(page, rect, text, font_size)
+            layout.draw(page, rect, text, font_size, highlighter)
             obstacles.append(rect)
             drawn += 1
 

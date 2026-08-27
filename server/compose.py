@@ -24,6 +24,16 @@ translated input's own glossary tail (everything past the page count the
 sidecar records) is IGNORED, so the appendix is never in the document twice.
 Without a sidecar the tail-append rule above keeps a glossary-tailed mono
 usable as-is.
+
+PHRASE HIGHLIGHTS: when the sidecar's blocks carry "pairs" (the aligned phrase
+segmentation phrase_pairs.py captured), both duals get matching colour chips —
+each source phrase and its translation tinted alike. Compose itself only
+shuffles pypdf pages, so the chips are a PyMuPDF PRE-PASS over the two INPUT
+byte strings (server/phrase_highlights.py): s_rects drawn on the original,
+t_rects on the translated, before either is opened for assembly. Everything
+downstream is untouched — the pre-pass never changes a page count, so the
+glossary-tail accounting above still holds, and side_by_side's placement
+scaling carries the chips along with the page they sit on for free.
 """
 
 import logging
@@ -35,6 +45,7 @@ from pypdf import PdfWriter
 from pypdf import Transformation
 
 from server import config
+from server import phrase_highlights
 
 logger = logging.getLogger("doctranslate.compose")
 
@@ -192,6 +203,16 @@ def compose_dual(original_bytes: bytes, translated_bytes: bytes,
     """
     if fmt not in COMPOSE_FORMATS:
         raise ComposeError(f"format must be one of {COMPOSE_FORMATS}")
+
+    if config.PHRASE_HIGHLIGHTS and isinstance(sidecar, dict):
+        # The chips pre-pass (module docstring): draw on the input bytes,
+        # assemble exactly as before. Best-effort inside — on any failure the
+        # bytes come back untouched, never an exception.
+        original_bytes = phrase_highlights.highlight_pairs(
+            original_bytes, sidecar, "s_rects")
+        translated_bytes = phrase_highlights.highlight_pairs(
+            translated_bytes, sidecar, "t_rects")
+
     original = _read(original_bytes, "original")
     translated = _read(translated_bytes, "translated")
 

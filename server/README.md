@@ -13,7 +13,7 @@ wrapper included, is public).
 | `GET` | `/v1/jobs/{id}` | token | `{"status": "queued|running|done|failed", "progress": {"percent", "stage"}, "pages", "format", "usage": {...} (when done), "error" (when failed)}` |
 | `GET` | `/v1/jobs/{id}/result` | token | The output PDF (`409` until `done`). |
 | `GET` | `/v1/jobs/{id}/sidecar` | token | The run's **translation sidecar** — its translated text as data (`409` until `done`, `404` when the run produced none). See below. |
-| `POST` | `/v1/compose` | token | Stateless dual builder. Multipart `original` + `translated` PDFs, field `format` = `alternating` \| `side_by_side`, optional `sidecar` JSON (see **Terms pages**). Returns the composed PDF. Pure page shuffling (plus the glossary render when the sidecar carries one) — no LLM, no job, no charge. |
+| `POST` | `/v1/compose` | token | Stateless dual builder. Multipart `original` + `translated` PDFs, field `format` = `alternating` \| `side_by_side`, optional `sidecar` JSON (see **Terms pages** and **Phrase highlights**). Returns the composed PDF. Pure page shuffling (plus the glossary render and the phrase-highlight chips when the sidecar carries them) — no LLM, no job, no charge. |
 | `POST` | `/v1/overlay` | token | Stateless **overlay** builder. Multipart `original` PDF + `sidecar` JSON, field `style` = `interlinear`, optional `scale`, `min_font_size`, `max_font_size`, `color` (hex), `align`. Returns the overlaid PDF plus `X-Overlay-Pages` / `X-Overlay-Drawn` / `X-Overlay-Skipped`. No LLM, no job, no charge. |
 | `POST` | `/v1/convert` | token | Stateless office-to-PDF normaliser (LibreOffice). Multipart `file` (docx/pptx/…). Returns the PDF. |
 | `GET` | `/healthz` | open | `200 {"status":"ok","versions":{babeldoc,tesseract,ocrmypdf,libreoffice}}`; `503 degraded` if a binary is missing. Deploy health check. |
@@ -77,6 +77,29 @@ the sidecar is for.
   every sidecar from before this feature: consumers must tolerate all of that.
   This is the data a highlight overlay draws matching source↔translation
   rectangles from. `PHRASE_PAIRS=0` stops requesting pairs entirely.
+- **Phrase highlights** (`server/phrase_highlights.py`): the drawing side of
+  those pairs. Phrase i of a paragraph gets colour i on both sides — a soft
+  background chip (no border, rounded corners, ~0.4 opacity drawn ON TOP of
+  the page content, so scanned pages work too), palette cycled per paragraph.
+  - **`/v1/compose`** (`alternating` and `side_by_side`): when the uploaded
+    sidecar's blocks carry `"pairs"`, a PyMuPDF pre-pass draws `s_rects` chips
+    on the original input and `t_rects` chips on the translated input before
+    the pypdf assembly runs — so side-by-side's placement scaling carries the
+    chips for free, and the glossary-tail page accounting is untouched. A pair
+    missing one side's rects still highlights the side it has.
+  - **`/v1/overlay`**: `s_rects` chips over the original text (same draw); the
+    Arabic side is the gloss the Story engine lays out fresh, so instead of
+    `t_rects` the gloss's phrase segments get matching
+    `background-color` spans inside the gloss HTML. On any mismatch between
+    the pairs' `t` phrases and the gloss text, that paragraph's gloss renders
+    unhighlighted.
+
+  Everything is best-effort and bounded (sidecars are uploader-supplied at
+  these endpoints): garbage rects are skipped silently, every chip is clamped
+  to its page, and a failure returns the unhighlighted output rather than an
+  error. `PHRASE_HIGHLIGHTS=0` turns the drawing off at both call sites —
+  independent of `PHRASE_PAIRS`, which gates capture. The mono result itself
+  is never chipped: one language, nothing to match.
 - **`interlinear`** (`server/interlinear.py`): the original page untouched, with
   each paragraph's translation drawn small in the whitespace directly above it.
   Sized to the band it is given, spread down the paragraph's own source lines
@@ -127,6 +150,7 @@ call and every append, on all three paths.
 | `JOB_TTL_HOURS` | `24` | Job retention |
 | `GLOSSARY_PAGES` | `1` | «شرح المصطلحات» terms pages; `0` disables extraction and every append |
 | `PHRASE_PAIRS` | `1` | Phrase-pair alignment in the sidecar (`"pairs"` on its blocks); `0` stops requesting pairs from the LLM |
+| `PHRASE_HIGHLIGHTS` | `1` | Matching phrase-highlight chips on `/v1/compose` duals and the `/v1/overlay` gloss; `0` turns the drawing off (capture is `PHRASE_PAIRS`'s job) |
 
 ## Run locally
 
