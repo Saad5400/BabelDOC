@@ -77,6 +77,7 @@ PDFCharacter =
     attribute formula_layout_id { xsd:int }?,
     attribute renderOrder { xsd:int }?,
     attribute subRenderOrder { xsd:int }?,
+    attribute renderMode { xsd:int }?,
     PDFStyle,
     Box,
     element visual_bbox { Box }?
@@ -110,6 +111,9 @@ PDFParagraph =
     attribute layout_label { xsd:string }?,
     attribute layout_id { xsd:int }?,
     attribute renderOrder { xsd:int }?,
+    attribute rasterRegion {
+      list { xsd:float, xsd:float, xsd:float, xsd:float }
+    }?,
     Box,
     PDFStyle,
     PDFParagraphComposition*
@@ -157,7 +161,10 @@ PDFRectangle =
     attribute fill_background { xsd:boolean }?,
     attribute xobjId { xsd:int }?,
     attribute lineWidth { xsd:float }?,
-    attribute renderOrder { xsd:int }?
+    attribute renderOrder { xsd:int }?,
+    attribute rasterRegion {
+      list { xsd:float, xsd:float, xsd:float, xsd:float }
+    }?
   }
 PDFCurve =
   element pdfCurve {

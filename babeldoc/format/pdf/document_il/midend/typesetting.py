@@ -1131,6 +1131,10 @@ class _RtlBidiElement:
 class Typesetting:
     stage_name = "Typesetting"
 
+    # How far past its source width an image-OCR label box may widen
+    # (see _prefit_raster_label_box).
+    RASTER_LABEL_MAX_GROWTH = 2.2
+
     def __init__(self, translation_config: TranslationConfig):
         self.font_mapper = FontMapper(translation_config)
         self.translation_config = translation_config
@@ -1189,6 +1193,11 @@ class Typesetting:
                     if all(unit.can_passthrough for unit in typesetting_units):
                         paragraph.optimal_scale = 1.0
                     else:
+                        # A raster label's box is widened before its scale is
+                        # computed, so the scale reflects the fitted box.
+                        self._prefit_raster_label_box(
+                            paragraph, page, typesetting_units
+                        )
                         # 获取最优缩放因子
                         optimal_scale = self._get_optimal_scale(
                             paragraph, page, typesetting_units
@@ -1305,10 +1314,15 @@ class Typesetting:
             if scale < 0.7:
                 space_expanded = False  # 标记是否成功扩展了空间
 
+                raster_region = self._raster_region(paragraph)
                 if expand_space_flag == 0:
                     # 尝试向下扩展
                     try:
                         min_y = self.get_max_bottom_space(box, page) + 2
+                        if raster_region is not None:
+                            # An image-OCR label may only grow inside its
+                            # own raster image (Contract 2).
+                            min_y = max(min_y, float(raster_region[1]) + 1)
                         if min_y < box.y:
                             expanded_box = Box(x=box.x, y=min_y, x2=box.x2, y2=box.y2)
                             box = expanded_box
@@ -1328,6 +1342,8 @@ class Typesetting:
                     # 尝试向右扩展
                     try:
                         max_x = self.get_max_right_space(box, page) - 5
+                        if raster_region is not None:
+                            max_x = min(max_x, float(raster_region[2]) - 1)
                         if max_x > box.x2:
                             expanded_box = Box(x=box.x, y=box.y, x2=max_x, y2=box.y2)
                             box = expanded_box
@@ -1893,6 +1909,26 @@ class Typesetting:
             )
 
     @staticmethod
+    def _raster_region(obj) -> list[float] | None:
+        """The image-text region an element is anchored to, if any.
+
+        Image-OCR label paragraphs and their masks carry the containing
+        raster image's placement box (Contract 2): under the RTL mirror they
+        must ride that image's rigid translation, never mirror on their own.
+        """
+        region = getattr(obj, "raster_region", None)
+        if region and len(region) == 4 and None not in region:
+            return region
+        return None
+
+    @classmethod
+    def _shift_raster_region(cls, obj, dx: float) -> None:
+        region = cls._raster_region(obj)
+        if region is not None:
+            region[0] = float(region[0]) + dx
+            region[2] = float(region[2]) + dx
+
+    @staticmethod
     def _find_anchor_dx(anchors, box) -> float | None:
         """dx of the smallest paragraph box containing `box`, if any."""
         best = None
@@ -1928,7 +1964,15 @@ class Typesetting:
             if not self._box_is_valid(paragraph.box):
                 continue
             box = paragraph.box
-            dx = pivot - box.x - box.x2
+            region = self._raster_region(paragraph)
+            if region is not None:
+                # An image-OCR label rides its raster image: the image
+                # mirrors as a rigid translation (content never flips), so
+                # the label gets exactly the image's dx, not its own.
+                dx = pivot - region[0] - region[2]
+                self._shift_raster_region(paragraph, dx)
+            else:
+                dx = pivot - box.x - box.x2
             paragraph_anchors.append(((box.x, box.y, box.x2, box.y2), dx))
             if abs(dx) < 1e-6:
                 continue
@@ -1968,7 +2012,13 @@ class Typesetting:
         for rect in page.pdf_rectangle:
             if not in_scope(rect.xobj_id) or not self._box_is_valid(rect.box):
                 continue
-            dx = pivot - rect.box.x - rect.box.x2
+            region = self._raster_region(rect)
+            if region is not None:
+                # An image-OCR mask rides its raster image, like its label.
+                dx = pivot - region[0] - region[2]
+                self._shift_raster_region(rect, dx)
+            else:
+                dx = pivot - rect.box.x - rect.box.x2
             if abs(dx) >= 1e-6:
                 self._shift_box_x(rect.box, dx)
 
@@ -2097,6 +2147,54 @@ class Typesetting:
             ),
         )
 
+    def _prefit_raster_label_box(
+        self,
+        paragraph: il_version_1.PdfParagraph,
+        page: il_version_1.Page,
+        typesetting_units: list[TypesettingUnit],
+    ) -> None:
+        """Widen a raster label's box around its center to fit one line.
+
+        An image-OCR label box is glyph-tight around a SHORT source word
+        ("Object"), so a longer translation would wrap letter-by-letter down
+        the artwork. The label sits centered on its shape, so growth is
+        symmetric about the center — clamped to the containing image region
+        and stopping short of the other labels on the same raster
+        (Contract 2). Idempotent: a box that is already wide enough is left
+        alone.
+        """
+        region = self._raster_region(paragraph)
+        box = paragraph.box
+        if region is None or box is None:
+            return
+        natural_width = sum(unit.width for unit in typesetting_units)
+        needed = natural_width * 1.05 + 2.0
+        # The label usually sits on a shape (a hexagon, an ellipse) the IL
+        # cannot see: growing to the translation's full natural width would
+        # walk the text off the shape onto whatever is behind it. Grow at
+        # most this factor past the source label and let the normal
+        # shrink-to-fit scale handle the rest.
+        needed = min(needed, (box.x2 - box.x) * self.RASTER_LABEL_MAX_GROWTH)
+        if needed <= box.x2 - box.x:
+            return
+        center = (box.x + box.x2) / 2
+        x1 = max(center - needed / 2, float(region[0]) + 1.0)
+        x2 = min(center + needed / 2, float(region[2]) - 1.0)
+        for other in page.pdf_paragraph:
+            if other is paragraph or self._raster_region(other) is None:
+                continue
+            other_box = other.box
+            if not self._box_is_valid(other_box):
+                continue
+            if other_box.y >= box.y2 or other_box.y2 <= box.y:
+                continue  # no vertical overlap: not in the way
+            if other_box.x2 <= box.x:
+                x1 = max(x1, other_box.x2 + 1.0)
+            if other_box.x >= box.x2:
+                x2 = min(x2, other_box.x - 1.0)
+        if x2 - x1 > box.x2 - box.x:
+            box.x, box.x2 = x1, x2
+
     def render_paragraph(
         self,
         paragraph: il_version_1.PdfParagraph,
@@ -2114,6 +2212,7 @@ class Typesetting:
                 typesetting_units,
             )
         else:
+            self._prefit_raster_label_box(paragraph, page, typesetting_units)
             # 使用预计算的缩放因子进行重排版
             precomputed_scale = (
                 paragraph.optimal_scale if paragraph.optimal_scale is not None else 1.0
