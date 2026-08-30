@@ -12,6 +12,17 @@ TOKEN = "test-token"  # noqa: S105 - a test fixture's shared secret
 
 
 @pytest.fixture()
+def anyio_backend():
+    """Run every `@pytest.mark.anyio` test on asyncio, and only asyncio.
+
+    anyio's plugin would otherwise parameterise each async test over asyncio
+    AND trio; trio is not a dependency of this service and uvicorn does not run
+    on it, so the second run would be testing a stack we never ship.
+    """
+    return "asyncio"
+
+
+@pytest.fixture()
 def client(monkeypatch, tmp_path):
     """The app with the token configured and the job worker stood down.
 

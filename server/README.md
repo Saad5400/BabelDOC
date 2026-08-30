@@ -15,8 +15,8 @@ wrapper included, is public).
 | `GET` | `/v1/jobs/{id}/sidecar` | token | The run's **translation sidecar** — its translated text as data (`409` until `done`, `404` when the run produced none). See below. |
 | `POST` | `/v1/compose` | token | Stateless dual builder. Multipart `original` + `translated` PDFs, field `format` = `alternating` \| `side_by_side`, optional `sidecar` JSON (see **Vocab pages**). Returns the composed PDF. Pure page shuffling (plus the vocab render when the sidecar carries one) — no LLM, no job, no charge. |
 | `POST` | `/v1/overlay` | token | Stateless **overlay** builder. Multipart `original` PDF + `sidecar` JSON, field `style` = `interlinear` \| `interlinear_compact`, optional `scale`, `min_font_size`, `max_font_size`, `gap`, `color` (hex), `align`, `plate_color` (hex), `plate_opacity`, `plate_padding` (each defaults to the tuning of the style asked for). Returns the overlaid PDF plus `X-Overlay-Pages` / `X-Overlay-Drawn` / `X-Overlay-Skipped` (and `X-Overlay-Raster-Drawn` / `X-Overlay-Raster-Skipped` for glosses inside embedded images). No LLM, no job, no charge. |
-| `POST` | `/v1/convert` | token | Stateless office-to-PDF normaliser (LibreOffice). Multipart `file` (docx/pptx/…). Returns the PDF. |
-| `GET` | `/healthz` | open | `200 {"status":"ok","versions":{babeldoc,tesseract,ocrmypdf,libreoffice}}`; `503 degraded` if a binary is missing. Deploy health check. |
+| `POST` | `/v1/convert` | token | Stateless office-to-PDF normaliser, rendered by the shared **Gotenberg** service (`GOTENBERG_URL`). Multipart `file` (docx/pptx/…). Returns the PDF. `422` when the document cannot be rendered (the service's own reason rides along); **`503` when the conversion service is busy or unreachable** — that one is not the document's fault and must not be shown as one. |
+| `GET` | `/healthz` | open | `200 {"status":"ok","versions":{babeldoc,tesseract,ocrmypdf,gotenberg}}`; `503 degraded` if a binary is missing or the conversion service is unreachable. The `gotenberg` line is a live probe of that service's own `libreoffice` component, not a `which` — it is no longer a binary in this image. Deploy health check. |
 
 Auth: header `X-Internal-Token` must equal env `DOCTRANSLATE_TOKEN`
 (`401` otherwise; `503` if the env is unset — the service refuses to run open).
@@ -149,6 +149,7 @@ paths — behavior is byte-identical to before the feature.
 | `OPENAI_API_KEY` | — (required) | LLM key (OpenRouter) |
 | `OPENAI_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible endpoint |
 | `OPENAI_MODEL` | `google/gemini-3.1-flash-lite` | Translation model |
+| `GOTENBERG_URL` | `http://localhost:3000` | The shared Gotenberg service `/v1/convert` renders office documents through. On prod: `http://gotenberg-int:3000` (same docker network) |
 | `DATA_DIR` | `/data` | Job storage (volume) |
 | `JOB_TTL_HOURS` | `24` | Job retention |
 | `VOCAB_PAGES` | `1` | «كلمات هذه الصفحة» per-page vocabulary pages; `0` disables extraction and every insertion |
@@ -165,13 +166,31 @@ Requires `tesseract` (+eng) and ghostscript on PATH for the scanned path.
 First run downloads babeldoc assets (fonts + onnx layout model) to
 `~/.cache/babeldoc`.
 
+`/v1/convert` needs a Gotenberg to talk to — the default `GOTENBERG_URL` points
+at one on localhost:
+
+```bash
+docker run --rm -p 3000:3000 gotenberg/gotenberg:8.36.0-libreoffice
+```
+
+Without it `/healthz` reads `degraded` and `/v1/convert` answers `503`;
+everything else (translation, compose, overlay, notes-space) is unaffected —
+the office suite was never on the translation path.
+
 ## Docker / Coolify
 
 - **Build context: the repo root**, dockerfile `server/Dockerfile`
   (`docker build -f server/Dockerfile .`). The image bakes tesseract,
-  ghostscript, fonts and the babeldoc assets, so boot needs no downloads.
+  ghostscript, fonts and the babeldoc assets, so boot needs no downloads. It
+  carries **no office suite**: `/v1/convert` renders over HTTP against the
+  shared Gotenberg service, which is what keeps this image ~515 MB smaller and
+  keeps a forked soffice out of a container capped at 3 GB.
 - Port `8000`; persistent volume on `/data`; health check `GET /healthz`.
 - Coolify: new app from this repo/branch, Build Pack = Dockerfile,
   "Dockerfile Location" = `/server/Dockerfile`, base directory `/`. Keep it on
   the internal network only (no public domain) and set `DOCTRANSLATE_TOKEN` +
   `OPENAI_API_KEY` in both this app and catodemy.
+- Set `GOTENBERG_URL=http://gotenberg-int:3000`. Both containers sit on the
+  `coolify` docker network, so the name resolves directly — no domain, no
+  exposed port. If it is unset the engine falls back to `localhost:3000`,
+  finds nothing, and `/healthz` reports `degraded` until it is fixed.

@@ -17,15 +17,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libglib2.0-0 libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Headless LibreOffice, for /v1/convert: university material arrives as .pptx
-# far more often than as .pdf, and the whole pipeline (translate AND the dual
-# compose) is PDF-only. Writer + Impress only — no Calc, no Base, no JRE — so
-# the image pays for the two document families a caller would actually ask to
-# have translated.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        libreoffice-writer libreoffice-impress \
-        fonts-liberation \
-    && rm -rf /var/lib/apt/lists/*
+# No office suite here. /v1/convert renders through the shared Gotenberg
+# service over HTTP (GOTENBERG_URL, see server/convert.py) — a container that
+# already carries LibreOffice for every app on the box. Baking a second copy in
+# cost this image ~450 MB and this container a forked soffice per request, out
+# of a 3 GB cap the translation pass wants for itself.
 
 WORKDIR /app
 COPY . /app

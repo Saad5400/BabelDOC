@@ -1,4 +1,4 @@
-"""Office-document → PDF normalisation, via headless LibreOffice.
+"""Office-document → PDF normalisation, via the shared Gotenberg service.
 
 BabelDOC translates PDFs and nothing else, but the material people actually
 have is a slide deck: university lectures are shipped as .pptx far more often
@@ -6,27 +6,39 @@ than as .pdf. Before this module a .pptx was a dead end at the very first step
 — the caller had no PDF to submit, so the user was told to go convert the file
 themselves.
 
-The conversion lives HERE, in the engine, for the same reason OCR does: it is
-document plumbing that needs a heavyweight binary (LibreOffice) which the
-callers must not each have to carry. It is deliberately STATELESS, like
+The conversion is still the ENGINE's job to arrange, for the same reason OCR
+is: it is document plumbing the callers must not each have to carry. What
+changed is WHERE the office suite lives. It used to be a headless LibreOffice
+baked into this image — ~450 MB of Writer and Impress that the translation path
+never touches, plus a soffice process forked per request inside a container
+capped at 3 GB. Now it is one HTTP call to the shared Gotenberg service, which
+runs LibreOffice for every app on the box behind a bounded queue.
+
+The endpoint's contract is unchanged: it is deliberately STATELESS, like
 /v1/compose — bytes in, bytes out, no job, no cache, no /data. The caller keeps
 the converted PDF and treats it as the original from then on, which is what
 makes the downstream dual-format compose work: compose pairs the ORIGINAL PDF
 with the translated one, and a .pptx can never be half of that pair.
 
-Each conversion gets its OWN LibreOffice user profile. soffice serialises
-itself around a shared profile directory — two concurrent requests against one
-profile is the classic "second call silently produces nothing" failure — so the
-profile is a per-call temp dir that dies with the request.
+The call is ASYNC. It is awaited from inside FastAPI's event loop, where the
+old `subprocess.run` blocked every other request for the whole render — a
+media-heavy deck could stall a health check or a job poll for a minute. An
+`httpx.AsyncClient` yields instead.
+
+Gotenberg serialises its own LibreOffice around one profile, so the per-call
+user-profile dance this module used to perform is gone with the binary. What
+survives is the FILENAME discipline: Gotenberg, like soffice, picks its import
+filter from the suffix, and duplicate part filenames silently drop documents —
+so each upload gets an explicit, unique name carrying the real extension.
 """
 
-import shutil
-import subprocess
-import tempfile
 import uuid
-from pathlib import Path
 
-# What LibreOffice is asked to open. Kept to the document formats a caller
+import httpx
+
+from server import config
+
+# What the office suite is asked to open. Kept to the document formats a caller
 # could plausibly want translated — a spreadsheet's grid survives neither the
 # PDF conversion nor the translation in any useful shape, so it stays out.
 CONVERTIBLE_EXTENSIONS = (
@@ -34,14 +46,28 @@ CONVERTIBLE_EXTENSIONS = (
     "pptx", "ppt", "odp",
 )
 
-# A big deck with embedded media genuinely takes a while to render; the ceiling
-# exists to bound a WEDGED soffice (it hangs rather than fails when a profile
-# is contended or a font lookup stalls), not to rush an honest conversion.
-CONVERT_TIMEOUT_SECONDS = 300
+
+# The transport every call is made over. `None` means httpx's own — the only
+# value production ever sees. It exists as a seam so the tests can drive a
+# mock Gotenberg (httpx.MockTransport) through the REAL client code: timeouts,
+# a full queue and a refused connection are all things this module has to get
+# right and none of them are reproducible against a live service on demand.
+TRANSPORT: httpx.AsyncBaseTransport | None = None
 
 
 class ConvertError(Exception):
     """The document could not be turned into a PDF."""
+
+
+class ConvertUnavailableError(ConvertError):
+    """The conversion SERVICE could not do the work — nothing to do with the file.
+
+    Separate from its parent because the two mean opposite things to a user:
+    a plain ConvertError says "this document is the problem, re-export it",
+    while this one says "the machinery is busy or down, the same file will work
+    in a minute". Telling a reader to re-export a perfectly good deck because
+    a queue was full is the failure this class exists to prevent.
+    """
 
 
 def is_convertible(filename: str) -> bool:
@@ -52,12 +78,12 @@ def extension_of(filename: str) -> str:
     return (filename or "").rsplit(".", 1)[-1].lower() if "." in (filename or "") else ""
 
 
-def office_to_pdf(data: bytes, filename: str) -> bytes:
+async def office_to_pdf(data: bytes, filename: str) -> bytes:
     """Convert one office document to PDF bytes.
 
     `filename` is only read for its EXTENSION: LibreOffice picks its import
-    filter from the file suffix, so the scratch copy has to keep it. The user's
-    actual name never reaches the filesystem here.
+    filter from the file suffix, so the name sent to Gotenberg has to keep it.
+    The user's actual name never leaves this process.
     """
     extension = extension_of(filename)
 
@@ -67,69 +93,109 @@ def office_to_pdf(data: bytes, filename: str) -> bytes:
     if not data:
         raise ConvertError("the document is empty")
 
-    with tempfile.TemporaryDirectory(prefix="doctranslate-convert-") as workdir:
-        work = Path(workdir)
-        source = work / f"source.{extension}"
-        source.write_bytes(data)
+    # Unique per call, and never the user's own name: Gotenberg keys the parts
+    # of a multipart upload by filename, and two parts sharing one name lose a
+    # document silently. Single-file here, but the invariant is cheap to hold
+    # and expensive to rediscover.
+    upload_name = f"{uuid.uuid4().hex}.{extension}"
 
-        outdir = work / "out"
-        outdir.mkdir()
-
-        # A private profile per call (see the module docstring) — inside the
-        # same temp dir, so it is cleaned up even when soffice leaves lock
-        # files behind.
-        profile = work / f"profile-{uuid.uuid4().hex}"
-
-        argv = [
-            _soffice(),
-            "--headless",
-            "--norestore",
-            # Not merely cosmetic: a conversion that pops any dialog (a repair
-            # prompt on a slightly malformed deck, a macro warning) would
-            # otherwise block until the timeout.
-            "--nolockcheck",
-            "--nodefault",
-            "--nofirststartwizard",
-            f"-env:UserInstallation=file://{profile}",
-            "--convert-to", "pdf",
-            "--outdir", str(outdir),
-            str(source),
-        ]
-
-        try:
-            result = subprocess.run(
-                argv, capture_output=True, text=True,
-                timeout=CONVERT_TIMEOUT_SECONDS,
+    try:
+        async with _client(_timeout()) as client:
+            response = await client.post(
+                f"{config.GOTENBERG_URL.rstrip('/')}/forms/libreoffice/convert",
+                files={"files": (upload_name, data,
+                                 "application/octet-stream")},
             )
-        except subprocess.TimeoutExpired as exc:
-            raise ConvertError("converting the document to PDF timed out") from exc
-        except OSError as exc:
-            raise ConvertError(f"LibreOffice could not be run: {exc}") from exc
+    except httpx.TimeoutException as exc:
+        # Same wording the soffice ceiling used to produce: from the caller's
+        # side a render that never finished is one story, wherever it ran.
+        raise ConvertError("converting the document to PDF timed out") from exc
+    except httpx.RequestError as exc:
+        raise ConvertUnavailableError(
+            f"the conversion service could not be reached: {exc}") from exc
 
-        produced = next(iter(outdir.glob("*.pdf")), None)
+    if response.status_code == 503:
+        # Gotenberg's bounded queue, full. The document is fine; the service is
+        # saturated — so this must never read as "your file is broken".
+        raise ConvertUnavailableError(
+            "the conversion service is busy; try again in a moment")
 
-        # soffice exits 0 on failures often enough that the exit code is not
-        # evidence; the produced FILE is. Its stderr is the only useful thing
-        # to report, so it rides along when there is nothing to hand back.
-        if produced is None:
-            detail = (result.stderr or result.stdout or "").strip().splitlines()
-            raise ConvertError(
-                "LibreOffice produced no PDF"
-                + (f": {detail[-1]}" if detail else "")
-            )
+    if response.status_code != 200:
+        raise ConvertError(
+            "the conversion service could not render the document"
+            + _detail_of(response, upload_name, filename))
 
-        pdf_bytes = produced.read_bytes()
+    pdf_bytes = response.content
 
-        if not pdf_bytes.startswith(b"%PDF-"):
-            raise ConvertError("LibreOffice produced a file that is not a PDF")
+    # Kept from the soffice era for the same reason it was written: the ONE
+    # thing every downstream step assumes is that these bytes are a PDF.
+    if not pdf_bytes.startswith(b"%PDF-"):
+        raise ConvertError("the conversion service returned a file that is not a PDF")
 
-        return pdf_bytes
+    return pdf_bytes
 
 
-def _soffice() -> str:
-    path = shutil.which("soffice") or shutil.which("libreoffice")
+async def service_status() -> str:
+    """Gotenberg's LibreOffice, as /healthz reports it: "up" or "missing".
 
-    if path is None:
-        raise ConvertError("LibreOffice is not installed in this image")
+    Deliberately a probe of the COMPONENT that matters, not of the service as a
+    whole: Gotenberg answering while its LibreOffice is down would convert
+    nothing, and /healthz exists to say so before a user finds out.
+    """
+    try:
+        async with _client(_health_timeout()) as client:
+            response = await client.get(f"{config.GOTENBERG_URL.rstrip('/')}/health")
 
-    return path
+        if response.status_code != 200:
+            return "missing"
+
+        status = (response.json()
+                  .get("details", {})
+                  .get("libreoffice", {})
+                  .get("status"))
+    except (httpx.HTTPError, ValueError, AttributeError):
+        return "missing"
+
+    return "up" if status == "up" else "missing"
+
+
+def _client(timeout: httpx.Timeout) -> httpx.AsyncClient:
+    """The one place the HTTP client is built (see TRANSPORT)."""
+    return httpx.AsyncClient(timeout=timeout, transport=TRANSPORT)
+
+
+def _timeout() -> httpx.Timeout:
+    """Read ceiling above Gotenberg's own, connect ceiling far below it.
+
+    Gotenberg gives up on a conversion at 300 s and answers with an error; the
+    client must outlast that, or a wedged render comes back as a bare timeout
+    instead of the service's own account of what went wrong. Connecting, by
+    contrast, is a container on the same docker network: seconds, or it is not
+    there at all.
+    """
+    return httpx.Timeout(config.GOTENBERG_TIMEOUT_SECONDS, connect=10.0)
+
+
+def _health_timeout() -> httpx.Timeout:
+    """A health check must answer fast or count as a failure."""
+    return httpx.Timeout(5.0, connect=2.0)
+
+
+def _detail_of(response: httpx.Response, upload_name: str, filename: str) -> str:
+    """Gotenberg's own explanation, when it sent one.
+
+    Its error bodies are short plain text and name the file they failed on —
+    by the scratch name WE gave it, which means nothing to anyone reading a
+    log. Swapping the user's own name back in is the difference between
+    "failed to convert '9f3c…c98.pptx'" and a line an operator can act on.
+
+    Trimmed to one line and 300 characters: this rides into the caller's log
+    through an HTTP error detail, and a service having a bad day can produce a
+    great deal of prose.
+    """
+    try:
+        body = response.text.replace(upload_name, filename).strip().splitlines()
+    except UnicodeDecodeError:
+        return ""
+
+    return f": {body[-1][:300]}" if body else ""

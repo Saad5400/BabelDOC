@@ -8,6 +8,20 @@ SERVER_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 JOB_TTL_HOURS = float(os.environ.get("JOB_TTL_HOURS", "24"))
 
+# The shared Gotenberg service — the office suite /v1/convert renders through.
+#
+# Infra, so it is env: on prod the engine's container sits on the same docker
+# network as gotenberg-int and reaches it by container name; a dev box runs its
+# own on localhost (`docker run --rm -p 3000:3000
+# gotenberg/gotenberg:8.36.0-libreoffice`), which is the default here so a
+# fresh checkout converts without any env at all.
+GOTENBERG_URL = os.environ.get("GOTENBERG_URL", "http://localhost:3000")
+
+# Above Gotenberg's OWN 300 s conversion ceiling on purpose. Below it, a slow
+# render would come back as a client timeout — the least informative failure
+# available — instead of the service's own account of what went wrong.
+GOTENBERG_TIMEOUT_SECONDS = 330.0
+
 # Shared secret for the /v1 API. Empty/unset => all /v1 requests are refused.
 DOCTRANSLATE_TOKEN = os.environ.get("DOCTRANSLATE_TOKEN", "")
 
