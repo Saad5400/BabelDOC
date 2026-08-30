@@ -183,7 +183,8 @@ the office suite was never on the translation path.
   (`docker build -f server/Dockerfile .`). The image bakes tesseract,
   ghostscript, fonts and the babeldoc assets, so boot needs no downloads. It
   carries **no office suite**: `/v1/convert` renders over HTTP against the
-  shared Gotenberg service, which is what keeps this image ~515 MB smaller and
+  shared Gotenberg service, which is what keeps this image ~520 MB smaller
+  (3.4 GB → 2.88 GB, measured) and
   keeps a forked soffice out of a container capped at 3 GB.
 - Port `8000`; persistent volume on `/data`; health check `GET /healthz`.
 - Coolify: new app from this repo/branch, Build Pack = Dockerfile,

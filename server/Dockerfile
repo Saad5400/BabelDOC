@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # No office suite here. /v1/convert renders through the shared Gotenberg
 # service over HTTP (GOTENBERG_URL, see server/convert.py) — a container that
 # already carries LibreOffice for every app on the box. Baking a second copy in
-# cost this image ~450 MB and this container a forked soffice per request, out
+# cost this image ~515 MB and this container a forked soffice per request, out
 # of a 3 GB cap the translation pass wants for itself.
 
 WORKDIR /app

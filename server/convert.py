@@ -9,7 +9,7 @@ themselves.
 The conversion is still the ENGINE's job to arrange, for the same reason OCR
 is: it is document plumbing the callers must not each have to carry. What
 changed is WHERE the office suite lives. It used to be a headless LibreOffice
-baked into this image — ~450 MB of Writer and Impress that the translation path
+baked into this image — ~515 MB of Writer and Impress that the translation path
 never touches, plus a soffice process forked per request inside a container
 capped at 3 GB. Now it is one HTTP call to the shared Gotenberg service, which
 runs LibreOffice for every app on the box behind a bounded queue.
