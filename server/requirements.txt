@@ -1,5 +1,9 @@
 fastapi>=0.115
 uvicorn>=0.30
+# The office-to-PDF call to the shared Gotenberg service (server/convert.py).
+# Pulled in by babeldoc too, but named here because the server depends on it
+# directly and must not lose it to a change upstream.
+httpx>=0.27
 python-multipart>=0.0.9
 ocrmypdf>=16.0
 pypdf>=4.0

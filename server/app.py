@@ -6,10 +6,10 @@ Run: uvicorn server.app:app --host 0.0.0.0 --port 8000
 import dataclasses
 import hmac
 import json
-import shutil
 import subprocess
 from contextlib import asynccontextmanager
 
+import anyio.to_thread
 from fastapi import Depends
 from fastapi import FastAPI
 from fastapi import File
@@ -76,18 +76,25 @@ def _cmd_version(argv: list[str]) -> str:
 
 
 @app.get("/healthz")
-def healthz():
+async def healthz():
     from babeldoc.const import __version__ as babeldoc_version
 
+    # The office suite is no longer a binary in this image but a service on the
+    # network, so its line is a REACHABILITY probe rather than a `which`. It
+    # reports Gotenberg's own libreoffice component: a Gotenberg that answers
+    # while its LibreOffice is down would convert nothing.
+    #
+    # Async because that probe is: the version calls are subprocesses and would
+    # block the loop for as long as they run, so they go to a worker thread —
+    # which is what an ordinary `def` endpoint got for free and this one has to
+    # ask for.
     versions = {
         "babeldoc": babeldoc_version,
-        "tesseract": _cmd_version(["tesseract", "--version"]),
-        "ocrmypdf": _cmd_version(["ocrmypdf", "--version"]),
-        # Presence, not `--version`: soffice builds its user profile on the
-        # first run, which can outlast a health check's patience — and a slow
-        # answer here would report the whole engine degraded over a binary the
-        # translation path does not even use.
-        "libreoffice": shutil.which("soffice") or "missing",
+        "tesseract": await anyio.to_thread.run_sync(
+            _cmd_version, ["tesseract", "--version"]),
+        "ocrmypdf": await anyio.to_thread.run_sync(
+            _cmd_version, ["ocrmypdf", "--version"]),
+        "gotenberg": await convert.service_status(),
     }
     ok = all(v != "missing" for v in versions.values())
     return JSONResponse(status_code=200 if ok else 503,
@@ -288,6 +295,11 @@ async def convert_to_pdf(file: UploadFile = File(...)):
     that pairs an original with its translation — so a .pptx has to become a
     PDF before anything else can touch it. The caller keeps what comes back and
     uses it as the original from that point on.
+
+    The render itself happens on the shared Gotenberg service (see
+    server/convert.py), awaited rather than forked: this handler used to run a
+    blocking soffice inside the event loop and hold up every other request —
+    a job poll, a health check — for the length of a deck's conversion.
     """
     filename = file.filename or "document"
 
@@ -303,7 +315,14 @@ async def convert_to_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=413, detail="file too large")
 
     try:
-        pdf_bytes = convert.office_to_pdf(data, filename)
+        pdf_bytes = await convert.office_to_pdf(data, filename)
+    # Order matters: the unavailable case is a ConvertError too, and it is the
+    # one that must NOT come back as 422. A 422 tells the caller the document
+    # is unacceptable — re-export it and try again — which is a lie when the
+    # conversion service was merely busy or down, and it is a lie the user
+    # reads as "my file is broken".
+    except convert.ConvertUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except convert.ConvertError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
