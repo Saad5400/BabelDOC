@@ -64,10 +64,25 @@ else:  # script mode: python server/image_prep.py ...
 
 DPI = 300
 MAX_DPI = 600            # render at native image resolution up to this
-MIN_W_PT = 50.0          # placements smaller than this are decorations
-MIN_H_PT = 30.0
+# A placement is a DECORATION when it is too thin to hold a line of text or
+# too small to hold a word — not merely when it is short. The old
+# 50 x 30 pt box test was a proxy for "decorative" that a wide band of body
+# text fails: run59's boxed DEFINITION panels are 348 x 29.5 pt (a 1697 x
+# 124 px raster of two dense lines) and missed the height threshold by half
+# a point, so the primary content of 21 of that deck's 39 pages was never
+# translated while the truth table beside it was.
+#
+# Measured over the corpus's 1,019 real image placements, min-side + area
+# admits 34 placements the box test rejected — the DEFINITION panels, run59's
+# formula bands, and portrait figures in run14/run30/run39 that were too
+# NARROW for MIN_W_PT — and rejects nothing the box test kept. run9's
+# decorative page rules (698 x 9.4 pt, a 2909 x 39 px hairline) stay out on
+# the short side, which is what they are: a rule, not a line of text.
+MIN_SIDE_PT = 12.0       # thinner than a line of text in any direction
+MIN_AREA_PT2 = 1500.0    # too small to hold a legible word
 MERGE_OVERLAP = 0.5      # placements overlapping this much (of the smaller
                          # one) OCR as ONE region (stacked shadow + figure)
+MIN_LEGIBLE_PT = 5.5     # OCR lines smaller than this are left as pixels
 TEXT_OVERLAP_KILL = 0.25 # OCR-word area share covered by digital text => dup
 TEXT_PAD_PT = 1.0        # slack around digital spans for the overlap test
 FULL_PAGE_FRAC = 0.60    # region covering this much of the page gets the
@@ -124,8 +139,12 @@ def gather_regions(page):
     for info in page.get_image_info(xrefs=True):
         raw = pymupdf.Rect(info["bbox"])
         clip = raw & page.rect
-        if clip.is_empty or clip.width < MIN_W_PT or clip.height < MIN_H_PT:
+        if clip.is_empty:
             continue
+        if min(clip.width, clip.height) < MIN_SIDE_PT:
+            continue  # a rule, a divider, a spacer strip
+        if clip.width * clip.height < MIN_AREA_PT2:
+            continue  # too small to hold a legible word
         if info["width"] < 8 or info["height"] < 8:
             continue  # decorative strip / spacer
         native = 72.0 * info["width"] / max(raw.width, 1e-6)
@@ -509,6 +528,28 @@ def build_region_ops(lines, clip, px_per_pt, inv_ptm, font, visible=False):
                 # DOWN only (a correct hOCR baseline equals the ink bottom
                 # already, a floated all-caps one sits ~5pt above it)
                 baseline = max(baseline, max(w.y2 for w in ws))
+            if size_pt < MIN_LEGIBLE_PT:
+                # Below the legibility floor, translating this label makes
+                # the page WORSE. The original is a crisp raster label the
+                # reader can zoom into; what replaces it is vector Arabic at
+                # the same tiny size, which is a smear — and, because these
+                # micro-labels cluster inside diagrams, several of them
+                # overprint each other and the artwork underneath.
+                #
+                # Measured over the sweep corpus's 1,058 real image-OCR
+                # blocks: 8.4 % fall below 5.5 pt, and they are concentrated
+                # in exactly the two decks whose figures came out illegible
+                # (run14 44/100 blocks, run30 31/65) while the OCR lane's
+                # real earners are untouched (run59 1/328, run67 0/129,
+                # run38 0/71, run39 0/59, run8 0/49). The floor also
+                # collects the lane's pure noise: every 0.00 pt "line" in
+                # the corpus is a mis-recognised diagram stroke ('=',
+                # '0+0=2').
+                #
+                # Skipping the run leaves the source pixels showing, which
+                # is honest: we do not claim to have translated what we
+                # cannot draw legibly.
+                continue
             natural = font.text_length(text, fontsize=size_pt)
             if natural <= 0:
                 continue

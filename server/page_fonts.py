@@ -9,6 +9,11 @@ subsetter is shared from server/interlinear.py, which solved the same problem
 for the gloss font) and offers the measuring `Story.place` pass that renderers
 use to decide their page breaks. Every caller saves with `garbage=4`, which is
 what folds the per-box copies of the subset faces into one.
+
+It also owns `repair_arabic_text_layer`, the pass every renderer that draws
+Arabic must run on the finished document before saving it — the Story engine
+leaves a text layer that reads as glyph shapes rather than letters, and that
+is not something a page can fix for itself.
 """
 
 from __future__ import annotations
@@ -24,6 +29,45 @@ from server.interlinear import subset_font_bytes
 logger = logging.getLogger("doctranslate.page_fonts")
 
 BOLD_FONT_FILE = "GoNotoKurrent-Bold.ttf"
+
+
+def repair_arabic_text_layer(doc: pymupdf.Document) -> int:
+    """Make the Arabic on `doc`'s pages extract as the letters it reads as.
+
+    Call this on the finished document, after every page has been drawn and
+    BEFORE saving it. Returns how many fonts were rewritten; a document with
+    no Arabic in it is left untouched, so it is safe on any output.
+
+    Why an appendix page needs it at all: the Story engine shapes Arabic
+    through the font, so what lands on the page is contextual glyphs, and the
+    ToUnicode map a viewer builds is a reverse of the font's cmap — which is
+    where those shapes were looked up. The strip therefore renders correctly
+    and extracts as presentation forms; worse, the glyphs the shaper reached
+    through GSUB (every joined «ل», the hyphen inside an Arabic run) have no
+    cmap entry to reverse at all, so the viewer falls back to reading the
+    glyph id as a codepoint and «كلمات» extracts as «ﻛɅﻤﺎت». Neither is
+    searchable, copyable, or readable by a screen reader, and catodemy's own
+    corpus ingestion reads exactly this text.
+
+    Nothing about the drawing changes: this only rewrites what each glyph
+    claims to be.
+
+    Never raises. The renderers that call it are inside a guard whose job is
+    to keep a run alive, so an exception escaping here would take the whole
+    appendix layer down to fix a text layer — the wrong trade every time. A
+    failure leaves the document exactly as it was found and returns 0.
+    """
+    try:
+        from babeldoc.format.pdf.document_il.backend.pdf_creater import (
+            normalize_arabic_text_layer,
+        )
+
+        return normalize_arabic_text_layer(doc)
+    except Exception:  # noqa: BLE001 - a text layer is never worth the run
+        logger.exception("page fonts: could not repair the Arabic text layer; "
+                         "shipping it as drawn")
+
+        return 0
 
 
 def _font_path(font_file: str) -> Path:

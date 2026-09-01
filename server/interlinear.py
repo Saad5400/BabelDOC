@@ -29,10 +29,21 @@ the requested fraction of the source font size first, then stepped down, and
 finally force-fitted by the renderer if a step still spills. A paragraph with
 no usable band above it is SKIPPED rather than drawn over the reader's
 document, and the count comes back to the caller — a bad fit should be visible,
-not silent. On a real slide deck that costs a fifth of the glosses and shrinks
-the rest, which is why it is no longer the default; it is still the right
-answer when the original pagination has to be preserved, and it is the only one
-that can gloss a page whose /Rotate the other cannot open along.
+not silent.
+
+That price turned out to be the whole layout. MEASURED over 13 real production
+runs and 403 pages, it skips 68% of the glosses; on a 2-slides-per-A4 lecture
+handout it skips 96% (run30 441 of 457, run14 862 of 894), and run14's page 2
+comes back with not one gloss on it and nothing in the file saying so. There
+is no tuning that recovers it: the bands on documents of that shape are ~4 pt
+tall, and the fit ladder bottoms out before anything fits.
+
+So the product no longer OFFERS it — that decision lives in catodemy, not
+here. The engine still accepts the style so that artifacts already built and
+cached stay downloadable, and it is still what glosses a page whose /Rotate
+the spaced layout cannot open along ({@link render_spaced}). It is frozen,
+not maintained: everything below that says "both styles" means the spaced one
+and that fallback. New work belongs in THE SPACED LAYOUT.
 
 When one band cannot hold a gloss at a readable size, the compact layout
 SPREADS it down the paragraph's own source lines instead of shrinking it into
@@ -90,9 +101,10 @@ _GLYPH_HEIGHTS = threading.Lock()
 
 # `interlinear` is the layout the product means by the word: the one that opens
 # the page up so every gloss fits. `interlinear_compact` is the same idea under
-# the constraint that the page may not change size — worth keeping for a reader
-# who needs the original pagination, and the only thing that can gloss a page
-# whose /Rotate this layout cannot open along.
+# the constraint that the page may not change size, which measured a 68% skip
+# rate on the real corpus and is no longer offered to anyone: it is kept so
+# already-built artifacts stay downloadable, and because it is what glosses a
+# page whose /Rotate the spaced layout cannot open along.
 COMPACT_STYLE = "interlinear_compact"
 OVERLAY_STYLES = ("interlinear", COMPACT_STYLE)
 
@@ -140,6 +152,22 @@ _RASTER_INK_DILATION = 2
 # brittle (one stray speck of dither vetoes a whole band), so a speck is
 # forgiven and anything that could be part of a letter is not.
 _RASTER_INK_TOLERANCE = 0.003
+
+# What a plate may sit on when the alternative is no gloss at all. The strict
+# tolerance above can never be cleared by a label in a TABLE CELL — there is a
+# rule a couple of points above it and another a couple below, so neither band
+# is ever quiet — and a dense diagram is the same story. 738 of the corpus's
+# 1058 in-image blocks were skipped for it: run59 96.6%, run39 93.2%, and
+# run39 p6 is a physics slide whose entire content is two rendered tables of
+# SI units, delivered untranslated.
+#
+# A translucent plate clipping a table rule is a far better outcome for the
+# reader than an untranslated table, so a label with nowhere quiet to go is
+# offered the crowded band instead of being given up on. What it may still
+# never cover is another LABEL — the plate is kept off every other block's own
+# box — and it is drawn at the legibility floor so it covers as little as it
+# can.
+_RASTER_CROWDED_TOLERANCE = 0.4
 
 # Corner rounding of the legibility plate, as the fraction of its short side
 # pymupdf's draw_rect wants. Enough to read as a tag laid on the artwork
@@ -230,8 +258,10 @@ class OverlayOptions:
         The two want different numbers for the same reason they are two
         layouts: `interlinear_compact` is rationing space the author left it,
         so its type is modest and its clearances are shaved to the point of
-        being charged twice against a 7 pt band. `interlinear` makes the space
-        it needs, so it can afford to be read comfortably and to breathe.
+        being charged twice against a 7 pt band — which is most of why it
+        skips two thirds of what it is given, and why it is no longer offered.
+        `interlinear` makes the space it needs, so it can afford to be read
+        comfortably and to breathe.
         """
         if style == COMPACT_STYLE:
             return cls()
@@ -436,17 +466,65 @@ def _ceiling(band_x0: float, band_x1: float, floor_y: float,
     return ceiling
 
 
-def _split_proportionally(text: str, weights: list[float]) -> list[str]:
+# What a list item starts with: a bullet, or a short label closed by a dot or
+# a bracket — `a)`, `(1)`, `2.`, and the Arabic abjad's `أ)` `ب)` `هـ)`. Kept
+# tight on purpose: one or two characters and a closer, at a token start, so
+# ordinary prose and a parenthesised Latin term do not look like a list.
+_LIST_MARKER = re.compile(
+    r"(?:^|(?<=\s))"
+    r"(?:[•▪◦‣∙]"
+    r"|\(?[0-9]{1,2}[.)]"
+    r"|\(?[A-Za-z][.)]"
+    r"|\(?[؀-ۿ]{1,2}[.)])"
+)
+
+
+def _split_at_markers(text: str, count: int) -> list[str] | None:
+    """`text` cut at its own list markers into exactly `count` chunks, or None.
+
+    BabelDOC merges a run of same-styled bullets into one paragraph, so a
+    numbered list arrives as a single block whose translation still carries
+    the markers the source printed. Cutting that by line-width weights puts
+    the tail of each item and the head of the next into one gloss — run44 p3's
+    item a) is glossed «أ) القمر مصنوع من الجبن الأخضر. ب) مكة هى» and item e)
+    with the fragment «0 = 2». The markers say exactly where the cuts belong.
+    """
+    starts = [match.start() for match in _LIST_MARKER.finditer(text)]
+
+    if len(starts) != count:
+        return None
+
+    chunks = [text[start:end].strip() for start, end
+              in zip(starts, [*starts[1:], len(text)], strict=True)]
+    # Anything before the first marker introduces the list and belongs with it.
+    chunks[0] = (text[:starts[0]].strip() + " " + chunks[0]).strip()
+
+    return chunks if all(chunks) else None
+
+
+def _split_proportionally(text: str, weights: list[float],
+                          source: str | None = None) -> list[str]:
     """`text` cut into len(weights) chunks, each roughly its share of the whole.
 
     Word boundaries only, and every chunk is non-empty when there are enough
     words — a blank chunk would leave a source line silently unglossed.
+
+    `source` is the paragraph this translates, and is what allows the split to
+    stop being proportional: when both sides carry the same number of list
+    markers as there are lines, the paragraph IS a list and its own markers
+    say where the cuts go ({@link _split_at_markers}).
     """
     words = text.split()
     count = len(weights)
 
     if count <= 1 or len(words) < count:
         return [text]
+
+    if source and len(_LIST_MARKER.findall(source)) == count:
+        marked = _split_at_markers(text, count)
+
+        if marked is not None:
+            return marked
 
     total = sum(weights) or float(count)
     chunks: list[str] = []
@@ -820,8 +898,9 @@ class _RegionInk:
 
         self._integral = numpy.pad(edge.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
 
-    def inky(self, rect: pymupdf.Rect) -> bool:
-        """Does a plate here sit on something that was drawn?"""
+    def inky(self, rect: pymupdf.Rect,
+             tolerance: float = _RASTER_INK_TOLERANCE) -> bool:
+        """Does a plate here sit on more than `tolerance` of what was drawn?"""
         rows, cols = self._integral.shape[0] - 1, self._integral.shape[1] - 1
         x0 = max(int((rect.x0 - self.clip.x0) * _RASTER_SCALE), 0)
         y0 = max(int((rect.y0 - self.clip.y0) * _RASTER_SCALE), 0)
@@ -837,13 +916,14 @@ class _RegionInk:
         count = (self._integral[y1, x1] - self._integral[y0, x1]
                  - self._integral[y1, x0] + self._integral[y0, x0])
 
-        return count > area * _RASTER_INK_TOLERANCE
+        return count > area * tolerance
 
 
 def _raster_placement(layout: _Layout, text: str, anchor: pymupdf.Rect,
                       region: pymupdf.Rect, source_size: float,
-                      ink: _RegionInk,
-                      taken: list[pymupdf.Rect]) -> tuple[pymupdf.Rect, float] | None:
+                      ink: _RegionInk, taken: list[pymupdf.Rect],
+                      tolerance: float = _RASTER_INK_TOLERANCE,
+                      ) -> tuple[pymupdf.Rect, float] | None:
     """Where one raster gloss's plate would go — nothing is drawn.
 
     The band directly above the label first — a gloss reads as belonging to
@@ -853,6 +933,11 @@ def _raster_placement(layout: _Layout, text: str, anchor: pymupdf.Rect,
     quiet". A size step that would land the plate on a border or a neighbour
     shrinks past it; a label with no quiet pixels either way is given up on,
     and the caller counts it.
+
+    A raised `tolerance` is the crowded retry — see
+    {@link _RASTER_CROWDED_TOLERANCE}. It asks the same questions in the same
+    order and only accepts more ink under the answer, at the smallest size
+    that is still worth reading.
 
     Only the plate comes back: the text's own rect is derived from it at draw
     time by peeling the padding off.
@@ -875,9 +960,15 @@ def _raster_placement(layout: _Layout, text: str, anchor: pymupdf.Rect,
         (max(region.x0, anchor.x0 - stretch), min(region.x1, anchor.x1 + stretch)),
     ))
 
+    crowded = tolerance > _RASTER_INK_TOLERANCE
     start = min(max(source_size * options.scale, options.min_font_size),
                 options.max_font_size)
     floor = options.min_font_size * options.squeeze
+
+    if crowded:
+        # Nothing here is free, so the plate takes the least it can and stops
+        # at the floor the layout calls legible rather than below it.
+        start = floor = options.min_font_size
 
     for below in (False, True):
         for span_x0, span_x1 in spans:
@@ -902,7 +993,7 @@ def _raster_placement(layout: _Layout, text: str, anchor: pymupdf.Rect,
 
                 if (plate.y0 >= region.y0 and plate.y1 <= region.y1
                         and not any(plate.intersects(other) for other in taken)
-                        and not ink.inky(plate)):
+                        and not ink.inky(plate, tolerance)):
                     return plate, size
 
                 if size <= floor:
@@ -932,8 +1023,14 @@ def _render_raster(page: pymupdf.Page, blocks: list[dict], layout: _Layout,
     """
     options = layout.options
     plate_rgb = _hex_rgb(options.plate_color)
+    typical = _typical_size(blocks)
     masks: dict[tuple[float, float, float, float], _RegionInk] = {}
     taken: list[pymupdf.Rect] = []
+    placed: list[tuple[dict, pymupdf.Rect, pymupdf.Rect, float]] = []
+    # Every label on the page, which is the one thing a crowded plate may
+    # still never cover — a gloss that hides the word it glosses, or its
+    # neighbour, has taken more than it gave.
+    labels: list[pymupdf.Rect] = []
     drawn = skipped = 0
 
     for block in blocks:
@@ -954,12 +1051,17 @@ def _render_raster(page: pymupdf.Page, blocks: list[dict], layout: _Layout,
         if key not in masks:
             masks[key] = _RegionInk(page, region)
 
-        source_size = float(block.get("font_size") or 0) or anchor.height
+        labels.append(anchor)
+        source_size = _source_size(block, anchor, typical)
         found = _raster_placement(layout, block["target"].strip(), anchor,
                                   region, source_size, masks[key], taken)
 
         if found is None:
-            skipped += 1
+            # Nowhere quiet. Held back rather than skipped: the crowded retry
+            # below runs once every label that COULD have a quiet band has
+            # taken one, so a plate that has to sit on the artwork is never
+            # the reason another label lost its clean place.
+            placed.append((block, anchor, region, source_size))
             continue
 
         plate, size = found
@@ -973,7 +1075,119 @@ def _render_raster(page: pymupdf.Page, blocks: list[dict], layout: _Layout,
         taken.append(plate)
         drawn += 1
 
+    for block, anchor, region, source_size in placed:
+        found = _raster_placement(
+            layout, block["target"].strip(), anchor, region, source_size,
+            masks[tuple(region)],
+            taken + [label for label in labels if label != anchor],
+            _RASTER_CROWDED_TOLERANCE)
+
+        if found is None:
+            skipped += 1
+            continue
+
+        plate, size = found
+        pad = options.plate_padding
+        page.draw_rect(plate, color=None, fill=plate_rgb,
+                       fill_opacity=options.plate_opacity, radius=_PLATE_RADIUS)
+        layout.draw(page, plate + (pad, pad, -pad, -pad),
+                    block["target"].strip(), size, align="center")
+        taken.append(plate)
+        drawn += 1
+
     return drawn, skipped
+
+
+def _typical_size(blocks: list[dict]) -> float:
+    """The median font size this page actually recorded, or 0 if none did.
+
+    The backstop for {@link _source_size} when a block carries no size of its
+    own: whatever the rest of the page is set in is a far better guess than
+    anything the missing block's own geometry can offer.
+    """
+    sizes = sorted(float(block["font_size"]) for block in blocks
+                   if block.get("font_size"))
+
+    return sizes[len(sizes) // 2] if sizes else 0.0
+
+
+def _source_size(block: dict, anchor: pymupdf.Rect, typical: float) -> float:
+    """The type size this block's gloss is proportioned against.
+
+    `font_size` when the run recorded one, which is almost always. When it did
+    not, the box's HEIGHT used to stand in — and for a ROTATED block that is
+    not the type size, it is the length of the line: run67 p6's vertical label
+    "focus of this course" has a 94.5 pt tall box, so its gloss was requested
+    at 0.78 x 94.5 = 73.7 pt, clamped to the 28 pt ceiling, and a 28 pt gloss
+    of the extractor's letter-soup (`rse f this cou focus o`) demanded a band
+    tall enough to hold it. The slide's title panel grew from 65 pt to 318 pt
+    to provide one. 431 blocks corpus-wide carry no size, 243 of them taller
+    than wide.
+
+    So the guess comes from the block's own LINES where it has them, from its
+    shorter dimension where it does not — a line of type is as thick as its
+    size whichever way round it is drawn — and is held to what the rest of the
+    page is set in, which is the one measurement that is never a guess.
+    """
+    size = float(block.get("font_size") or 0)
+
+    if size > 0:
+        return size
+
+    lines = [line for line in (block.get("lines") or []) if line]
+
+    if lines:
+        heights = sorted(min(abs(line[3] - line[1]), abs(line[2] - line[0]))
+                         for line in lines)
+        size = heights[len(heights) // 2]
+    else:
+        size = min(anchor.width, anchor.height)
+
+    if typical > 0:
+        # Twice the page's own body size is already a heading; anything past
+        # that is the geometry lying, not a bigger heading.
+        size = min(size, 2 * typical)
+
+    return size or anchor.height
+
+
+def _says_nothing(block: dict) -> bool:
+    """Would this block's gloss just repeat the line it sits over?
+
+    A translation run returns a target for every block it was given, and for a
+    great many of them the target is the source back again: a slide number, a
+    date, a truth table's T/F cells, a table of Java keywords, a formula. On
+    the corpus that is 2284 of 6106 blocks — 37 % — and every one of them is
+    drawn as a gloss saying exactly what is already printed under it, in the
+    spaced layout after opening a band to hold it. So the page grows to
+    restate itself.
+
+    Whitespace-normalised equality only. Anything the translator actually
+    changed — a different word, a different script, punctuation moved — still
+    gets its gloss; this is not a heuristic about what is worth translating,
+    it is the observation that a gloss identical to its source is not a gloss.
+    """
+    target = " ".join((block.get("target") or "").split())
+
+    return bool(target) and target == " ".join((block.get("source") or "").split())
+
+
+def _gloss_blocks(page_data: dict) -> tuple[list[dict], list[dict]]:
+    """One page's blocks worth glossing, as `(normal, raster)`.
+
+    The raster lane — blocks the engine marked as living inside an embedded
+    image — is split out BEFORE the normal pass so that pass's anchors,
+    obstacles and column edge are computed from exactly the blocks it always
+    saw: an old sidecar renders exactly what it always did.
+    """
+    blocks = [block for block in (page_data.get("blocks") or [])
+              if block.get("box") and (block.get("target") or "").strip()
+              and not _says_nothing(block)]
+
+    return ([block for block in blocks
+             if not (block.get("on_raster") and block.get("region"))],
+            [block for block in blocks
+             if block.get("on_raster") and block.get("region")])
 
 
 def _render_page(page: pymupdf.Page, page_data: dict,
@@ -982,16 +1196,7 @@ def _render_page(page: pymupdf.Page, page_data: dict,
 
     Returns `(drawn, skipped, raster_drawn, raster_skipped)`.
     """
-    blocks = [block for block in (page_data.get("blocks") or [])
-              if block.get("box") and (block.get("target") or "").strip()]
-    # The raster lane: blocks the engine marked as living inside an embedded
-    # image. They are split out BEFORE the normal pass so that pass's anchors,
-    # obstacles and column edge are computed from exactly the blocks it always
-    # saw — an old sidecar renders exactly what it always did.
-    raster = [block for block in blocks
-              if block.get("on_raster") and block.get("region")]
-    blocks = [block for block in blocks
-              if not (block.get("on_raster") and block.get("region"))]
+    blocks, raster = _gloss_blocks(page_data)
 
     if not blocks and not raster:
         return 0, 0, 0, 0
@@ -1013,10 +1218,11 @@ def _render_page(page: pymupdf.Page, page_data: dict,
         # the obstacle set — _spread has to be able to tell a paragraph's own
         # box apart from every other rect in there. Each is grown to cover the
         # glyphs the sidecar's box falls short of.
+        typical = _typical_size(blocks + raster)
         anchors = [
             _cover_ink(_to_display(block["box"], matrix),
-                       float(block.get("font_size") or 0)
-                       or _to_display(block["box"], matrix).height, ink)
+                       _source_size(block, _to_display(block["box"], matrix),
+                                    typical), ink)
             for block in blocks
         ]
         # The page's own ink joins the obstacle set: it is the truthful account
@@ -1040,7 +1246,7 @@ def _render_page(page: pymupdf.Page, page_data: dict,
 
         for block, anchor in zip(blocks, anchors, strict=False):
             text = block["target"].strip()
-            source_size = float(block.get("font_size") or 0) or anchor.height
+            source_size = _source_size(block, anchor, typical)
             lines = [_cover_ink(_to_display(line, matrix), source_size, ink)
                      for line in (block.get("lines") or [])]
 
@@ -1148,6 +1354,26 @@ _STRIP_HEIGHT = 0.6
 # paragraph- and region-level attachments are the deliberate way to go further.
 _CUT_LOOKUP = 0.75
 
+# The cut check's view of the page: its pixels at this many per point. A cut
+# asks one question — does the page CHANGE from one row to the next here — and
+# 2 px/pt resolves the anti-aliased fringe of a hairline rule to a couple of
+# rows, which is all the question needs.
+_CUT_SCALE = 2.0
+
+# A grey step this big between vertically neighbouring pixels is something
+# drawn, not a gradient. Same reasoning and same number as the raster lane's
+# {@link _RASTER_EDGE_STEP}: type and line art clear it by a wide margin, a
+# background's soft blend stays under it.
+_CUT_EDGE_STEP = 20
+
+# How far up its gap a cut may be walked while looking for clean air, in
+# points. A face whose metrics under-report its ascent (run44's subset `35`
+# reports a 28 pt title as starting 16 pt below where its glyphs really do)
+# leaves the free gap running down into the letters, and the walk is what
+# finds the top of them again. Bounded because a gap on a mostly-blank page
+# can be hundreds of points tall and every step costs a mask query.
+_CUT_WALK = 24.0
+
 # Region splitting. A corridor is the strongest evidence a page has two
 # independent flows, so columns are looked for first — but only in a region
 # tall enough to hold more than one line of text. Splitting a single line at
@@ -1158,6 +1384,24 @@ _ROW_GAP = 5.0
 _MIN_COLUMN_HEIGHT = 72.0
 _MIN_COLUMN_MARKS = 2
 _MIN_COLUMN_SHARE = 0.05
+# A corridor is read off the marks' x spans alone, which is how a page with no
+# columns at all acquires one: run8 p10 is a single full-page diagram with a
+# caption across the top (x 58.9-363.9) and a copyright line at the bottom
+# right (x 371.8-470.7). The two never coexist vertically, but between them
+# they leave a clear x range, so the page was split at x = 367.8, the two
+# leaves grew by different amounts, and the diagram that spans both was sliced
+# — its box outline two mismatched halves 30 pt apart, the word "Partial"
+# broken into "P" and "artial". The image itself is a backdrop, so the
+# splitter could not see the thing it was cutting.
+#
+# A corridor has to have a real column on each side of it. Two tests, because
+# either alone lets that page through: each side must be enough of the
+# region's height to BE a column (run8 p10's sides are 4.0% and 1.6% of it —
+# one text line each), and the two must actually run beside each other rather
+# than sit at opposite corners. The second is measured against the shorter
+# side, so a screenshot beside a short bullet list still reads as two columns.
+_MIN_COLUMN_EXTENT = 0.10
+_MIN_COLUMN_COEXIST = 0.30
 _MAX_REGION_DEPTH = 4
 
 # A single band may not open wider than this share of the original page. Only
@@ -1194,6 +1438,60 @@ def _text_ink(page: pymupdf.Page) -> list[pymupdf.Rect]:
                     if span["text"].strip()]
         finally:
             pymupdf.TOOLS.set_small_glyph_heights(False)
+
+
+class _CutRows:
+    """Where the page is vertically constant — the only place it may be cut.
+
+    Every account this module takes of what is drawn is an approximation of
+    one question: may the page be sliced here and a hairline of it stretched
+    over the band that opens? A span's bbox answers it from the FONT's
+    metrics, and a font's metrics can lie. run44's title face — the subset
+    `AAAAAB+35` — reports its 28 pt title as starting at y 63.0 while the
+    glyphs reach up to y 47.2, so the free gap above the title ran 16 pt down
+    into the letters, the cut landed inside them, the sliced ascenders were
+    left behind above the band, the 0.6 pt strip smeared them down it as gold
+    bars, and the gloss was drawn on the wreckage. 16 of that document's 17
+    pages.
+
+    So the page is rasterised once and asked directly: a row of pixels that
+    differs from the row under it is somewhere the page changes, and a strip
+    taken there cannot be stretched invisibly. A vertical rule passing through
+    is unchanged from row to row and stays allowed, exactly as
+    {@link _cut_items} always intended.
+    """
+
+    def __init__(self, page: pymupdf.Page) -> None:
+        self.rect = page.rect
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(_CUT_SCALE, _CUT_SCALE),
+                              colorspace=pymupdf.csGRAY, alpha=False)
+        grey = (numpy.frombuffer(pix.samples, numpy.uint8)
+                .reshape(pix.height, pix.stride)[:, :pix.width]
+                .astype(numpy.int16))
+        step = numpy.abs(numpy.diff(grey, axis=0)) > _CUT_EDGE_STEP
+        # Row `y` of the integral counts the steps in source rows < y, so a
+        # query over [y0, y1) is one subtraction whatever the height.
+        self._integral = numpy.pad(step.cumsum(0).cumsum(1).astype(numpy.int64),
+                                   ((1, 0), (1, 0)))
+
+    def constant(self, x0: float, x1: float, y0: float, y1: float) -> bool:
+        """Is the page unchanging down [y0, y1] across [x0, x1]?"""
+        rows, cols = self._integral.shape[0] - 1, self._integral.shape[1] - 1
+        left = min(max(int((x0 - self.rect.x0) * _CUT_SCALE), 0), cols)
+        right = min(max(int((x1 - self.rect.x0) * _CUT_SCALE) + 1, left), cols)
+        # A step between rows n and n+1 sits at index n, so a strip spanning
+        # source rows [a, b] is asked about steps [a - 1, b] — the boundaries
+        # into and out of it are part of what stretching it would smear.
+        top = min(max(int((y0 - self.rect.y0) * _CUT_SCALE) - 1, 0), rows)
+        bottom = min(max(int((y1 - self.rect.y0) * _CUT_SCALE) + 1, top), rows)
+
+        if right <= left or bottom <= top:
+            # Off the rendered page: nothing is known, and unknown is not a
+            # place to cut.
+            return False
+
+        return not (self._integral[bottom, right] - self._integral[top, right]
+                    - self._integral[bottom, left] + self._integral[top, left])
 
 
 def _cut_items(drawing: dict) -> list[pymupdf.Rect]:
@@ -1243,8 +1541,8 @@ def _cut_items(drawing: dict) -> list[pymupdf.Rect]:
 
 
 def _page_marks(page: pymupdf.Page) -> tuple[list[pymupdf.Rect], list[pymupdf.Rect],
-                                             list[pymupdf.Rect]]:
-    """`(ink, blockers, backdrops)` for one page, from a single parse of it.
+                                             list[pymupdf.Rect], list[pymupdf.Rect]]:
+    """`(ink, blockers, backdrops, solid)` for one page, from a single parse.
 
     `ink` is what a gloss may not be drawn over — the same account
     {@link _page_ink} takes, but on the spans' real heights ({@link
@@ -1253,9 +1551,13 @@ def _page_marks(page: pymupdf.Page) -> tuple[list[pymupdf.Rect], list[pymupdf.Re
     `backdrops` is what the page is drawn ON — set aside by both, and reported
     because a region that is nothing BUT backdrop has no clear air to open a
     band in and has to be handled differently ({@link _paint_leaf}).
+    `solid` is the part of `blockers` that is text or a placed image, with the
+    page's vector furniture left out: the fallback for a region whose
+    decoration has left it no air at all ({@link _breathing_room}).
     """
     ink = _text_ink(page)
     blockers = list(ink)
+    solid = list(ink)
     backdrops: list[pymupdf.Rect] = []
 
     page_area = abs(page.rect.get_area()) or 1.0
@@ -1274,6 +1576,7 @@ def _page_marks(page: pymupdf.Page) -> tuple[list[pymupdf.Rect], list[pymupdf.Re
         else:
             ink.append(rect)
             blockers.append(rect)
+            solid.append(rect)
 
     try:
         drawings = page.get_drawings()
@@ -1296,7 +1599,8 @@ def _page_marks(page: pymupdf.Page) -> tuple[list[pymupdf.Rect], list[pymupdf.Re
 
     return ([rect for rect in ink if rect.is_valid and not rect.is_empty],
             [rect for rect in blockers if rect.is_valid and rect.height > 0],
-            backdrops)
+            backdrops,
+            [rect for rect in solid if rect.is_valid and rect.height > 0])
 
 
 def _merge_spans(spans: list[tuple[float, float]],
@@ -1442,6 +1746,35 @@ def _substantial(runs: list[tuple[float, float]],
     return kept
 
 
+def _side_extent(marks: list[pymupdf.Rect]) -> float:
+    """How much height these marks cover between them, gaps not counted."""
+    return sum(high - low for low, high
+               in _merge_spans([(mark.y0, mark.y1) for mark in marks], 0.0))
+
+
+def _is_corridor(edge: float, marks: list[pymupdf.Rect],
+                 rect: pymupdf.Rect) -> bool:
+    """Is there a real column on each side of `edge`?
+
+    The evidence a candidate corridor is a corridor: two flows with enough to
+    them to be flows, running BESIDE each other rather than sitting at
+    opposite corners of the page. See {@link _MIN_COLUMN_EXTENT}.
+    """
+    left = [mark for mark in marks if mark.x1 <= edge]
+    right = [mark for mark in marks if mark.x0 >= edge]
+    extents = (_side_extent(left), _side_extent(right))
+
+    if min(extents) < _MIN_COLUMN_EXTENT * rect.height:
+        return False
+
+    shared = sum(
+        max(0.0, min(low, high) - max(start, top))
+        for start, low in _merge_spans([(mark.y0, mark.y1) for mark in left], 0.0)
+        for top, high in _merge_spans([(mark.y0, mark.y1) for mark in right], 0.0))
+
+    return shared >= _MIN_COLUMN_COEXIST * min(extents)
+
+
 def _split_region(rect: pymupdf.Rect, blockers: list[pymupdf.Rect], depth: int,
                   column: pymupdf.Rect) -> _Region:
     """`rect` divided into the parts of it that can be opened independently."""
@@ -1458,7 +1791,8 @@ def _split_region(rect: pymupdf.Rect, blockers: list[pymupdf.Rect], depth: int,
             runs = _substantial(
                 _merge_spans([(mark.x0, mark.x1) for mark in inside], _COL_GAP),
                 inside)
-            edges = _cut_lines(runs, rect.x0, rect.x1)
+            edges = [edge for edge in _cut_lines(runs, rect.x0, rect.x1)
+                     if _is_corridor(edge, inside, rect)]
 
             if edges:
                 bounds = [rect.x0, *edges, rect.x1]
@@ -1486,14 +1820,22 @@ def _split_region(rect: pymupdf.Rect, blockers: list[pymupdf.Rect], depth: int,
 
 
 def _cut_above(line: pymupdf.Rect, gaps: list[tuple[float, float]],
-               blockers: list[pymupdf.Rect], limit: float,
-               strict: bool) -> tuple[float, float] | None:
+               blockers: list[pymupdf.Rect], limit: float, strict: bool,
+               clean: Callable[[float, float], bool] | None = None,
+               ) -> tuple[float, float] | None:
     """`(cut, strip)` — where the region may be opened for `line`, or None.
 
     `strict` is what makes a gloss belong to its line: the cut must be
     reachable from the line with nothing of the page in between, so a gloss is
     never hung above someone else's paragraph. The paragraph- and region-level
     attachments drop it deliberately, having already decided to sit further up.
+
+    `clean(cut, strip)` is the page's own pixels vetting the result
+    ({@link _CutRows}). The gap this works in is built from object bounds, and
+    where those under-report their ink the gap runs down inside the glyphs —
+    so the cut is walked back UP the gap until the page agrees there is
+    nothing there. Walking up costs the gloss a little of its closeness to the
+    line; cutting through the line costs the reader the line.
     """
     top = line.y0
     found = None
@@ -1520,6 +1862,15 @@ def _cut_above(line: pymupdf.Rect, gaps: list[tuple[float, float]],
         return None
 
     cut = ceiling - strip / 2
+
+    if clean is not None:
+        floor = max(low + strip / 2, ceiling - strip / 2 - _CUT_WALK)
+
+        while not clean(cut, strip):
+            cut -= strip
+
+            if cut < floor:
+                return None
 
     if strict:
         for mark in blockers:
@@ -1565,7 +1916,8 @@ def _band_at(leaf: _Region, cut: float, strip: float) -> _Band:
     return band
 
 
-def _ink_bounds(box: pymupdf.Rect, ink: list[pymupdf.Rect]) -> pymupdf.Rect:
+def _ink_bounds(box: pymupdf.Rect, ink: list[pymupdf.Rect],
+                reach: float | None = None) -> pymupdf.Rect:
     """`box` replaced by the marks it actually holds.
 
     The sidecar's boxes come from BabelDOC's character metrics and are only
@@ -1579,10 +1931,28 @@ def _ink_bounds(box: pymupdf.Rect, ink: list[pymupdf.Rect]) -> pymupdf.Rect:
     whatever it overlaps — which here would swallow the neighbour it was
     supposed to be told apart from. Ownership is decided by CENTRE instead: a
     mark belongs to the box its middle falls in, and to no other.
+
+    And only if it is the size of something the box could be MADE of. The
+    shortfall being corrected is an ascent artifact, a fraction of a line; a
+    mark much taller than the box is a page-centred decorative ring, a
+    full-height bracket, a tall arrow — scenery that happens to be centred
+    there. Adopting it swelled ~200 blocks corpus-wide to more than twice
+    their real height, run22 p3 an 18.6 pt paragraph to 405.7 pt. That anchor
+    is what {@link _levels} sorts on, so the paragraph sorted first and its
+    gloss was drawn above three paragraphs that come before it; it is also
+    what the fallback placement treats as an obstacle and what
+    {@link _leaf_for} picks a region with.
+
+    `reach` is how far past the box a mark may still be part of it — one line
+    of slack in each direction, so the ascent correction this exists for is
+    untouched.
     """
+    reach = reach if reach is not None else box.height
+    span = box.height + 2 * reach
     owned = [mark for mark in ink
              if box.y0 <= (mark.y0 + mark.y1) / 2 <= box.y1
-             and mark.x1 > box.x0 and mark.x0 < box.x1]
+             and mark.x1 > box.x0 and mark.x0 < box.x1
+             and mark.height <= span]
 
     if not owned:
         return box
@@ -1592,24 +1962,30 @@ def _ink_bounds(box: pymupdf.Rect, ink: list[pymupdf.Rect]) -> pymupdf.Rect:
     for mark in owned[1:]:
         bounds |= mark
 
-    return bounds
+    return pymupdf.Rect(bounds.x0, max(bounds.y0, box.y0 - reach),
+                        bounds.x1, min(bounds.y1, box.y1 + reach))
 
 
-def _spaced_units(block: dict, matrix: pymupdf.Matrix,
-                  ink: list[pymupdf.Rect]) -> tuple[pymupdf.Rect, list, float]:
+def _spaced_units(block: dict, matrix: pymupdf.Matrix, ink: list[pymupdf.Rect],
+                  typical: float = 0.0) -> tuple[pymupdf.Rect, list, float]:
     """One paragraph as `(anchor, [(line, chunk)], source_size)`."""
     anchor = _to_display(block["box"], matrix)
-    source_size = float(block.get("font_size") or 0) or anchor.height
+    source_size = _source_size(block, anchor, typical)
     text = block["target"].strip()
-    lines = sorted((_ink_bounds(_to_display(line, matrix), ink)
+    # A line of the paragraph's own type is the slack a mark may claim, for
+    # the anchor as much as for one line: the anchor's job is to say where the
+    # paragraph is, and a paragraph is not the scenery behind it.
+    reach = max(source_size, 1.0)
+    lines = sorted((_ink_bounds(_to_display(line, matrix), ink, reach)
                     for line in (block.get("lines") or []) if line),
                    key=lambda rect: rect.y0)
-    anchor = _ink_bounds(anchor, ink)
+    anchor = _ink_bounds(anchor, ink, reach)
 
     if not lines:
         return anchor, [(anchor, text)], source_size
 
-    chunks = _split_proportionally(text, [line.width for line in lines])
+    chunks = _split_proportionally(text, [line.width for line in lines],
+                                   block.get("source"))
 
     if len(chunks) < len(lines):
         # Too few words to go round: one gloss for the paragraph.
@@ -1871,10 +2247,41 @@ def _spaced_page(target: pymupdf.Document, source: pymupdf.Document, index: int,
     page = source[index]
     rect = page.rect
     options = layout.options
-    ink, blockers, backdrops = _page_marks(page)
+    ink, blockers, backdrops, solid = _page_marks(page)
     root = _split_region(rect, blockers, 0, rect)
     leaves = root.leaves()
     gaps = {id(leaf): _free_gaps(blockers, leaf.rect) for leaf in leaves}
+    # The same air measured against the page's TEXT AND IMAGES ALONE, with its
+    # vector furniture left out. A page whose decoration is one big shape is
+    # already handled — {@link _is_backdrop} sets it aside — but a decoration
+    # drawn as FORTY small shapes is not: run22's concentric vignette spans
+    # y 66.9 to 371.7 as ~40 curves, none individually big enough to be a
+    # backdrop, and between them they leave that slide's main region 4.3 pt of
+    # free air in 476 pt. No line can find clear air above it, every paragraph
+    # falls through to "gloss above the whole region", and 415 of that
+    # document's 486 glosses end up piled at the top, out of reading order.
+    #
+    # So a line that finds nothing the strict way asks again without the
+    # scenery, rather than being hoisted to the top of the page. Nothing is
+    # given away by asking second: the full account is always tried first, and
+    # the page's own pixels ({@link _CutRows}) have the final say over the cut
+    # either way — which is what keeps this from slicing the scenery it just
+    # agreed to ignore.
+    loose = {id(leaf): _free_gaps(solid, leaf.rect) for leaf in leaves}
+    # The page's own pixels, which every cut is checked against before it is
+    # committed. One render per page, shared by every leaf on it.
+    rows = _CutRows(page)
+
+    def cleaner(leaf: _Region) -> Callable[[float, float], bool]:
+        # The strip is copied across the whole leaf, so the whole leaf's width
+        # is what has to be constant — not just the line's own span.
+        def clean(cut: float, strip: float) -> bool:
+            return rows.constant(leaf.rect.x0, leaf.rect.x1,
+                                 cut - strip / 2, cut + strip / 2)
+
+        return clean
+
+    clean_for = {id(leaf): cleaner(leaf) for leaf in leaves}
     reach: dict[int, float] = {}
 
     for leaf in leaves:
@@ -1898,23 +2305,20 @@ def _spaced_page(target: pymupdf.Document, source: pymupdf.Document, index: int,
                     > 0.9 * abs(leaf.rect.get_area())
                     for backdrop in backdrops))
 
-    blocks = [block for block in (page_data.get("blocks") or [])
-              if block.get("box") and (block.get("target") or "").strip()]
     # The raster lane's blocks live INSIDE an embedded image. No cut can pass
     # through an image (it is a blocker), so opening the page cannot make room
     # for them — they keep the plate treatment, drawn on the rebuilt page after
     # everything has landed where it is going to stay.
-    raster = [block for block in blocks
-              if block.get("on_raster") and block.get("region")]
-    blocks = [block for block in blocks
-              if not (block.get("on_raster") and block.get("region"))]
+    blocks, raster = _gloss_blocks(page_data)
     matrix = page.transformation_matrix
     anchors: list[pymupdf.Rect] = []
     fallbacks: list[tuple[pymupdf.Rect, str, float]] = []
     drawn = skipped = 0
 
+    typical = _typical_size(blocks + raster)
+
     for block in blocks:
-        anchor, units, source_size = _spaced_units(block, matrix, ink)
+        anchor, units, source_size = _spaced_units(block, matrix, ink, typical)
         text = block["target"].strip()
         anchors.append(anchor)
         limit = max(2.0, _CUT_LOOKUP * source_size)
@@ -1922,8 +2326,14 @@ def _spaced_page(target: pymupdf.Document, source: pymupdf.Document, index: int,
 
         for line, _chunk in units:
             leaf = _leaf_for(line, leaves)
-            found.append((leaf, _cut_above(line, gaps[id(leaf)], blockers,
-                                           limit, True)))
+            cut = _cut_above(line, gaps[id(leaf)], blockers, limit, True,
+                             clean_for[id(leaf)])
+
+            if cut is None:
+                cut = _cut_above(line, loose[id(leaf)], solid, limit, True,
+                                 clean_for[id(leaf)])
+
+            found.append((leaf, cut))
 
         if all(cut for _leaf, cut in found):
             # Line by line: the gloss sits directly over the words it renders.
@@ -1939,8 +2349,11 @@ def _spaced_page(target: pymupdf.Document, source: pymupdf.Document, index: int,
             # between the boxes; it can be opened up over them.
             line = units[0][0]
             leaf = _leaf_for(line, leaves)
-            cut = _cut_above(line, gaps[id(leaf)], blockers,
-                             line.y0 - leaf.rect.y0 + 1.0, False)
+            reach = line.y0 - leaf.rect.y0 + 1.0
+            cut = (_cut_above(line, gaps[id(leaf)], blockers, reach, False,
+                              clean_for[id(leaf)])
+                   or _cut_above(line, loose[id(leaf)], solid, reach, False,
+                                 clean_for[id(leaf)]))
             attached = [(leaf, cut, line, text)] if cut else None
 
         if attached is None:
@@ -2234,6 +2647,25 @@ def render_overlay(original_bytes: bytes, sidecar: Any,
                                  "returning the overlay without it")
 
         report["vocab_pages"] = vocab_added
+
+        # Every glyph in the gloss font claims to BE its contextual shape, so
+        # the Arabic drawn above the reader's lines extracts, copies and
+        # searches as presentation forms rather than as letters — Ctrl+F for a
+        # word that is visibly on the page finds nothing. The repair rewrites
+        # what each glyph claims to be; the save below persists it.
+        #
+        # Guarded like every other optional layer here, and for one concrete
+        # reason: it lands with the engine-text fix, so on a build without
+        # that fix an unguarded call would take the vocab layer and the
+        # compacting save down with it — trading a text layer for the page
+        # itself, which is what it cost the duals.
+        try:
+            from server import page_fonts
+
+            page_fonts.repair_arabic_text_layer(doc)
+        except Exception:  # noqa: BLE001 - a text layer is never worth a page
+            logger.exception("%s: repairing the Arabic text layer failed; "
+                             "returning the overlay as drawn", style)
 
         out = BytesIO()
         # garbage=4 is what collapses the one-font-copy-per-box the Story

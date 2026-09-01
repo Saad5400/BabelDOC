@@ -525,6 +525,13 @@ class ParagraphFinder:
             # image characters are not needed
             page.pdf_character = []
 
+        # Rotated (90 deg) runs are extracted as a column of glyphs in
+        # reading-column order, i.e. one character per cluster and bottom to
+        # top. Translating that produces letter salad drawn over the
+        # un-erased original. Hand those characters back to the page so they
+        # render exactly as the author drew them.
+        self.restore_rotated_text_paragraphs(page)
+
         self.fix_overlapping_paragraphs(page)
 
         # Image-text lane: the label paragraphs join the page only after all
@@ -541,6 +548,104 @@ class ParagraphFinder:
 
         # 新阶段：设置段落的 renderorder 为所有组成部分中 renderorder 最小的
         self._set_paragraph_render_order(page)
+
+    # ------------------------------------------------------------------
+    # Rotated text (extraction failure guard)
+    # ------------------------------------------------------------------
+
+    # Rotated runs betray themselves in two ways, both measured on run67.
+    #
+    # A. A GLYPH COLUMN. Clustering by page-x puts every glyph of a
+    #    90-degree run in its own cluster, so the paragraph is a tall stack
+    #    of one-character lines: the chapter sidebar arrives as 20 lines of
+    #    a single letter each inside a 26 x 407 pt box.
+    # B. A LINE THAT CANNOT FIT. A horizontal line is about n/2 times as
+    #    wide as it is tall; a rotated one is far narrower. Below
+    #    0.3 * n the text cannot be running left to right at all
+    #    (measured: 'focus o' n=6 w=13.2 h=35.2 -> 0.38 against 1.8, while
+    #    the same page's 'device drivers' n=13 w=66.6 h=10.9 -> 6.1
+    #    against 3.9).
+    ROTATED_MIN_CHARS = 4
+    ROTATED_ASPECT_PER_CHAR = 0.3
+    ROTATED_COLUMN_MIN_LINES = 6
+    ROTATED_COLUMN_SHARE = 0.7
+    ROTATED_BOX_ASPECT = 1.5
+
+    @staticmethod
+    def _line_char_count(line: PdfLine) -> int:
+        return sum(
+            1
+            for char in line.pdf_character
+            if char.char_unicode and not char.char_unicode.isspace()
+        )
+
+    @classmethod
+    def _line_is_rotated(cls, line: PdfLine) -> bool | None:
+        """True/False for a line long enough to judge, None for too short."""
+        if line.box is None or not line.pdf_character:
+            return None
+        chars = cls._line_char_count(line)
+        if chars < cls.ROTATED_MIN_CHARS:
+            return None
+        width = line.box.x2 - line.box.x
+        height = line.box.y2 - line.box.y
+        if width <= 0 or height <= 0:
+            return None
+        return width / height < cls.ROTATED_ASPECT_PER_CHAR * chars
+
+    def _is_a_glyph_column(self, paragraph: PdfParagraph) -> bool:
+        lines = [
+            line for line in self._paragraph_lines(paragraph) if line.box is not None
+        ]
+        if len(lines) < self.ROTATED_COLUMN_MIN_LINES:
+            return False
+        singles = sum(1 for line in lines if self._line_char_count(line) == 1)
+        if singles / len(lines) < self.ROTATED_COLUMN_SHARE:
+            return False
+        box = paragraph.box
+        if box is None:
+            box = Box(
+                min(line.box.x for line in lines),
+                min(line.box.y for line in lines),
+                max(line.box.x2 for line in lines),
+                max(line.box.y2 for line in lines),
+            )
+        width = box.x2 - box.x
+        return width > 0 and (box.y2 - box.y) > width * self.ROTATED_BOX_ASPECT
+
+    def _is_rotated_text_paragraph(self, paragraph: PdfParagraph) -> bool:
+        if not paragraph.pdf_paragraph_composition:
+            return False
+        if self._is_a_glyph_column(paragraph):
+            return True
+        verdicts = [
+            verdict
+            for line in self._paragraph_lines(paragraph)
+            if (verdict := self._line_is_rotated(line)) is not None
+        ]
+        return bool(verdicts) and all(verdicts)
+
+    def restore_rotated_text_paragraphs(self, page: Page) -> None:
+        """Un-paragraph rotated runs so they are delivered untouched.
+
+        The extractor clusters characters by page-x, which for a run set at
+        90 degrees is its reading COLUMN: every glyph lands in its own
+        cluster, in reverse. run67's vertical chapter sidebar arrives as
+        'E D OC D N A SM E TSYS R E B M U N' — "NUMBER SYSTEMS AND CODE"
+        read bottom to top — on all 48 of its pages, and the fragments the
+        model happens to recognise come back translated while the rest are
+        redrawn as a column of single letters on top of the original.
+
+        Translating rotated text properly needs the run's own rotated frame
+        throughout extraction, clustering and typesetting. Until then the
+        honest outcome is the untranslated original: the reader loses a
+        sidebar label and keeps a readable page.
+        """
+        page.pdf_paragraph = [
+            paragraph
+            for paragraph in page.pdf_paragraph
+            if not self._is_rotated_text_paragraph(paragraph)
+        ]
 
     def _set_paragraph_render_order(self, page: Page):
         """
@@ -666,11 +771,12 @@ class ParagraphFinder:
         """
         if len(paragraphs) < 2:
             return
+        column_starts = self._page_column_starts(paragraphs)
         i = 0
         while i < len(paragraphs) - 1:
             a = paragraphs[i]
             b = paragraphs[i + 1]
-            if self._should_merge_line_fragments(a, b):
+            if self._should_merge_line_fragments(a, b, column_starts):
                 self._merge_fragment_paragraph(a, b)
                 del paragraphs[i + 1]
                 # stay on i: allows chains like "The" + <title body> + ")"
@@ -685,8 +791,45 @@ class ParagraphFinder:
             if comp.pdf_line
         ]
 
+    # A justified line's inter-word gaps are WIDER than the gutter between
+    # two table columns (measured on run9 p8: ~21 pt word gaps at a 15 pt
+    # font, against a 14 pt column gutter), so no gap threshold can tell
+    # them apart. What does tell them apart is that a column starts in the
+    # same place on many lines, while a stretched word gap starts nowhere
+    # in particular.
+    COLUMN_BIN_PT = 2.0        # x positions this close are the same column
+    COLUMN_MIN_LINES = 3       # distinct baselines needed to call it a column
+    # A fragment gap may run to this multiple of the line height when it
+    # does not begin a column.
+    FRAGMENT_GAP_LINES = 2.0
+
+    def _page_column_starts(self, paragraphs: list[PdfParagraph]) -> list[float]:
+        """Left edges at which enough separate lines start to be a column.
+
+        Counted over distinct BASELINES from distinct PARAGRAPHS: one
+        wrapped paragraph's lines all start at the same x, and on its own
+        that is a left margin, not a column boundary.
+        """
+        by_bin: dict[int, set[tuple[int, int]]] = {}
+        for index, paragraph in enumerate(paragraphs):
+            for line in self._paragraph_lines(paragraph):
+                if line.box is None:
+                    continue
+                key = int(line.box.x / self.COLUMN_BIN_PT)
+                by_bin.setdefault(key, set()).add((index, int(line.box.y / 2.0)))
+        return [
+            key * self.COLUMN_BIN_PT
+            for key, seen in by_bin.items()
+            if len(seen) >= self.COLUMN_MIN_LINES
+            and len({index for index, _ in seen}) >= 2
+        ]
+
+    def _starts_a_column(self, x: float, column_starts: list[float]) -> bool:
+        return any(abs(x - start) <= self.COLUMN_BIN_PT for start in column_starts)
+
     def _should_merge_line_fragments(
-        self, a: PdfParagraph, b: PdfParagraph
+        self, a: PdfParagraph, b: PdfParagraph,
+        column_starts: list[float] | None = None,
     ) -> bool:
         if not a.pdf_paragraph_composition or not b.pdf_paragraph_composition:
             return False
@@ -718,7 +861,18 @@ class ParagraphFinder:
             last_a.box.y2 - last_a.box.y, first_b.box.y2 - first_b.box.y
         )
         gap = first_b.box.x - last_a.box.x2
-        return -2.0 <= gap <= max(2.0, line_height * 0.6)
+        if gap < -2.0:
+            return False
+        if gap <= max(2.0, line_height * 0.6):
+            return True
+        # A wider gap is a justified line's stretched word space — unless
+        # the second fragment begins one of the page's columns, in which
+        # case the gap is a gutter and the two are unrelated cells.
+        if gap > max(2.0, line_height * self.FRAGMENT_GAP_LINES):
+            return False
+        if column_starts is None:
+            return False
+        return not self._starts_a_column(first_b.box.x, column_starts)
 
     def _merge_fragment_paragraph(self, a: PdfParagraph, b: PdfParagraph):
         """Merge paragraph b into a; b's first line joins a's last line."""
