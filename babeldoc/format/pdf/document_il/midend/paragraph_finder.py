@@ -8,6 +8,7 @@ import pymupdf
 
 from babeldoc.babeldoc_exception.BabelDOCException import ExtractTextError
 from babeldoc.format.pdf.document_il import Box
+from babeldoc.format.pdf.document_il import VisualBbox
 from babeldoc.format.pdf.document_il import Document
 from babeldoc.format.pdf.document_il import GraphicState
 from babeldoc.format.pdf.document_il import Page
@@ -1373,7 +1374,7 @@ class ParagraphFinder:
         for region, chars in zip(regions, per_region, strict=True):
             if chars:
                 paragraphs.extend(
-                    self._build_image_text_region_paragraphs(region, chars)
+                    self._build_image_text_region_paragraphs(page, region, chars)
                 )
         return paragraphs
 
@@ -1402,6 +1403,7 @@ class ParagraphFinder:
 
     def _build_image_text_region_paragraphs(
         self,
+        page: Page,
         region: tuple[float, float, float, float],
         chars: list[PdfCharacter],
     ) -> list[PdfParagraph]:
@@ -1435,7 +1437,7 @@ class ParagraphFinder:
             line = self.create_line(members).pdf_line
             if line is None or not line.pdf_character:
                 continue
-            for piece in self._split_image_text_line_at_gaps(line):
+            for piece in self._split_image_text_line_at_gaps(line, page):
                 paragraph = PdfParagraph(
                     box=Box(0, 0, 0, 0),
                     pdf_paragraph_composition=[piece],
@@ -1467,7 +1469,7 @@ class ParagraphFinder:
         return paragraphs
 
     def _split_image_text_line_at_gaps(
-        self, line: PdfLine
+        self, line: PdfLine, page: Page | None = None
     ) -> list[PdfParagraphComposition]:
         """Split one threaded line into label pieces at big horizontal gaps."""
         chars = sorted(
@@ -1485,10 +1487,69 @@ class ParagraphFinder:
         for prev, char in zip(chars, chars[1:], strict=False):
             prev_box = prev.visual_bbox.box if prev.visual_bbox else prev.box
             char_box = char.visual_bbox.box if char.visual_bbox else char.box
-            if char_box.x - prev_box.x2 > threshold:
-                pieces.append([])
+            gap = char_box.x - prev_box.x2
+            if gap > threshold:
+                if self._one_region_spans(page, prev_box, char_box):
+                    # Kept as one label: the gap is a word gap, so it has
+                    # to reach the translator as one — 'Digital Design
+                    # and' + 'Computer' is not 'andComputer'.
+                    if (prev.char_unicode or "") != " ":
+                        pieces[-1].append(
+                            self._gap_space_char(prev, prev_box, char_box)
+                        )
+                else:
+                    pieces.append([])
             pieces[-1].append(char)
         return [self.create_line(piece) for piece in pieces if piece]
+
+    @staticmethod
+    def _gap_space_char(model: PdfCharacter, left, right) -> PdfCharacter:
+        """A space filling the gap between two runs of one label."""
+        box = Box(x=left.x2, y=left.y, x2=right.x, y2=left.y2)
+        return PdfCharacter(
+            pdf_style=model.pdf_style,
+            box=box,
+            char_unicode=" ",
+            scale=model.scale,
+            advance=box.x2 - box.x,
+            visual_bbox=VisualBbox(box=box),
+            render_mode=model.render_mode,
+            xobj_id=model.xobj_id,
+        )
+
+    def _one_region_spans(self, page: Page | None, left, right) -> bool:
+        """True when one detected region holds both sides of the gap.
+
+        The gap rule exists to keep two labels that share a row apart. It
+        cannot tell that row from a LINE with wide word spacing, and on
+        run67 it cut the copyright footer — set in a letter-spaced italic,
+        so its word gaps run to 18 and 22 pt against a 8.2 pt line — into
+        'Digital Design and' / 'Computer Architecture, 2"' / 'Edition,
+        2012'. Each piece was then translated on its own and set right
+        aligned in its own box, and the one sentence was delivered as
+        three Arabic fragments with 90 pt of white between them, on 44 of
+        that document's 48 pages.
+
+        A region the page was parsed into is the document's own statement
+        that its contents belong together, so a gap inside one is a word
+        gap. Two labels on a row are two regions, or none.
+        """
+        if page is None:
+            return False
+        for layout in page.page_layout or []:
+            if layout.class_name == "fallback_line":
+                continue
+            box = layout.box
+            if box is None or None in (box.x, box.y, box.x2, box.y2):
+                continue
+            if (
+                box.x <= left.x
+                and right.x2 <= box.x2
+                and box.y <= min(left.y, right.y)
+                and max(left.y2, right.y2) <= box.y2
+            ):
+                return True
+        return False
 
     def add_image_text_masks(
         self, page: Page, paragraphs: list[PdfParagraph]

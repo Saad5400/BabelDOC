@@ -394,3 +394,62 @@ def test_image_text_masks_render_on_digital_pages():
     # mask below the translated (orderless) character
     assert ordered.index("RectangleRenderUnit") < ordered.index(
         "CharacterRenderUnit")
+
+
+# --------------------------------------------------- one line, one label
+
+
+def _page_with_regions(chars, layouts, *, page_number=0):
+    page = _page(chars, page_number=page_number)
+    page.page_layout = [
+        il_version_1.PageLayout(
+            id=index + 1, conf=conf, class_name=class_name, box=_box(*box)
+        )
+        for index, (class_name, conf, box) in enumerate(layouts)
+    ]
+    return page
+
+
+# run67 p5's copyright footer, at its real coordinates: one sentence in a
+# letter-spaced italic, so its word gaps run to 18.1 and 21.9 pt against a
+# 8.2 pt line. The gap rule cut it into three labels, each translated on
+# its own and set right aligned in its own box, and the sentence was
+# delivered as three Arabic fragments with 90 pt of white between them —
+# on 44 of that document's 48 pages.
+FOOTER_REGION = (0.0, 60.0, 841.0, 534.0)
+FOOTER_CAPTION = ("figure_caption", 0.57, (20.0, 67.0, 438.0, 85.0))
+
+
+def _footer_chars():
+    return (
+        _word_chars("Digital Design and", 41.7, 70.9, size=8.2, step=6.4)
+        + _word_chars("Computer Architecture,", 174.8, 70.9, size=8.2, step=6.9)
+        + _word_chars("Edition, 2012", 349.2, 70.9, size=8.2, step=6.2)
+    )
+
+
+def test_one_detected_region_makes_one_label_of_a_spaced_out_line():
+    page = _page_with_regions(_footer_chars(), [FOOTER_CAPTION])
+    paragraphs = _finder({0: [FOOTER_REGION]})._extract_image_text_paragraphs(page)
+
+    assert [p.unicode for p in paragraphs] == [
+        "Digital Design and Computer Architecture, Edition, 2012"
+    ]
+
+
+def test_without_a_region_to_vouch_for_them_the_pieces_stay_apart():
+    # The same characters with no layout region over them: the gap rule is
+    # all the evidence there is, and it still separates side-by-side
+    # labels sharing a row.
+    page = _page(_footer_chars())
+    paragraphs = _finder({0: [FOOTER_REGION]})._extract_image_text_paragraphs(page)
+
+    assert len(paragraphs) == 3
+
+
+def test_a_region_covering_only_one_side_of_the_gap_does_not_join_it():
+    caption = ("figure_caption", 0.57, (20.0, 67.0, 170.0, 85.0))
+    page = _page_with_regions(_footer_chars(), [caption])
+    paragraphs = _finder({0: [FOOTER_REGION]})._extract_image_text_paragraphs(page)
+
+    assert len(paragraphs) == 3
