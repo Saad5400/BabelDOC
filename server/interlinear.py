@@ -29,10 +29,21 @@ the requested fraction of the source font size first, then stepped down, and
 finally force-fitted by the renderer if a step still spills. A paragraph with
 no usable band above it is SKIPPED rather than drawn over the reader's
 document, and the count comes back to the caller — a bad fit should be visible,
-not silent. On a real slide deck that costs a fifth of the glosses and shrinks
-the rest, which is why it is no longer the default; it is still the right
-answer when the original pagination has to be preserved, and it is the only one
-that can gloss a page whose /Rotate the other cannot open along.
+not silent.
+
+That price turned out to be the whole layout. MEASURED over 13 real production
+runs and 403 pages, it skips 68% of the glosses; on a 2-slides-per-A4 lecture
+handout it skips 96% (run30 441 of 457, run14 862 of 894), and run14's page 2
+comes back with not one gloss on it and nothing in the file saying so. There
+is no tuning that recovers it: the bands on documents of that shape are ~4 pt
+tall, and the fit ladder bottoms out before anything fits.
+
+So the product no longer OFFERS it — that decision lives in catodemy, not
+here. The engine still accepts the style so that artifacts already built and
+cached stay downloadable, and it is still what glosses a page whose /Rotate
+the spaced layout cannot open along ({@link render_spaced}). It is frozen,
+not maintained: everything below that says "both styles" means the spaced one
+and that fallback. New work belongs in THE SPACED LAYOUT.
 
 When one band cannot hold a gloss at a readable size, the compact layout
 SPREADS it down the paragraph's own source lines instead of shrinking it into
@@ -90,9 +101,10 @@ _GLYPH_HEIGHTS = threading.Lock()
 
 # `interlinear` is the layout the product means by the word: the one that opens
 # the page up so every gloss fits. `interlinear_compact` is the same idea under
-# the constraint that the page may not change size — worth keeping for a reader
-# who needs the original pagination, and the only thing that can gloss a page
-# whose /Rotate this layout cannot open along.
+# the constraint that the page may not change size, which measured a 68% skip
+# rate on the real corpus and is no longer offered to anyone: it is kept so
+# already-built artifacts stay downloadable, and because it is what glosses a
+# page whose /Rotate the spaced layout cannot open along.
 COMPACT_STYLE = "interlinear_compact"
 OVERLAY_STYLES = ("interlinear", COMPACT_STYLE)
 
@@ -246,8 +258,10 @@ class OverlayOptions:
         The two want different numbers for the same reason they are two
         layouts: `interlinear_compact` is rationing space the author left it,
         so its type is modest and its clearances are shaved to the point of
-        being charged twice against a 7 pt band. `interlinear` makes the space
-        it needs, so it can afford to be read comfortably and to breathe.
+        being charged twice against a 7 pt band — which is most of why it
+        skips two thirds of what it is given, and why it is no longer offered.
+        `interlinear` makes the space it needs, so it can afford to be read
+        comfortably and to breathe.
         """
         if style == COMPACT_STYLE:
             return cls()

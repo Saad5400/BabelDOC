@@ -230,7 +230,13 @@ def test_a_tight_list_gets_every_gloss_and_the_page_grows():
 
 
 def test_the_same_list_defeats_the_compact_layout():
-    """The comparison that justifies the layout, so it cannot rot silently."""
+    """The comparison that justifies the layout, so it cannot rot silently.
+
+    On the real corpus the compact style skips 68% of its glosses and 96% on a
+    2-slides-per-A4 handout, which is why the product no longer offers it. The
+    engine still builds it — cached artifacts have to stay downloadable, and
+    it is what glosses a rotated page — so this stays as the record of why.
+    """
     builder = _tight_list()
 
     _pdf, report = interlinear.render_overlay(builder.pdf(), builder.sidecar(),
