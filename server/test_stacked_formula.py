@@ -22,9 +22,7 @@ Run from the repo root:
 """
 
 from babeldoc.format.pdf.document_il import il_version_1
-from babeldoc.format.pdf.document_il.midend.styles_and_formulas import (
-    StylesAndFormulas,
-)
+from babeldoc.format.pdf.document_il.midend.styles_and_formulas import StylesAndFormulas
 from babeldoc.format.pdf.document_il.midend.typesetting import Typesetting
 
 
