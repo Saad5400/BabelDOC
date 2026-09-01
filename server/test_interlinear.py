@@ -152,18 +152,47 @@ def test_the_original_page_is_left_intact():
     assert "Software change is inevitable" in latin
 
 
-def test_arabic_is_shaped_not_left_as_isolated_letters():
+def test_arabic_is_shaped_and_the_delivered_layer_reads_as_letters(monkeypatch):
+    """Shaped on the page, and letters in the text layer — both, in one pass.
+
+    These used to be one assertion. Before the text-layer repair existed the
+    only visible sign that a run had been shaped was that it EXTRACTED as
+    contextual forms, so that is what this asserted. The repair makes the
+    delivered file extract as letters instead, which inverts the old assertion
+    without changing anything about what is drawn — so the two properties are
+    now checked where each is actually true: shaping on the finished document
+    the repair is handed, letters on the file the reader gets.
+    """
     original = _page_pdf([(60, 300, 500, 340, "Software change is inevitable")])
     sidecar = _sidecar([{"box": (60, 300, 400, 314), "target": AR_ONE}])
 
+    from server import page_fonts
+
+    repair = page_fonts.repair_arabic_text_layer
+    as_drawn = []
+
+    def record_then_repair(doc):
+        as_drawn.append("".join(page.get_text() for page in doc))
+
+        return repair(doc)
+
+    monkeypatch.setattr(page_fonts, "repair_arabic_text_layer",
+                        record_then_repair)
+
     pdf, _ = _render(original, sidecar)
 
+    # Shaped: contextual (presentation) forms are what a shaped Arabic run is
+    # made of, and they are what the Story engine leaves on the page. An
+    # unshaped run would carry only the base letters of the U+06xx block here.
+    assert as_drawn, "the repair was never offered the document"
+    assert any("\ufb50" <= ch <= "\ufeff" for ch in as_drawn[0])
+
+    # Repaired: the file the reader downloads gives the letters back, contiguous
+    # and in order, so the gloss is searchable and copyable rather than the
+    # glyph soup an unrepaired subset extracts as.
     drawn = "".join(text for _rect, text in _drawn_spans(pdf))
-    # Contextual (presentation) forms are what a shaped Arabic run is made of;
-    # an unshaped run would carry only the base letters of the U+06xx block.
-    # That they come back out at all also means the font subset kept their cmap
-    # entries — without those the finished PDF's Arabic extracts as mojibake.
-    assert any("\ufb50" <= ch <= "\ufeff" for ch in drawn)
+    assert AR_ONE in drawn
+    assert not any("\ufb50" <= ch <= "\ufeff" for ch in drawn)
 
 
 def test_a_latin_term_inside_an_arabic_gloss_survives():
