@@ -64,8 +64,22 @@ else:  # script mode: python server/image_prep.py ...
 
 DPI = 300
 MAX_DPI = 600            # render at native image resolution up to this
-MIN_W_PT = 50.0          # placements smaller than this are decorations
-MIN_H_PT = 30.0
+# A placement is a DECORATION when it is too thin to hold a line of text or
+# too small to hold a word — not merely when it is short. The old
+# 50 x 30 pt box test was a proxy for "decorative" that a wide band of body
+# text fails: run59's boxed DEFINITION panels are 348 x 29.5 pt (a 1697 x
+# 124 px raster of two dense lines) and missed the height threshold by half
+# a point, so the primary content of 21 of that deck's 39 pages was never
+# translated while the truth table beside it was.
+#
+# Measured over the corpus's 1,019 real image placements, min-side + area
+# admits 34 placements the box test rejected — the DEFINITION panels, run59's
+# formula bands, and portrait figures in run14/run30/run39 that were too
+# NARROW for MIN_W_PT — and rejects nothing the box test kept. run9's
+# decorative page rules (698 x 9.4 pt, a 2909 x 39 px hairline) stay out on
+# the short side, which is what they are: a rule, not a line of text.
+MIN_SIDE_PT = 12.0       # thinner than a line of text in any direction
+MIN_AREA_PT2 = 1500.0    # too small to hold a legible word
 MERGE_OVERLAP = 0.5      # placements overlapping this much (of the smaller
                          # one) OCR as ONE region (stacked shadow + figure)
 MIN_LEGIBLE_PT = 5.5     # OCR lines smaller than this are left as pixels
@@ -125,8 +139,12 @@ def gather_regions(page):
     for info in page.get_image_info(xrefs=True):
         raw = pymupdf.Rect(info["bbox"])
         clip = raw & page.rect
-        if clip.is_empty or clip.width < MIN_W_PT or clip.height < MIN_H_PT:
+        if clip.is_empty:
             continue
+        if min(clip.width, clip.height) < MIN_SIDE_PT:
+            continue  # a rule, a divider, a spacer strip
+        if clip.width * clip.height < MIN_AREA_PT2:
+            continue  # too small to hold a legible word
         if info["width"] < 8 or info["height"] < 8:
             continue  # decorative strip / spacer
         native = 72.0 * info["width"] / max(raw.width, 1e-6)

@@ -76,6 +76,40 @@ def test_gather_regions_skips_small_placements(tmp_path):
     assert clip == pymupdf.Rect(100, 100, 400, 250)
 
 
+def test_gather_regions_keeps_a_wide_short_text_band(tmp_path):
+    # run59's boxed DEFINITION panels are 348 x 29.5 pt — two dense lines of
+    # body text, and the whole point of the slide. The old 50 x 30 pt box
+    # test dropped them as decoration by half a point.
+    src = tmp_path / "in.pdf"
+    src.write_bytes(_pdf_with_images([
+        ((100, 100, 448, 129.5), "DEFINITION"),
+    ]))
+    doc = pymupdf.open(src)
+    assert len(image_prep.gather_regions(doc[0])) == 1
+
+
+def test_gather_regions_keeps_a_narrow_tall_figure(tmp_path):
+    # Portrait figures (run39's 43.8 x 52.1 pt icons) were rejected for
+    # being narrower than MIN_W_PT even though they carry labels.
+    src = tmp_path / "in.pdf"
+    src.write_bytes(_pdf_with_images([
+        ((100, 100, 144, 200), "FIG"),
+    ]))
+    doc = pymupdf.open(src)
+    assert len(image_prep.gather_regions(doc[0])) == 1
+
+
+def test_gather_regions_still_skips_a_decorative_rule(tmp_path):
+    # run9's page rules are 698 x 9.4 pt hairlines. Wide, large in area,
+    # and not text — the short side is what gives them away.
+    src = tmp_path / "in.pdf"
+    src.write_bytes(_pdf_with_images([
+        ((10, 100, 590, 109.4), "RULE"),
+    ]))
+    doc = pymupdf.open(src)
+    assert image_prep.gather_regions(doc[0]) == []
+
+
 def test_gather_regions_merges_stacked_placements(tmp_path):
     # a figure drawn over its own drop shadow must OCR once, not twice
     src = tmp_path / "in.pdf"
