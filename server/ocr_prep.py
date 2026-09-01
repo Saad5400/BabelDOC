@@ -35,10 +35,18 @@ Fixes fed to BabelDOC (--ocr-workaround):
    (min(x_size, 1.35 * median word height)) instead of ocrmypdf's smaller
    guess, so translated text is typeset near the original size.
 
-Usage: ocr_prep.py in.pdf out.pdf [--dpi 300] [--debug out_dbg.pdf]
+Usage: ocr_prep.py in.pdf out.pdf [--dpi 300] [--lang eng+ara]
+                                  [--keep-pages 0,1,2] [--debug out_dbg.pdf]
+
+`--keep-pages` names the 0-based pages that already have a real text layer.
+This pass rewrites the text of every page it touches, so a mixed document —
+a scanned cover in front of nine good slides — must hand it only the pages
+that were actually scanned.
 """
 
+import functools
 import html
+import logging
 import re
 import subprocess
 import sys
@@ -46,6 +54,8 @@ import tempfile
 from pathlib import Path
 
 import pymupdf
+
+logger = logging.getLogger("doctranslate.ocr_prep")
 
 DPI = 300
 CONF_KILL = 60          # words below this confidence die
@@ -73,6 +83,74 @@ STROKE_CHARS = set("Il1|!i/\\()[]{}jJtf")
 MARKER_SET = {"¢", "e", "o", "©", "*", "•", "·", "-", "–", "—", "="}
 SINGLE_CHAR_KEEP = {"&", "#", "+", "%", "@", "$", "=", "?", "!", "7"}
 JUNK_ONLY = re.compile(r"^[|<>_\-~^`*.,;:'\"()\[\]{}\\/¢©®™°·—–\s]+$")
+
+# ---------------------------------------------------------------------------
+# Which language tesseract is told to read
+# ---------------------------------------------------------------------------
+# Hardcoding `-l eng` made tesseract read every Arabic run on a mixed scan as
+# Latin noise — a real scanned page came back as `algo Gill`, `sow Josi`,
+# `Pxé` — and that noise was then dutifully translated and drawn over the
+# reader's own page. The realistic scanned input for this product is not an
+# English-only handout; it is an English handout with an Arabic university
+# header, or an instructor's Arabic annotations.
+#
+# ISO 639-1 (what the job carries) -> the ISO 639-2/T code tesseract names its
+# model files by. Only the languages this product plausibly meets; anything
+# already 3 letters is passed through as a tesseract code.
+ISO1_TO_TESSERACT = {
+    "ar": "ara", "de": "deu", "en": "eng", "es": "spa", "fa": "fas",
+    "fr": "fra", "he": "heb", "hi": "hin", "id": "ind", "it": "ita",
+    "ja": "jpn", "ko": "kor", "ms": "msa", "nl": "nld", "pt": "por",
+    "ru": "rus", "tr": "tur", "ur": "urd", "zh": "chi_sim",
+}
+DEFAULT_TESSERACT_LANG = "eng"
+
+
+@functools.lru_cache(maxsize=1)
+def installed_languages() -> frozenset[str]:
+    """The models this image actually carries.
+
+    Asked rather than assumed, because naming a model that is not installed
+    does not degrade — tesseract exits non-zero and the whole OCR stage fails.
+    An image built without `tesseract-ocr-ara` therefore keeps working exactly
+    as it did, one line quieter in the log.
+    """
+    try:
+        proc = subprocess.run(["tesseract", "--list-langs"],
+                              capture_output=True, text=True, timeout=30,
+                              check=False)
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+    # First line is a header ("List of available languages ...").
+    return frozenset(line.strip() for line in proc.stdout.splitlines()[1:]
+                     if line.strip())
+
+
+def tesseract_lang(*wanted: str) -> str:
+    """A `-l` argument covering `wanted`, restricted to what is installed.
+
+    Order is preserved (tesseract weights the first language) and duplicates
+    collapse, so `tesseract_lang("en", "ar")` is `"eng+ara"` on the engine
+    image and `"eng"` on a box that only has English.
+    """
+    available = installed_languages()
+    codes: list[str] = []
+    missing: list[str] = []
+    for name in wanted:
+        if not name:
+            continue
+        code = ISO1_TO_TESSERACT.get(name.split("-")[0].lower(), name.lower())
+        if code in codes:
+            continue
+        if available and code not in available:
+            missing.append(code)
+            continue
+        codes.append(code)
+    if missing:
+        logger.warning("tesseract model(s) %s are not installed; OCR will run "
+                       "as %s", "+".join(missing), "+".join(codes) or
+                       DEFAULT_TESSERACT_LANG)
+    return "+".join(codes) or DEFAULT_TESSERACT_LANG
 
 
 class Word:
@@ -631,18 +709,34 @@ def build_page_ops(lines, page_h_pt, px_per_pt, font, visible=False):
     return "\n".join(ops)
 
 
+def _take_option(args, flag, default=None):
+    if flag not in args:
+        return default
+    i = args.index(flag)
+    value = args[i + 1]
+    del args[i:i + 2]
+    return value
+
+
+def parse_page_list(value):
+    """`--keep-pages 0,3,4` -> {0, 3, 4}. Empty or absent -> empty set."""
+    if not value:
+        return set()
+    return {int(part) for part in value.split(",") if part.strip()}
+
+
 def main():
     args = sys.argv[1:]
-    dbg_path = None
-    if "--debug" in args:
-        i = args.index("--debug")
-        dbg_path = args[i + 1]
-        del args[i:i + 2]
-    dpi = DPI
-    if "--dpi" in args:
-        i = args.index("--dpi")
-        dpi = int(args[i + 1])
-        del args[i:i + 2]
+    dbg_path = _take_option(args, "--debug")
+    dpi = int(_take_option(args, "--dpi", DPI))
+    # Which language(s) tesseract reads. The caller passes the job's own
+    # languages; an unknown or uninstalled one degrades to English rather
+    # than failing the stage.
+    lang = _take_option(args, "--lang") or DEFAULT_TESSERACT_LANG
+    # Pages that already carry a good text layer, 0-based. They keep it: this
+    # pass strips and rewrites the text of every page it touches, so running
+    # it over a page that was never scanned destroys perfectly good text.
+    keep = parse_page_list(_take_option(args, "--keep-pages"))
     src, dst = args
     px_per_pt = dpi / 72.0
 
@@ -652,11 +746,13 @@ def main():
 
     with tempfile.TemporaryDirectory() as td:
         for pno, page in enumerate(doc):
+            if pno in keep:
+                continue
             pix = page.get_pixmap(dpi=dpi)
             img = f"{td}/p{pno}.png"
             pix.save(img)
             subprocess.run(
-                ["tesseract", img, f"{td}/p{pno}", "-l", "eng", "hocr"],
+                ["tesseract", img, f"{td}/p{pno}", "-l", lang, "hocr"],
                 check=True, capture_output=True,
             )
             lines = parse_hocr(f"{td}/p{pno}.hocr")
