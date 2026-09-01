@@ -8,6 +8,63 @@ SERVER_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 JOB_TTL_HOURS = float(os.environ.get("JOB_TTL_HOURS", "24"))
 
+
+def _positive(name: str, default: str, cast):
+    """An env knob that is refused rather than obeyed when it is nonsense.
+
+    A capacity limit read as 0 (or as "two") would not be a cautious engine,
+    it would be one that never runs anything — the sort of typo that is only
+    ever discovered in production, in the dark.
+    """
+    raw = os.environ.get(name, default).strip()
+    try:
+        value = cast(raw)
+    except (TypeError, ValueError):
+        value = cast(default)
+    return value if value > 0 else cast(default)
+
+
+# How many HEAVY document operations may be in flight at once — translation
+# jobs and the stateless builders together, in ONE global pool. See
+# server/capacity.py for the measurements; the short version is that the engine
+# runs under a 3 GiB cgroup, a single translation job costs up to 1.5 GB of
+# peak RSS and a 73-page overlay 0.6 GB, so the arithmetic for the default is
+#
+#     620 MB floor + 1482 MB (worst job) + 593 MB (worst overlay) = 2695 MB
+#
+# which fits, and a third concurrent operation does not. Raise it only
+# alongside the cgroup limit, and only with a measurement.
+MAX_CONCURRENT_HEAVY = _positive("ENGINE_MAX_CONCURRENT", "2", int)
+
+# How long a stateless rebuild waits for a slot before it is told the engine is
+# busy (503 + Retry-After) instead of being left hanging.
+#
+# Sized against the CALLER's patience, not ours. Waiting past the client's own
+# timeout buys nothing: the client has already given up, and the slot is then
+# spent building a document nobody will read. catodemy's real budgets, READ
+# from app/Services/DocTranslate/DocTranslateClient.php rather than assumed:
+#
+#     POST /v1/compose        60 s     POST /v1/overlay       120 s
+#     POST /v1/strip-vocab    60 s     POST /v1/notes-space   120 s
+#     POST /v1/convert       360 s (240 s interactive; nginx cuts it at 300 s)
+#
+# and NONE of those POSTs is retried — the file parts are streamed, so a
+# client-side retry would re-send empty ones. So the tightest real budget is
+# 60 s, out of which the build itself needs its share: 40 s of queueing leaves
+# room for the ~4 s compose and the ~30 s overlay that follow it, and gets the
+# 503 to the caller BEFORE its own transport timeout, which is the difference
+# between "the engine is busy, try again" and a bare read error.
+#
+# Two things are deliberately NOT subject to this:
+#   * translation JOBS — durable on disk, polled rather than held open, so
+#     they wait as long as it takes (server/capacity.py);
+#   * /healthz and the job-status GETs — they never enter the gate at all.
+#     catodemy retries a status poll exactly once, 200 ms later, and then
+#     abandons a translation that is still running, so a status poll that
+#     queued behind an overlay would throw away paid work.
+ADMISSION_WAIT_SECONDS = _positive("ENGINE_ADMISSION_WAIT_SECONDS", "40",
+                                   float)
+
 # The shared Gotenberg service — the office suite /v1/convert renders through.
 #
 # Infra, so it is env: on prod the engine's container sits on the same docker

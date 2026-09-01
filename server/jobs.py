@@ -10,6 +10,7 @@ import time
 import uuid
 from pathlib import Path
 
+from server import capacity
 from server import config
 
 logger = logging.getLogger("doctranslate.jobs")
@@ -133,16 +134,23 @@ def _worker_loop() -> None:
         job = read_job(job_id)
         if job is None or job["status"] != "queued":
             continue
-        _CURRENT_JOB_ID = job_id
-        try:
-            update_job(job_id, status="running",
-                       progress={"percent": 0.0, "stage": "starting"})
-            pipeline.run_job(job_id)
-        except Exception as exc:  # noqa: BLE001 - job isolation boundary
-            logger.exception("job %s failed", job_id)
-            update_job(job_id, status="failed", error=str(exc)[:2000])
-        finally:
-            _CURRENT_JOB_ID = None
+        # The worker has always been sequential, so this gate is not about
+        # translations racing each OTHER — it is about a translation racing the
+        # stateless builders, which until now nothing counted at all. The job
+        # stays "queued" while it waits, because that is what it is: the
+        # caller polling /v1/jobs/{id} is told the truth rather than watching a
+        # "running" job sit at 0% (server/capacity.py).
+        with capacity.slot_sync(f"job {job_id}"):
+            _CURRENT_JOB_ID = job_id
+            try:
+                update_job(job_id, status="running",
+                           progress={"percent": 0.0, "stage": "starting"})
+                pipeline.run_job(job_id)
+            except Exception as exc:  # noqa: BLE001 - job isolation boundary
+                logger.exception("job %s failed", job_id)
+                update_job(job_id, status="failed", error=str(exc)[:2000])
+            finally:
+                _CURRENT_JOB_ID = None
 
 
 def start_worker() -> None:

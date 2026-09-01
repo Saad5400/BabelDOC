@@ -24,6 +24,7 @@ from fastapi.responses import FileResponse
 from fastapi.responses import JSONResponse
 from fastapi.responses import Response
 
+from server import capacity
 from server import compose
 from server import config
 from server import convert
@@ -390,6 +391,21 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="doctranslate engine", lifespan=lifespan)
 
 
+@app.exception_handler(capacity.BusyError)
+async def _engine_busy(_request, exc: capacity.BusyError):
+    """A caller that waited out the admission queue gets a 503, not a hang.
+
+    One handler rather than a `try` in each of the five, because there is one
+    right answer and it must not drift between endpoints. 503 with
+    `Retry-After` is the honest status: the request was fine, the ENGINE was
+    not free, and coming back later will work — which is exactly what a 422
+    ("your document is unacceptable") would have lied about, and what a
+    silent hang would have left the caller to discover by timing out.
+    """
+    return JSONResponse(status_code=503, content={"detail": str(exc)},
+                        headers={"Retry-After": str(exc.retry_after)})
+
+
 def require_token(x_internal_token: str | None = Header(default=None)) -> None:
     if not config.DOCTRANSLATE_TOKEN:
         raise HTTPException(status_code=503,
@@ -430,9 +446,16 @@ async def healthz():
         "gotenberg": await convert.service_status(),
     }
     ok = all(v != "missing" for v in versions.values())
+    # What the admission gate is doing, read without entering it. A busy
+    # engine and a broken one look identical from outside, and they are not
+    # the same thing at all: this endpoint is what decides whether the
+    # container gets restarted, and restarting a busy engine kills the paid
+    # translation it was busy WITH. `status` therefore stays "ok" while the
+    # queue is deep — the depth is reported, not acted on.
     return JSONResponse(status_code=200 if ok else 503,
                         content={"status": "ok" if ok else "degraded",
-                                 "versions": versions})
+                                 "versions": versions,
+                                 "capacity": capacity.stats()})
 
 
 @app.post("/v1/jobs", status_code=202, dependencies=[Depends(require_token)])
@@ -499,41 +522,54 @@ async def compose_dual(
     `vocab=0` opts this download out of the vocab layer: the baked-in vocab
     still comes back out (that is undoing what the input carries, not adding
     a feature), but no fresh strips go in.
+
+    The admission slot is taken BEFORE the uploads are read, and every one of
+    the five heavy handlers does the same. Reading them is itself an
+    allocation — two whole PDFs and a sidecar, up to MAX_UPLOAD_BYTES each —
+    so a request admitted only at the build would already be holding the
+    memory the gate exists to bound, and a hundred queued requests would hold
+    a hundred copies. What comes FIRST is the validation that needs no body at
+    all: a `format` this endpoint does not build is a typo, and a typo should
+    not wait in a queue to be told so.
     """
     want_vocab = _parse_flag(vocab, "vocab")
     if format not in compose.COMPOSE_FORMATS:
         raise HTTPException(status_code=422,
                             detail=f"format must be one of {compose.COMPOSE_FORMATS}")
-    parts = {"original": await original.read(),
-             "translated": await translated.read()}
-    for name, pdf_bytes in parts.items():
-        if len(pdf_bytes) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail=f"{name} too large")
-        if not pdf_bytes.startswith(b"%PDF-"):
-            raise HTTPException(status_code=422, detail=f"{name} is not a PDF")
-        # compose reached 422 for a locked PDF only because pymupdf happened
-        # to throw later, with "File has not been decrypted" — true, and no
-        # use to a reader deciding what to do about it. Opened here for the
-        # same reason and in the same words as everywhere else.
-        _open_pdf(pdf_bytes, name).close()
 
-    sidecar_data = None
-    if sidecar is not None:
-        sidecar_bytes = await sidecar.read()
-        if len(sidecar_bytes) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="sidecar too large")
-        sidecar_data = _parse_sidecar(sidecar_bytes)
+    async with capacity.slot("compose"):
+        parts = {"original": await original.read(),
+                 "translated": await translated.read()}
+        for name, pdf_bytes in parts.items():
+            if len(pdf_bytes) > MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail=f"{name} too large")
+            if not pdf_bytes.startswith(b"%PDF-"):
+                raise HTTPException(status_code=422,
+                                    detail=f"{name} is not a PDF")
+            # compose reached 422 for a locked PDF only because pymupdf
+            # happened to throw later, with "File has not been decrypted" —
+            # true, and no use to a reader deciding what to do about it.
+            # Opened here for the same reason and in the same words as
+            # everywhere else.
+            _open_pdf(pdf_bytes, name).close()
 
-    try:
-        result = await _blocking(compose.compose_dual,
-                                 parts["original"], parts["translated"],
-                                 format, sidecar=sidecar_data,
-                                 vocab=want_vocab)
-    except compose.ComposeError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        sidecar_data = None
+        if sidecar is not None:
+            sidecar_bytes = await sidecar.read()
+            if len(sidecar_bytes) > MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="sidecar too large")
+            sidecar_data = _parse_sidecar(sidecar_bytes)
 
-    return Response(content=result, media_type="application/pdf",
-                    headers=_pdf_attachment(original.filename, format))
+        try:
+            result = await _blocking(compose.compose_dual,
+                                     parts["original"], parts["translated"],
+                                     format, sidecar=sidecar_data,
+                                     vocab=want_vocab)
+        except compose.ComposeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        return Response(content=result, media_type="application/pdf",
+                        headers=_pdf_attachment(original.filename, format))
 
 
 @app.post("/v1/overlay", dependencies=[Depends(require_token)])
@@ -571,62 +607,65 @@ async def overlay(
             status_code=422,
             detail=f"style must be one of {interlinear.OVERLAY_STYLES}")
 
-    original_bytes = await original.read()
-    sidecar_bytes = await sidecar.read()
+    async with capacity.slot(f"overlay {style}"):
+        original_bytes = await original.read()
+        sidecar_bytes = await sidecar.read()
 
-    for name, data in (("original", original_bytes), ("sidecar", sidecar_bytes)):
-        if len(data) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail=f"{name} too large")
+        for name, data in (("original", original_bytes),
+                           ("sidecar", sidecar_bytes)):
+            if len(data) > MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail=f"{name} too large")
 
-    if not original_bytes.startswith(b"%PDF-"):
-        raise HTTPException(status_code=422, detail="original is not a PDF")
+        if not original_bytes.startswith(b"%PDF-"):
+            raise HTTPException(status_code=422, detail="original is not a PDF")
 
-    parsed = _parse_sidecar(sidecar_bytes)
+        parsed = _parse_sidecar(sidecar_bytes)
 
-    # Opened HERE, once, rather than inside whichever style was asked for:
-    # the two styles open it independently and only one of them guarded the
-    # call, so the same unopenable upload was a clean 422 through
-    # interlinear_compact and a 500 through interlinear. Refusing it at the
-    # door also gives the identity check below the page sizes it needs.
-    source = _open_pdf(original_bytes, "original")
-    try:
-        _require_sidecar_matches_original(parsed, source)
-    finally:
-        source.close()
+        # Opened HERE, once, rather than inside whichever style was asked for:
+        # the two styles open it independently and only one of them guarded the
+        # call, so the same unopenable upload was a clean 422 through
+        # interlinear_compact and a 500 through interlinear. Refusing it at the
+        # door also gives the identity check below the page sizes it needs.
+        source = _open_pdf(original_bytes, "original")
+        try:
+            _require_sidecar_matches_original(parsed, source)
+        finally:
+            source.close()
 
-    try:
-        options = dataclasses.replace(
-            interlinear.OverlayOptions.defaults(style),
-            **{key: value for key, value in
-               (("scale", scale), ("min_font_size", min_font_size),
-                ("max_font_size", max_font_size), ("gap", gap),
-                ("color", color), ("align", align),
-                ("plate_color", plate_color),
-                ("plate_opacity", plate_opacity),
-                ("plate_padding", plate_padding))
-               if value is not None})
-        result, report = await _blocking(interlinear.render_overlay,
-                                         original_bytes, parsed, style=style,
-                                         options=options, vocab=want_vocab)
-    except interlinear.OverlayError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            options = dataclasses.replace(
+                interlinear.OverlayOptions.defaults(style),
+                **{key: value for key, value in
+                   (("scale", scale), ("min_font_size", min_font_size),
+                    ("max_font_size", max_font_size), ("gap", gap),
+                    ("color", color), ("align", align),
+                    ("plate_color", plate_color),
+                    ("plate_opacity", plate_opacity),
+                    ("plate_padding", plate_padding))
+                   if value is not None})
+            result, report = await _blocking(interlinear.render_overlay,
+                                             original_bytes, parsed,
+                                             style=style, options=options,
+                                             vocab=want_vocab)
+        except interlinear.OverlayError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    return Response(
-        content=result, media_type="application/pdf",
-        headers={
-            **_pdf_attachment(original.filename, style),
-            # The fit is not all-or-nothing: a caller that sees most of a
-            # document skipped knows the layout did not suit it, instead of
-            # shipping a near-empty overlay as a success.
-            "X-Overlay-Pages": str(report["pages"]),
-            "X-Overlay-Drawn": str(report["drawn"]),
-            "X-Overlay-Skipped": str(report["skipped"]),
-            # The raster lane's fit, on its own headers: a deck whose diagrams
-            # all came back unglossed should say so even when every ordinary
-            # paragraph fitted.
-            "X-Overlay-Raster-Drawn": str(report["raster_drawn"]),
-            "X-Overlay-Raster-Skipped": str(report["raster_skipped"]),
-        })
+        return Response(
+            content=result, media_type="application/pdf",
+            headers={
+                **_pdf_attachment(original.filename, style),
+                # The fit is not all-or-nothing: a caller that sees most of a
+                # document skipped knows the layout did not suit it, instead of
+                # shipping a near-empty overlay as a success.
+                "X-Overlay-Pages": str(report["pages"]),
+                "X-Overlay-Drawn": str(report["drawn"]),
+                "X-Overlay-Skipped": str(report["skipped"]),
+                # The raster lane's fit, on its own headers: a deck whose
+                # diagrams all came back unglossed should say so even when
+                # every ordinary paragraph fitted.
+                "X-Overlay-Raster-Drawn": str(report["raster_drawn"]),
+                "X-Overlay-Raster-Skipped": str(report["raster_skipped"]),
+            })
 
 
 @app.post("/v1/convert", dependencies=[Depends(require_token)])
@@ -651,25 +690,31 @@ async def convert_to_pdf(file: UploadFile = File(...)):
             detail=f"cannot convert this file type; supported: "
                    f"{', '.join(convert.CONVERTIBLE_EXTENSIONS)}")
 
-    data = await file.read()
+    # Gated like the rest even though the render itself happens on another
+    # host: this handler still holds the whole office file AND the whole PDF
+    # that comes back in memory, and Gotenberg is one shared service — an
+    # unbounded fan-out of conversions is its outage rather than ours, which
+    # is not an improvement.
+    async with capacity.slot("convert"):
+        data = await file.read()
 
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="file too large")
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="file too large")
 
-    try:
-        pdf_bytes = await convert.office_to_pdf(data, filename)
-    # Order matters: the unavailable case is a ConvertError too, and it is the
-    # one that must NOT come back as 422. A 422 tells the caller the document
-    # is unacceptable — re-export it and try again — which is a lie when the
-    # conversion service was merely busy or down, and it is a lie the user
-    # reads as "my file is broken".
-    except convert.ConvertUnavailableError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except convert.ConvertError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            pdf_bytes = await convert.office_to_pdf(data, filename)
+        # Order matters: the unavailable case is a ConvertError too, and it is
+        # the one that must NOT come back as 422. A 422 tells the caller the
+        # document is unacceptable — re-export it and try again — which is a
+        # lie when the conversion service was merely busy or down, and it is a
+        # lie the user reads as "my file is broken".
+        except convert.ConvertUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except convert.ConvertError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    return Response(content=pdf_bytes, media_type="application/pdf",
-                    headers=_pdf_attachment(filename))
+        return Response(content=pdf_bytes, media_type="application/pdf",
+                        headers=_pdf_attachment(filename))
 
 
 @app.post("/v1/strip-vocab", dependencies=[Depends(require_token)])
@@ -687,33 +732,35 @@ async def strip_vocab(
     layout means a pre-vocab mono: nothing to strip, the bytes come back
     unchanged.
     """
-    translated_bytes = await translated.read()
-    sidecar_bytes = await sidecar.read()
+    async with capacity.slot("strip-vocab"):
+        translated_bytes = await translated.read()
+        sidecar_bytes = await sidecar.read()
 
-    for name, data in (("translated", translated_bytes),
-                       ("sidecar", sidecar_bytes)):
-        if len(data) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail=f"{name} too large")
+        for name, data in (("translated", translated_bytes),
+                           ("sidecar", sidecar_bytes)):
+            if len(data) > MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail=f"{name} too large")
 
-    if not translated_bytes.startswith(b"%PDF-"):
-        raise HTTPException(status_code=422, detail="translated is not a PDF")
+        if not translated_bytes.startswith(b"%PDF-"):
+            raise HTTPException(status_code=422,
+                                detail="translated is not a PDF")
 
-    sidecar_data = _parse_sidecar(sidecar_bytes)
+        sidecar_data = _parse_sidecar(sidecar_bytes)
 
-    mono = _open_pdf(translated_bytes, "translated")
-    try:
-        _require_sidecar_matches_mono(sidecar_data, mono)
-    finally:
-        mono.close()
+        mono = _open_pdf(translated_bytes, "translated")
+        try:
+            _require_sidecar_matches_mono(sidecar_data, mono)
+        finally:
+            mono.close()
 
-    try:
-        result = await _blocking(compose.strip_vocab,
-                                 translated_bytes, sidecar_data)
-    except compose.ComposeError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            result = await _blocking(compose.strip_vocab,
+                                     translated_bytes, sidecar_data)
+        except compose.ComposeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    return Response(content=result, media_type="application/pdf",
-                    headers=_pdf_attachment(translated.filename))
+        return Response(content=result, media_type="application/pdf",
+                        headers=_pdf_attachment(translated.filename))
 
 
 @app.post("/v1/notes-space", dependencies=[Depends(require_token)])
@@ -732,22 +779,30 @@ async def add_notes_space(
     already is: a mono with baked strips, a dual, an overlay. Rotated pages
     are left untouched.
     """
-    data = await file.read()
-
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="file too large")
-
-    if not data.startswith(b"%PDF-"):
-        raise HTTPException(status_code=422, detail="file is not a PDF")
-
+    # `sides` is parsed before the slot is taken: a request that names no
+    # valid side is refused on the spot rather than queueing to be told so.
     try:
-        result = await _blocking(notes_space.add_notes_space, data,
-                                 notes_space.parse_sides(sides), size=size)
+        parsed_sides = notes_space.parse_sides(sides)
     except notes_space.NotesSpaceError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    return Response(content=result, media_type="application/pdf",
-                    headers=_pdf_attachment(file.filename, "notes"))
+    async with capacity.slot("notes-space"):
+        data = await file.read()
+
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="file too large")
+
+        if not data.startswith(b"%PDF-"):
+            raise HTTPException(status_code=422, detail="file is not a PDF")
+
+        try:
+            result = await _blocking(notes_space.add_notes_space, data,
+                                     parsed_sides, size=size)
+        except notes_space.NotesSpaceError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        return Response(content=result, media_type="application/pdf",
+                        headers=_pdf_attachment(file.filename, "notes"))
 
 
 def _get_job_or_404(job_id: str) -> dict:
