@@ -25,15 +25,26 @@ def _positive(name: str, default: str, cast):
 
 
 # How many HEAVY document operations may be in flight at once — translation
-# jobs and the stateless builders together, in ONE global pool. See
-# server/capacity.py for the measurements; the short version is that the engine
-# runs under a 3 GiB cgroup, a single translation job costs up to 1.5 GB of
-# peak RSS and a 73-page overlay 0.6 GB, so the arithmetic for the default is
+# jobs and the stateless builders together, in ONE global pool.
 #
-#     620 MB floor + 1482 MB (worst job) + 593 MB (worst overlay) = 2695 MB
+# A flat count, not a weight per document. The costs are certainly not equal —
+# a 73-page overlay is +593 MB and a notes-space +24 MB (server/capacity.py) —
+# but weighting means predicting a document's cost BEFORE doing the work, and
+# the measurements say page count does not predict it: the dearest thing in the
+# corpus is a SEVENTEEN-page scan, at +1884 MB, because what costs is raster
+# payload. A weight that guesses low is the OOM again, and one that guesses
+# high is this number with extra steps.
 #
-# which fits, and a third concurrent operation does not. Raise it only
-# alongside the cgroup limit, and only with a measurement.
+# 2 is what the cap affords. MEASURED end to end, worst lane, with the gate:
+#
+#     that 17-page scan + four concurrent rebuilds   2587 MB peak
+#     a 73-page job + six concurrent rebuilds        2275 MB peak
+#     every corpus document, every layout, 2 at once 1587 MB peak
+#
+# against the 3072 MB the kernel enforces — 485 MB of headroom in the worst
+# case. Three would not fit: the same worst case gains another rebuild's
+# 593 MB and lands on 3180 MB. Raise it only alongside the cgroup limit, and
+# only with a measurement of your own.
 MAX_CONCURRENT_HEAVY = _positive("ENGINE_MAX_CONCURRENT", "2", int)
 
 # How long a stateless rebuild waits for a slot before it is told the engine is

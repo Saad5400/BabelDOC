@@ -15,13 +15,21 @@ MEASURED on this branch, against the 14-document production corpus, as peak
 RSS of the uvicorn process (`/proc/<pid>/status` VmRSS, sampled at 4 Hz):
 
     resident floor, model loaded, nothing running        620 MB
-    one 73-page translation job, on its own            +1088 MB
+    one 17-page SCANNED job, through the OCR lane      +1884 MB
     one 41-page translation job, on its own            +1482 MB
+    one 73-page translation job, on its own            +1088 MB
     one 73-page interlinear overlay                     +593 MB
-    one 39-page side-by-side compose                     +82 MB
     one 25-page alternating compose                     +169 MB
-    one 73-page strip-vocab                              +20 MB
+    one 39-page side-by-side compose                     +82 MB
     one 41-page notes-space, four sides, lg              +24 MB
+    one 73-page strip-vocab                              +20 MB
+
+The scanned document is the expensive one, and by a margin — page count is not
+the cost, raster payload is. It also has a second peak nothing else has: while
+`ocrmypdf --force-ocr` runs it forks 17 workers, and the process TREE reaches
+1692 MB while uvicorn itself is still at 625 MB. Those workers are in the same
+cgroup, so they spend the same 3 GiB. It happens early, before babeldoc's own
+peak, which is the only reason the two do not add up.
 
 Nothing bounded the second column. The job worker has always been sequential —
 one translation at a time — but the five stateless builders were not bounded at
