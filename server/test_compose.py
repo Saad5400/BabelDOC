@@ -55,6 +55,24 @@ def _text_pdf(marker: str, size: tuple[float, float]) -> bytes:
     return bytes(out)
 
 
+@pytest.fixture(autouse=True)
+def arabic_text_layer_repair(monkeypatch):
+    """`page_fonts.repair_arabic_text_layer` while its branch is unmerged.
+
+    compose calls it on every finished dual (the fresh vocab strips are
+    drawn here, so their broken text layer is this module's to repair). The
+    function itself belongs to server/page_fonts.py and lands with the
+    engine-text fix; until then a no-op stands in, so these tests exercise
+    the composition rather than the absence of a dependency. Once it is
+    there, this fixture does nothing and the real one runs.
+    """
+    from server import page_fonts
+
+    if not hasattr(page_fonts, "repair_arabic_text_layer"):
+        monkeypatch.setattr(page_fonts, "repair_arabic_text_layer",
+                            lambda doc: 0, raising=False)
+
+
 @pytest.fixture(scope="module")
 def original_pdf() -> bytes:
     return _pdf([LETTER] * 3)
@@ -126,12 +144,27 @@ def test_alternating_keeps_page_order_of_text(client):
     assert "TRANSMARK" in pages[1].extract_text()
 
 
-def test_a_longer_translated_appends_its_tail_instead_of_pairing_blanks(
+def test_an_unexplained_longer_translated_is_refused(client, original_pdf,
+                                                     translated_pdf):
+    # Swap the inputs: original (2 pages) shorter than translated (3 pages),
+    # with nothing saying why. The extra page could be an appended tail — or
+    # a «كلمات هذه الصفحة» page the mono run had to INSERT between content
+    # pages, in which case pairing positionally mis-pairs every unit after
+    # it. Unknowable here, so it is refused rather than guessed.
+    for fmt in ("alternating", "side_by_side"):
+        resp = _post(client, translated_pdf, original_pdf, fmt)
+        assert resp.status_code == 422
+        assert "artifact_layout" in resp.json()["detail"]
+
+
+def test_a_longer_translated_appends_its_tail_when_the_layout_explains_it(
         client, original_pdf, translated_pdf):
-    # Swap the inputs: original (2 pages) shorter than translated (3 pages).
-    # A mono result may end with appended appendix pages of its own, so the
-    # tail is kept whole at the end rather than interleaved against blanks.
-    resp = _post(client, translated_pdf, original_pdf, "alternating")
+    # The same shape, with the sidecar's layout saying all three pages are
+    # content: the extra one is then known to be a tail and is appended
+    # whole at the end rather than interleaved against a blank.
+    resp = _post_with_sidecar(
+        client, translated_pdf, original_pdf, "alternating",
+        _sidecar_json(3, artifact_layout={"content_pages": [0, 1, 2]}))
     assert resp.status_code == 200
     pages = _pages(resp)
     assert len(pages) == 5  # 2 pairs + 1 tail page
@@ -141,7 +174,9 @@ def test_a_longer_translated_appends_its_tail_instead_of_pairing_blanks(
 
 def test_side_by_side_appends_the_translated_tail_full_width(
         client, original_pdf, translated_pdf):
-    resp = _post(client, translated_pdf, original_pdf, "side_by_side")
+    resp = _post_with_sidecar(
+        client, translated_pdf, original_pdf, "side_by_side",
+        _sidecar_json(3, artifact_layout={"content_pages": [0, 1, 2]}))
     assert resp.status_code == 200
     pages = _pages(resp)
     assert len(pages) == 3  # 2 pairs + 1 tail page
