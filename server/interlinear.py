@@ -1394,11 +1394,14 @@ _MIN_COLUMN_SHARE = 0.05
 # broken into "P" and "artial". The image itself is a backdrop, so the
 # splitter could not see the thing it was cutting.
 #
-# So the two sides of a corridor have to actually EXIST at the same heights
-# before it is believed to be one. Deliberately low: a real two-column page
-# measures 40-60% here (the air between its own lines is counted against it),
-# and the coincidences measure under 2%.
-_MIN_COLUMN_COEXIST = 0.15
+# A corridor has to have a real column on each side of it. Two tests, because
+# either alone lets that page through: each side must be enough of the
+# region's height to BE a column (run8 p10's sides are 4.0% and 1.6% of it —
+# one text line each), and the two must actually run beside each other rather
+# than sit at opposite corners. The second is measured against the shorter
+# side, so a screenshot beside a short bullet list still reads as two columns.
+_MIN_COLUMN_EXTENT = 0.10
+_MIN_COLUMN_COEXIST = 0.30
 _MAX_REGION_DEPTH = 4
 
 # A single band may not open wider than this share of the original page. Only
@@ -1743,21 +1746,33 @@ def _substantial(runs: list[tuple[float, float]],
     return kept
 
 
-def _coexist(edge: float, marks: list[pymupdf.Rect],
-             rect: pymupdf.Rect) -> float:
-    """How much of `rect`'s height has marks on BOTH sides of `edge`.
+def _side_extent(marks: list[pymupdf.Rect]) -> float:
+    """How much height these marks cover between them, gaps not counted."""
+    return sum(high - low for low, high
+               in _merge_spans([(mark.y0, mark.y1) for mark in marks], 0.0))
 
-    The evidence a candidate corridor is a corridor: two flows running beside
-    each other, rather than two things that happen to sit at opposite corners
-    of the page. See {@link _MIN_COLUMN_COEXIST}.
+
+def _is_corridor(edge: float, marks: list[pymupdf.Rect],
+                 rect: pymupdf.Rect) -> bool:
+    """Is there a real column on each side of `edge`?
+
+    The evidence a candidate corridor is a corridor: two flows with enough to
+    them to be flows, running BESIDE each other rather than sitting at
+    opposite corners of the page. See {@link _MIN_COLUMN_EXTENT}.
     """
-    left = _merge_spans([(mark.y0, mark.y1) for mark in marks
-                         if mark.x1 <= edge], 0.0)
-    right = _merge_spans([(mark.y0, mark.y1) for mark in marks
-                          if mark.x0 >= edge], 0.0)
+    left = [mark for mark in marks if mark.x1 <= edge]
+    right = [mark for mark in marks if mark.x0 >= edge]
+    extents = (_side_extent(left), _side_extent(right))
 
-    return sum(max(0.0, min(low, high) - max(start, top))
-               for start, low in left for top, high in right)
+    if min(extents) < _MIN_COLUMN_EXTENT * rect.height:
+        return False
+
+    shared = sum(
+        max(0.0, min(low, high) - max(start, top))
+        for start, low in _merge_spans([(mark.y0, mark.y1) for mark in left], 0.0)
+        for top, high in _merge_spans([(mark.y0, mark.y1) for mark in right], 0.0))
+
+    return shared >= _MIN_COLUMN_COEXIST * min(extents)
 
 
 def _split_region(rect: pymupdf.Rect, blockers: list[pymupdf.Rect], depth: int,
@@ -1777,8 +1792,7 @@ def _split_region(rect: pymupdf.Rect, blockers: list[pymupdf.Rect], depth: int,
                 _merge_spans([(mark.x0, mark.x1) for mark in inside], _COL_GAP),
                 inside)
             edges = [edge for edge in _cut_lines(runs, rect.x0, rect.x1)
-                     if _coexist(edge, inside, rect)
-                     >= _MIN_COLUMN_COEXIST * rect.height]
+                     if _is_corridor(edge, inside, rect)]
 
             if edges:
                 bounds = [rect.x0, *edges, rect.x1]

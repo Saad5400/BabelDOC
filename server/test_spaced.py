@@ -665,30 +665,27 @@ def test_a_rotated_label_does_not_blow_the_page_open():
 
 
 def test_a_caption_and_a_footnote_at_opposite_corners_are_not_a_column():
-    """run8 p10: one full-page diagram, split in half and torn.
-
-    The page is a single figure with a caption across the top
-    (x 58.9-363.9) and a copyright line at the bottom right
-    (x 371.8-470.7). The two never coexist vertically, but between them they
-    leave a clear x range — so the page was read as two columns and split at
-    x = 367.8. The two leaves then grew by different amounts and the diagram
-    that spans both was sliced: its outline two mismatched halves 30 pt apart,
-    the word "Partial" broken into "P" and "artial". The figure is a backdrop,
-    so the splitter could not see the thing it was cutting.
-    """
+    """run8 p10's imagined corridor, at the test that refuses it."""
     rect = pymupdf.Rect(0, 0, 842, 595)
     caption = pymupdf.Rect(59, 30, 364, 44)
     footnote = pymupdf.Rect(372, 560, 471, 572)
 
-    # Opposite corners: no height at all has marks on both sides.
-    assert interlinear._coexist(368.0, [caption, footnote], rect) < 1.0
+    assert not interlinear._is_corridor(368.0, [caption, footnote], rect)
 
-    # Two real columns running beside each other: most of the height does.
-    left = pymupdf.Rect(59, 60, 364, 540)
-    right = pymupdf.Rect(400, 60, 780, 540)
+    # Two real columns running beside each other still are one.
+    assert interlinear._is_corridor(
+        382.0, [pymupdf.Rect(59, 60, 364, 540),
+                pymupdf.Rect(400, 60, 780, 540)], rect)
 
-    assert (interlinear._coexist(382.0, [left, right], rect)
-            > interlinear._MIN_COLUMN_COEXIST * rect.height)
+    # And so is a tall screenshot beside a short bullet list, which is where
+    # a share-of-the-page-height test goes wrong: neither side fills the page,
+    # but they overlap each other for most of the shorter one.
+    bullets = [pymupdf.Rect(60, 100 + index * 24, 253, 120 + index * 24)
+               for index in range(6)]
+
+    assert interlinear._is_corridor(
+        306.0, [*bullets, pymupdf.Rect(360, 80, 520, 500)],
+        pymupdf.Rect(0, 0, 595, 842))
 
 
 def test_the_splitter_refuses_the_imagined_corridor():
