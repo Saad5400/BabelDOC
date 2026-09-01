@@ -29,6 +29,27 @@ from babeldoc.format.pdf.translation_config import WatermarkOutputMode
 
 logger = logging.getLogger(__name__)
 
+# --- Legibility floor -------------------------------------------------
+# Shrink-to-fit used to bottom out at scale 0.1, with no floor on the
+# RESULTING point size, so a 12.7 pt source line could legally be delivered
+# at 1.27 pt. Measured over the 14 real production source documents in the
+# sweep corpus (13,177 text spans): the smallest size any author actually
+# used is 4.56 pt, only 0.4 % of spans are under 5 pt and 1.0 % under
+# 5.5 pt. Anything below that is not "small print", it is unreadable — and
+# it is never what the source looked like.
+#
+# So the search stops at whichever comes first:
+#   * MIN_LEGIBLE_FONT_SIZE_PT absolute, or
+#   * MIN_LEGIBLE_SCALE of the paragraph's own source size,
+# and a paragraph that still does not fit is laid out AT that floor and
+# allowed to overflow its box. Overflow is honest — a reader can see it and
+# read it; a 1.3 pt paragraph is silently lost.
+#
+# A source paragraph that is already at or below the floor is simply never
+# shrunk (its min_scale clamps to 1.0) rather than being scaled UP.
+MIN_LEGIBLE_FONT_SIZE_PT = 5.5
+MIN_LEGIBLE_SCALE = 0.45
+
 LINE_BREAK_REGEX = regex.compile(
     r"^["
     r"a-z"
@@ -1261,9 +1282,12 @@ class Typesetting:
         box = paragraph.box
         scale = initial_scale
         line_skip = 1.50 if self.is_cjk else 1.3
-        min_scale = 0.1
+        min_scale = self._legibility_min_scale(typesetting_units)
         expand_space_flag = 0
         final_typeset_units = None
+        # Smallest-scale layout seen that did NOT fit, kept so the paragraph
+        # can be drawn overflowing at the floor instead of vanishing.
+        overflow_candidate: tuple[float, list[TypesettingUnit]] | None = None
         rtl_align = self._rtl_ocr_paragraph_align(paragraph, page)
 
         while scale >= min_scale:
@@ -1282,28 +1306,24 @@ class Typesetting:
                 # 如果所有单元都放得下
                 if all_units_fit:
                     if apply_layout:
-                        # 实际应用排版结果
-                        paragraph.scale = scale
-                        paragraph.pdf_paragraph_composition = []
-                        for unit in typeset_units:
-                            chars, curves, forms = unit.render()
-                            for char in chars:
-                                paragraph.pdf_paragraph_composition.append(
-                                    PdfParagraphComposition(pdf_character=char),
-                                )
-                            for curve in curves:
-                                page.pdf_curve.append(curve)
-                            for form in forms:
-                                page.pdf_form.append(form)
+                        self._apply_typeset_units(paragraph, page, typeset_units, scale)
                         final_typeset_units = typeset_units
                     return scale, final_typeset_units
+                # Does not fit. Keep the tightest layout seen: if the search
+                # runs out of room above the legibility floor this is what
+                # gets drawn (overflowing) rather than nothing at all.
+                if overflow_candidate is None or scale <= overflow_candidate[0]:
+                    overflow_candidate = (scale, typeset_units)
             except Exception:
                 # 如果布局检查出错，继续尝试下一个缩放因子
                 pass
 
             # 添加与原 retypeset 一致的逻辑检查
             if not hasattr(paragraph, "debug_id") or not paragraph.debug_id:
-                return scale, final_typeset_units
+                return self._settle_at_floor(
+                    paragraph, page, overflow_candidate, min_scale,
+                    final_typeset_units, apply_layout,
+                )
 
             # 减小缩放因子
             if scale > 0.6:
@@ -1376,8 +1396,88 @@ class Typesetting:
                 apply_layout=apply_layout,
             )
 
-        # 最后返回最小缩放因子
-        return min_scale, final_typeset_units
+        # Nothing fits, even at the legibility floor and without the English
+        # line-break rules. Draw it at the floor and let it overflow.
+        return self._settle_at_floor(
+            paragraph, page, overflow_candidate, min_scale,
+            final_typeset_units, apply_layout,
+        )
+
+    def _legibility_min_scale(
+        self, typesetting_units: list["TypesettingUnit"]
+    ) -> float:
+        """Smallest scale this paragraph may be shrunk to.
+
+        Floors the RESULTING point size, not just the ratio: the source's own
+        dominant size decides how much of a shrink `MIN_LEGIBLE_FONT_SIZE_PT`
+        allows. Source text that is already at or below the floor is never
+        shrunk at all (and never enlarged — the clamp is one-sided).
+        """
+        font_sizes = [
+            size
+            for unit in typesetting_units
+            for size in (
+                unit.font_size,
+                unit.char.pdf_style.font_size
+                if unit.char is not None and unit.char.pdf_style is not None
+                else None,
+            )
+            if size
+        ]
+        if not font_sizes:
+            return MIN_LEGIBLE_SCALE
+        try:
+            base_size = statistics.mode(font_sizes)
+        except statistics.StatisticsError:
+            base_size = statistics.median(font_sizes)
+        if base_size <= 0:
+            return MIN_LEGIBLE_SCALE
+        return min(1.0, max(MIN_LEGIBLE_FONT_SIZE_PT / base_size, MIN_LEGIBLE_SCALE))
+
+    def _apply_typeset_units(
+        self,
+        paragraph: il_version_1.PdfParagraph,
+        page: il_version_1.Page,
+        typeset_units: list["TypesettingUnit"],
+        scale: float,
+    ) -> None:
+        """Write a finished layout onto the paragraph and page."""
+        paragraph.scale = scale
+        paragraph.pdf_paragraph_composition = []
+        for unit in typeset_units:
+            chars, curves, forms = unit.render()
+            for char in chars:
+                paragraph.pdf_paragraph_composition.append(
+                    PdfParagraphComposition(pdf_character=char),
+                )
+            for curve in curves:
+                page.pdf_curve.append(curve)
+            for form in forms:
+                page.pdf_form.append(form)
+
+    def _settle_at_floor(
+        self,
+        paragraph: il_version_1.PdfParagraph,
+        page: il_version_1.Page,
+        overflow_candidate: tuple[float, list["TypesettingUnit"]] | None,
+        min_scale: float,
+        final_typeset_units: list["TypesettingUnit"] | None,
+        apply_layout: bool,
+    ) -> tuple[float, list["TypesettingUnit"] | None]:
+        """Give up on fitting and draw the paragraph at the legibility floor.
+
+        The old code returned `min_scale` with nothing laid out, which — on the
+        apply pass — left `pdf_paragraph_composition` empty and dropped the
+        paragraph from the page entirely. Overflowing text the reader can see
+        and read beats text that is either invisible or 1.3 pt tall.
+        """
+        if overflow_candidate is None:
+            return min_scale, final_typeset_units
+        scale, typeset_units = overflow_candidate
+        if apply_layout:
+            self._apply_typeset_units(paragraph, page, typeset_units, scale)
+            final_typeset_units = typeset_units
+        return scale, final_typeset_units
 
     def _rtl_ocr_paragraph_align(
         self,

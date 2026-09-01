@@ -67,6 +67,39 @@ CODE_PARAGRAPH_PURE_MONO_RATIO = 0.95
 # contain no statement punctuation, and must still be translated.
 CODE_SYNTAX_CHARS = frozenset(";{}=")
 
+# A monospace face is a typographic choice, not a statement about content: a
+# deck whose heading font is NotoMono had 46 headings on 28 of its 83 pages
+# turned into formulas and delivered untranslated ("Exercise: Classify the
+# Scenario", "Sources of Threats", "Beyond the CIA Triad"), because the
+# >= CODE_PARAGRAPH_PURE_MONO_RATIO branch asked for no evidence of code at
+# all. So one line of plain words is prose whatever it is set in.
+#
+# Real code that has no ";{}=" ("public class Foo", "aload_0", "SET>java
+# Hello") is still caught: either it runs to more than one line, or some
+# token is not a plain word.
+CODE_PROSE_EDGE_PUNCT = ".,:!?\"'\u201c\u201d\u2018\u2019"
+CODE_PROSE_SYMBOLS = frozenset({"&", "-", "\u2013", "\u2014"})
+
+
+def looks_like_prose(text: str) -> bool:
+    """True when every token reads as an ordinary word.
+
+    Anything with an identifier, an operator, a path or a bare digit glued
+    into a word (`aload_0`, `System.out`, `SET>java`) is not prose.
+    """
+    words = 0
+    for token in text.split():
+        stripped = token.strip(CODE_PROSE_EDGE_PUNCT)
+        if not stripped or stripped in CODE_PROSE_SYMBOLS:
+            continue
+        if stripped.isalpha():
+            words += 1
+            continue
+        if stripped.isdigit():
+            continue
+        return False
+    return words > 0
+
 # Ignore tiny paragraphs (page numbers etc.) to avoid noise.
 CODE_PARAGRAPH_MIN_CHARS = 4
 
@@ -487,11 +520,13 @@ class StylesAndFormulas:
             all_chars = []
             total = 0
             mono = 0
+            line_count = 0
             has_code_syntax = False
             for composition in paragraph.pdf_paragraph_composition:
                 line = composition.pdf_line
                 if not line or not line.pdf_character:
                     continue
+                line_count += 1
                 for char in line.pdf_character:
                     all_chars.append(char)
                     if char.char_unicode is None or char.char_unicode.isspace():
@@ -511,6 +546,12 @@ class StylesAndFormulas:
             if ratio <= CODE_PARAGRAPH_MONO_RATIO:
                 continue
             if ratio < CODE_PARAGRAPH_PURE_MONO_RATIO and not has_code_syntax:
+                continue
+            # One line of plain words is a heading, not program output —
+            # however monospace the face it is set in.
+            if line_count < 2 and looks_like_prose(
+                "".join(c.char_unicode or "" for c in all_chars)
+            ):
                 continue
 
             code_paragraphs.append((paragraph, all_chars))
@@ -844,6 +885,14 @@ class StylesAndFormulas:
                 page, self.translation_config.formular_font_pattern
             )
         )
+        # babeldoc's default formula-font pattern matches `.*Mono`, so EVERY
+        # character of a monospace face is classified as formula and never
+        # translated. For real code that is the point; for a deck whose
+        # heading face happens to be NotoMono it silently drops a third of
+        # the document. Monospace-only font ids are therefore withdrawn from
+        # the formula signal on paragraphs that read as prose (see
+        # `looks_like_prose`); math faces are untouched.
+        page_code_font_ids, xobj_code_font_ids = build_code_font_ids(page)
 
         for paragraph in page.pdf_paragraph:
             if not paragraph.pdf_paragraph_composition:
@@ -859,6 +908,13 @@ class StylesAndFormulas:
                 ]
             else:
                 current_formula_font_ids = page_level_formula_font_ids
+
+            if paragraph.xobj_id is not None and paragraph.xobj_id in xobj_code_font_ids:
+                code_font_ids = xobj_code_font_ids[paragraph.xobj_id]
+            else:
+                code_font_ids = page_code_font_ids
+            if code_font_ids and self._is_monospace_prose(paragraph, code_font_ids):
+                current_formula_font_ids = current_formula_font_ids - code_font_ids
 
             new_paragraph_compositions = []
             # This flag is carried through all compositions in a paragraph, as in the original implementation.
@@ -887,6 +943,32 @@ class StylesAndFormulas:
                 new_paragraph_compositions.extend(grouped_compositions)
 
             paragraph.pdf_paragraph_composition = new_paragraph_compositions
+
+    def _is_monospace_prose(self, paragraph, code_font_ids: set) -> bool:
+        """One line of plain words set in a monospace face: a heading.
+
+        Only paragraphs whose formula-ness comes from the monospace font
+        rule qualify — a line that already carries formula characters, or
+        that runs to more than one line (a code block), is left alone.
+        """
+        lines = [
+            comp.pdf_line
+            for comp in paragraph.pdf_paragraph_composition
+            if comp.pdf_line and comp.pdf_line.pdf_character
+        ]
+        if len(lines) != 1:
+            return False
+        chars = lines[0].pdf_character
+        if not any(
+            char.pdf_style and char.pdf_style.font_id in code_font_ids
+            for char in chars
+        ):
+            return False
+        if any(char.formula_layout_id for char in chars):
+            return False
+        return looks_like_prose(
+            "".join(char.char_unicode or "" for char in chars)
+        )
 
     def process_translatable_formulas(self, page: Page):
         """将需要正常翻译的公式（如纯数字、数字加逗号等）转换为普通文本行"""
