@@ -499,6 +499,76 @@ def test_an_image_beside_the_text_is_not_sliced():
     assert (rows[-1] - rows[0]) * 72 / 36 == pytest.approx(240, abs=6.0)
 
 
+def test_a_paragraph_does_not_adopt_the_scenery_it_sits_on():
+    """`_ink_bounds` decides ownership by centre, which scenery can exploit.
+
+    A page-centred decorative ring, a full-height bracket, a tall arrow: any
+    of them whose middle happens to fall inside a paragraph's band was adopted
+    by that paragraph, and its anchor became most of the page. run22 p3 turned
+    an 18.6 pt paragraph into a 405.7 pt one — and the anchor is what the
+    reading order is sorted on.
+    """
+    box = pymupdf.Rect(60, 300, 300, 318)
+    line = pymupdf.Rect(60, 302, 300, 316)
+    ring = pymupdf.Rect(40, 100, 500, 520)
+
+    assert (ring.y0 + ring.y1) / 2 == pytest.approx((box.y0 + box.y1) / 2,
+                                                    abs=10)
+
+    grown = interlinear._ink_bounds(box, [line, ring], 18.0)
+
+    assert grown.height < 3 * box.height, f"the ring was adopted: {grown}"
+    # And the ascent correction this exists for still happens.
+    assert interlinear._ink_bounds(box, [pymupdf.Rect(60, 292, 300, 316)],
+                                   18.0).y0 == pytest.approx(292, abs=0.1)
+
+
+def test_a_deck_whose_decoration_is_forty_shapes_still_gets_line_glosses():
+    """One big backdrop is recognised; forty small ones were not.
+
+    run22's slides carry a concentric vignette drawn as ~40 curves. None is
+    big enough to be a backdrop on its own, every one of them is a blocker,
+    and between them they left the slide's main region 4.3 pt of free air in
+    476 pt — so no line could find clear air above it, every paragraph fell
+    through to "gloss above the whole region", and 415 of that document's 486
+    glosses landed piled at the top of the page, out of reading order.
+
+    A vignette is faint, which is the other half of why this is safe to
+    ignore: the page's own pixels still have the last word on the cut, and
+    they report a soft tone as the flat background it reads as.
+    """
+    builder = _Builder()
+
+    for step in range(30):
+        builder.page.draw_circle(pymupdf.Point(300, 300), 30 + step * 5,
+                                 color=(0.97, 0.97, 0.98), width=0.8)
+
+    lines = [builder.text(60, 150 + index * 40, f"Bullet {index} of the slide",
+                          16.0, gloss=AR_ONE)
+             for index in range(4)]
+
+    pdf, report = _render(builder)
+
+    assert report["drawn"] == 4
+    assert report["skipped"] == 0
+
+    arabic = _gloss_lines(pdf)
+    latin = sorted((rect for rect, _text in _latin(pdf)), key=lambda r: r.y0)
+
+    assert len(latin) == len(lines)
+
+    # Each gloss stands over its own line, in order — not all four stacked
+    # above the first.
+    ceiling = 0.0
+
+    for line in latin:
+        above = _gloss_above(line, arabic, ceiling)
+        assert above, f"nothing glosses {line}"
+        assert min(gloss.y0 for gloss in above) > line.y0 - 60, \
+            f"the gloss for {line} was hoisted away from it"
+        ceiling = line.y1
+
+
 def test_a_filled_panel_is_opened_up_rather_than_stepped_around():
     """A cut through the middle of a solid box reopens as more of the box."""
     builder = _Builder()

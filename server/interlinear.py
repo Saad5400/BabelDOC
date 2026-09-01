@@ -1347,8 +1347,8 @@ def _cut_items(drawing: dict) -> list[pymupdf.Rect]:
 
 
 def _page_marks(page: pymupdf.Page) -> tuple[list[pymupdf.Rect], list[pymupdf.Rect],
-                                             list[pymupdf.Rect]]:
-    """`(ink, blockers, backdrops)` for one page, from a single parse of it.
+                                             list[pymupdf.Rect], list[pymupdf.Rect]]:
+    """`(ink, blockers, backdrops, solid)` for one page, from a single parse.
 
     `ink` is what a gloss may not be drawn over — the same account
     {@link _page_ink} takes, but on the spans' real heights ({@link
@@ -1357,9 +1357,13 @@ def _page_marks(page: pymupdf.Page) -> tuple[list[pymupdf.Rect], list[pymupdf.Re
     `backdrops` is what the page is drawn ON — set aside by both, and reported
     because a region that is nothing BUT backdrop has no clear air to open a
     band in and has to be handled differently ({@link _paint_leaf}).
+    `solid` is the part of `blockers` that is text or a placed image, with the
+    page's vector furniture left out: the fallback for a region whose
+    decoration has left it no air at all ({@link _breathing_room}).
     """
     ink = _text_ink(page)
     blockers = list(ink)
+    solid = list(ink)
     backdrops: list[pymupdf.Rect] = []
 
     page_area = abs(page.rect.get_area()) or 1.0
@@ -1378,6 +1382,7 @@ def _page_marks(page: pymupdf.Page) -> tuple[list[pymupdf.Rect], list[pymupdf.Re
         else:
             ink.append(rect)
             blockers.append(rect)
+            solid.append(rect)
 
     try:
         drawings = page.get_drawings()
@@ -1400,7 +1405,8 @@ def _page_marks(page: pymupdf.Page) -> tuple[list[pymupdf.Rect], list[pymupdf.Re
 
     return ([rect for rect in ink if rect.is_valid and not rect.is_empty],
             [rect for rect in blockers if rect.is_valid and rect.height > 0],
-            backdrops)
+            backdrops,
+            [rect for rect in solid if rect.is_valid and rect.height > 0])
 
 
 def _merge_spans(spans: list[tuple[float, float]],
@@ -1686,7 +1692,8 @@ def _band_at(leaf: _Region, cut: float, strip: float) -> _Band:
     return band
 
 
-def _ink_bounds(box: pymupdf.Rect, ink: list[pymupdf.Rect]) -> pymupdf.Rect:
+def _ink_bounds(box: pymupdf.Rect, ink: list[pymupdf.Rect],
+                reach: float | None = None) -> pymupdf.Rect:
     """`box` replaced by the marks it actually holds.
 
     The sidecar's boxes come from BabelDOC's character metrics and are only
@@ -1700,10 +1707,28 @@ def _ink_bounds(box: pymupdf.Rect, ink: list[pymupdf.Rect]) -> pymupdf.Rect:
     whatever it overlaps — which here would swallow the neighbour it was
     supposed to be told apart from. Ownership is decided by CENTRE instead: a
     mark belongs to the box its middle falls in, and to no other.
+
+    And only if it is the size of something the box could be MADE of. The
+    shortfall being corrected is an ascent artifact, a fraction of a line; a
+    mark much taller than the box is a page-centred decorative ring, a
+    full-height bracket, a tall arrow — scenery that happens to be centred
+    there. Adopting it swelled ~200 blocks corpus-wide to more than twice
+    their real height, run22 p3 an 18.6 pt paragraph to 405.7 pt. That anchor
+    is what {@link _levels} sorts on, so the paragraph sorted first and its
+    gloss was drawn above three paragraphs that come before it; it is also
+    what the fallback placement treats as an obstacle and what
+    {@link _leaf_for} picks a region with.
+
+    `reach` is how far past the box a mark may still be part of it — one line
+    of slack in each direction, so the ascent correction this exists for is
+    untouched.
     """
+    reach = reach if reach is not None else box.height
+    span = box.height + 2 * reach
     owned = [mark for mark in ink
              if box.y0 <= (mark.y0 + mark.y1) / 2 <= box.y1
-             and mark.x1 > box.x0 and mark.x0 < box.x1]
+             and mark.x1 > box.x0 and mark.x0 < box.x1
+             and mark.height <= span]
 
     if not owned:
         return box
@@ -1713,7 +1738,8 @@ def _ink_bounds(box: pymupdf.Rect, ink: list[pymupdf.Rect]) -> pymupdf.Rect:
     for mark in owned[1:]:
         bounds |= mark
 
-    return bounds
+    return pymupdf.Rect(bounds.x0, max(bounds.y0, box.y0 - reach),
+                        bounds.x1, min(bounds.y1, box.y1 + reach))
 
 
 def _spaced_units(block: dict, matrix: pymupdf.Matrix,
@@ -1722,10 +1748,14 @@ def _spaced_units(block: dict, matrix: pymupdf.Matrix,
     anchor = _to_display(block["box"], matrix)
     source_size = float(block.get("font_size") or 0) or anchor.height
     text = block["target"].strip()
-    lines = sorted((_ink_bounds(_to_display(line, matrix), ink)
+    # A line of the paragraph's own type is the slack a mark may claim, for
+    # the anchor as much as for one line: the anchor's job is to say where the
+    # paragraph is, and a paragraph is not the scenery behind it.
+    reach = max(source_size, 1.0)
+    lines = sorted((_ink_bounds(_to_display(line, matrix), ink, reach)
                     for line in (block.get("lines") or []) if line),
                    key=lambda rect: rect.y0)
-    anchor = _ink_bounds(anchor, ink)
+    anchor = _ink_bounds(anchor, ink, reach)
 
     if not lines:
         return anchor, [(anchor, text)], source_size
@@ -1992,10 +2022,27 @@ def _spaced_page(target: pymupdf.Document, source: pymupdf.Document, index: int,
     page = source[index]
     rect = page.rect
     options = layout.options
-    ink, blockers, backdrops = _page_marks(page)
+    ink, blockers, backdrops, solid = _page_marks(page)
     root = _split_region(rect, blockers, 0, rect)
     leaves = root.leaves()
     gaps = {id(leaf): _free_gaps(blockers, leaf.rect) for leaf in leaves}
+    # The same air measured against the page's TEXT AND IMAGES ALONE, with its
+    # vector furniture left out. A page whose decoration is one big shape is
+    # already handled — {@link _is_backdrop} sets it aside — but a decoration
+    # drawn as FORTY small shapes is not: run22's concentric vignette spans
+    # y 66.9 to 371.7 as ~40 curves, none individually big enough to be a
+    # backdrop, and between them they leave that slide's main region 4.3 pt of
+    # free air in 476 pt. No line can find clear air above it, every paragraph
+    # falls through to "gloss above the whole region", and 415 of that
+    # document's 486 glosses end up piled at the top, out of reading order.
+    #
+    # So a line that finds nothing the strict way asks again without the
+    # scenery, rather than being hoisted to the top of the page. Nothing is
+    # given away by asking second: the full account is always tried first, and
+    # the page's own pixels ({@link _CutRows}) have the final say over the cut
+    # either way — which is what keeps this from slicing the scenery it just
+    # agreed to ignore.
+    loose = {id(leaf): _free_gaps(solid, leaf.rect) for leaf in leaves}
     # The page's own pixels, which every cut is checked against before it is
     # committed. One render per page, shared by every leaf on it.
     rows = _CutRows(page)
@@ -2052,8 +2099,14 @@ def _spaced_page(target: pymupdf.Document, source: pymupdf.Document, index: int,
 
         for line, _chunk in units:
             leaf = _leaf_for(line, leaves)
-            found.append((leaf, _cut_above(line, gaps[id(leaf)], blockers,
-                                           limit, True, clean_for[id(leaf)])))
+            cut = _cut_above(line, gaps[id(leaf)], blockers, limit, True,
+                             clean_for[id(leaf)])
+
+            if cut is None:
+                cut = _cut_above(line, loose[id(leaf)], solid, limit, True,
+                                 clean_for[id(leaf)])
+
+            found.append((leaf, cut))
 
         if all(cut for _leaf, cut in found):
             # Line by line: the gloss sits directly over the words it renders.
@@ -2069,9 +2122,11 @@ def _spaced_page(target: pymupdf.Document, source: pymupdf.Document, index: int,
             # between the boxes; it can be opened up over them.
             line = units[0][0]
             leaf = _leaf_for(line, leaves)
-            cut = _cut_above(line, gaps[id(leaf)], blockers,
-                             line.y0 - leaf.rect.y0 + 1.0, False,
-                             clean_for[id(leaf)])
+            reach = line.y0 - leaf.rect.y0 + 1.0
+            cut = (_cut_above(line, gaps[id(leaf)], blockers, reach, False,
+                              clean_for[id(leaf)])
+                   or _cut_above(line, loose[id(leaf)], solid, reach, False,
+                                 clean_for[id(leaf)]))
             attached = [(leaf, cut, line, text)] if cut else None
 
         if attached is None:
