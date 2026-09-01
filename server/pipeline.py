@@ -530,7 +530,20 @@ def _insert_vocab(output_pdf: Path, sidecar_path: Path) -> None:
             # presentation forms instead of letters and Ctrl+F, copy-paste,
             # screen readers and catodemy's corpus ingestion all get glyph
             # soup. A no-op on a document that has no presentation forms.
-            page_fonts.repair_arabic_text_layer(doc)
+            #
+            # Looked up rather than called directly: this whole block sits
+            # inside a never-lose-the-run guard, so on a build where the
+            # repair is not present an AttributeError would be swallowed and
+            # would silently cost the entire vocab layer — a much larger
+            # regression than the one the repair fixes. Absent, we ship the
+            # strips unrepaired, which is exactly what shipped before it
+            # existed.
+            repair = getattr(page_fonts, "repair_arabic_text_layer", None)
+            if repair is None:
+                logger.warning("vocab: page_fonts carries no Arabic text-layer "
+                               "repair; the strips ship as presentation forms")
+            else:
+                repair(doc)
             # A full save (not incremental): garbage=4 folds the per-box
             # copies of the subset row font into one. Via a sibling temp
             # file — pymupdf cannot rewrite the file it has open.
