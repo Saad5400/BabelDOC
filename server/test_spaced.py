@@ -49,7 +49,8 @@ class _Builder:
         self.blocks: list[dict] = []
 
     def text(self, x0: float, top: float, text: str, size: float = 11.0,
-             *, gloss: str | None = None) -> pymupdf.Rect:
+             *, gloss: str | None = None,
+             source: str | None = None) -> pymupdf.Rect:
         """One line of Latin text with its baseline placed from `top`."""
         self.page.insert_text((x0, top + size * 0.8), text, fontname="helv",
                               fontsize=size)
@@ -57,19 +58,21 @@ class _Builder:
         rect = pymupdf.Rect(x0, top, x0 + width, top + size)
 
         if gloss is not None:
-            self.paragraph([rect], gloss, size)
+            self.paragraph([rect], gloss, size, source=source)
 
         return rect
 
     def paragraph(self, lines: list[pymupdf.Rect], gloss: str,
-                  size: float = 11.0) -> None:
+                  size: float = 11.0, *, source: str | None = None) -> None:
         box = pymupdf.Rect(lines[0])
 
         for line in lines[1:]:
             box |= line
 
+        # The source text matters to the layout in one way: a target that
+        # repeats it is not a gloss at all ({@link interlinear._says_nothing}).
         self.blocks.append({"box": box, "lines": list(lines), "target": gloss,
-                            "font_size": size})
+                            "font_size": size, "source": source or "source"})
 
     def fill(self, rect: pymupdf.Rect, color=(0.9, 0.9, 0.9)) -> None:
         self.page.draw_rect(rect, fill=color, color=None)
@@ -104,7 +107,7 @@ class _Builder:
                             block["box"].x1, height - block["box"].y0],
                     "lines": [[line.x0, height - line.y1, line.x1,
                                height - line.y0] for line in block["lines"]],
-                    "source": "source",
+                    "source": block["source"],
                     "target": block["target"],
                     "font_size": block["font_size"],
                     "label": "plain text",
@@ -308,6 +311,50 @@ def test_a_gloss_is_proportional_to_the_type_it_glosses():
     arabic = _gloss_lines(pdf)
 
     assert arabic[0].height > 2 * arabic[-1].height
+
+
+# --------------------------------------------------------------------------
+# what is not worth a gloss
+# --------------------------------------------------------------------------
+
+def test_a_target_that_repeats_its_source_is_not_glossed():
+    """A slide number, a truth table cell, a keyword: 37 % of the corpus.
+
+    The translator returns a target for every block it is handed, and on a
+    real deck a great many of those targets are the source back again. Drawn,
+    each one is a gloss restating the line under it — and in this layout the
+    page is opened up to make room for it first.
+    """
+    builder = _Builder()
+    builder.text(60, 100, "Change is inevitable", 11.0, gloss=AR_ONE,
+                 source="Change is inevitable")
+    builder.text(60, 300, "12", 11.0, gloss="12", source="12")
+    builder.text(60, 500, "byte", 11.0, gloss="  byte  ", source="byte")
+
+    pdf, report = _render(builder)
+
+    assert report["drawn"] == 1
+    # Every gloss on the page belongs to the first line; the "12" and the
+    # "byte" were left to speak for themselves.
+    assert _gloss_lines(pdf)
+    assert all(gloss.y1 < 200 for gloss in _gloss_lines(pdf))
+    # And nothing had to be opened up for the other two.
+    assert _page_size(pdf)[1] < PAGE[1] + 40
+
+
+def test_a_page_of_nothing_but_repeated_sources_is_carried_through_whole():
+    builder = _Builder()
+
+    for index in range(5):
+        builder.text(60, 100 + index * 24, f"item {index}", 11.0,
+                     gloss=f"item {index}", source=f"item {index}")
+
+    pdf, report = _render(builder)
+
+    assert report["drawn"] == 0
+    assert report["skipped"] == 0
+    assert _page_size(pdf) == PAGE
+    assert not _arabic(pdf)
 
 
 # --------------------------------------------------------------------------

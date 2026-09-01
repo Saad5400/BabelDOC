@@ -976,22 +976,52 @@ def _render_raster(page: pymupdf.Page, blocks: list[dict], layout: _Layout,
     return drawn, skipped
 
 
+def _says_nothing(block: dict) -> bool:
+    """Would this block's gloss just repeat the line it sits over?
+
+    A translation run returns a target for every block it was given, and for a
+    great many of them the target is the source back again: a slide number, a
+    date, a truth table's T/F cells, a table of Java keywords, a formula. On
+    the corpus that is 2284 of 6106 blocks — 37 % — and every one of them is
+    drawn as a gloss saying exactly what is already printed under it, in the
+    spaced layout after opening a band to hold it. So the page grows to
+    restate itself.
+
+    Whitespace-normalised equality only. Anything the translator actually
+    changed — a different word, a different script, punctuation moved — still
+    gets its gloss; this is not a heuristic about what is worth translating,
+    it is the observation that a gloss identical to its source is not a gloss.
+    """
+    target = " ".join((block.get("target") or "").split())
+
+    return bool(target) and target == " ".join((block.get("source") or "").split())
+
+
+def _gloss_blocks(page_data: dict) -> tuple[list[dict], list[dict]]:
+    """One page's blocks worth glossing, as `(normal, raster)`.
+
+    The raster lane — blocks the engine marked as living inside an embedded
+    image — is split out BEFORE the normal pass so that pass's anchors,
+    obstacles and column edge are computed from exactly the blocks it always
+    saw: an old sidecar renders exactly what it always did.
+    """
+    blocks = [block for block in (page_data.get("blocks") or [])
+              if block.get("box") and (block.get("target") or "").strip()
+              and not _says_nothing(block)]
+
+    return ([block for block in blocks
+             if not (block.get("on_raster") and block.get("region"))],
+            [block for block in blocks
+             if block.get("on_raster") and block.get("region")])
+
+
 def _render_page(page: pymupdf.Page, page_data: dict,
                  layout: _Layout) -> tuple[int, int, int, int]:
     """Draw one page's glosses.
 
     Returns `(drawn, skipped, raster_drawn, raster_skipped)`.
     """
-    blocks = [block for block in (page_data.get("blocks") or [])
-              if block.get("box") and (block.get("target") or "").strip()]
-    # The raster lane: blocks the engine marked as living inside an embedded
-    # image. They are split out BEFORE the normal pass so that pass's anchors,
-    # obstacles and column edge are computed from exactly the blocks it always
-    # saw — an old sidecar renders exactly what it always did.
-    raster = [block for block in blocks
-              if block.get("on_raster") and block.get("region")]
-    blocks = [block for block in blocks
-              if not (block.get("on_raster") and block.get("region"))]
+    blocks, raster = _gloss_blocks(page_data)
 
     if not blocks and not raster:
         return 0, 0, 0, 0
@@ -1898,16 +1928,11 @@ def _spaced_page(target: pymupdf.Document, source: pymupdf.Document, index: int,
                     > 0.9 * abs(leaf.rect.get_area())
                     for backdrop in backdrops))
 
-    blocks = [block for block in (page_data.get("blocks") or [])
-              if block.get("box") and (block.get("target") or "").strip()]
     # The raster lane's blocks live INSIDE an embedded image. No cut can pass
     # through an image (it is a blocker), so opening the page cannot make room
     # for them — they keep the plate treatment, drawn on the rebuilt page after
     # everything has landed where it is going to stay.
-    raster = [block for block in blocks
-              if block.get("on_raster") and block.get("region")]
-    blocks = [block for block in blocks
-              if not (block.get("on_raster") and block.get("region"))]
+    blocks, raster = _gloss_blocks(page_data)
     matrix = page.transformation_matrix
     anchors: list[pymupdf.Rect] = []
     fallbacks: list[tuple[pymupdf.Rect, str, float]] = []
