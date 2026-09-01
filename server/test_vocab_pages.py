@@ -293,6 +293,31 @@ def test_rows_that_would_dwarf_the_page_fall_back_too():
     doc.close()
 
 
+def test_a_band_over_half_the_page_falls_back_rather_than_growing_it():
+    # run32's shape: 14 rows measured 277pt under a 595x335 slide — 83% of
+    # the slide, 45% of the delivered sheet, and it passed the old 0.9 guard.
+    short = pymupdf.open()
+    short.new_page(width=595.0, height=335.0)
+
+    added = vocab_pages.attach_vocab(short, {"0": _rows(14)}, {0: 0})
+
+    assert added[0] < 0  # an inserted page, not a band the size of the slide
+    assert short[0].rect.height == 335.0  # the slide keeps its own geometry
+    short.close()
+
+    # The same rows on a page tall enough to carry them still get their strip:
+    # it is the SHARE of the page that decides, not the number of rows.
+    tall = pymupdf.open()
+    tall.new_page(width=595.0, height=842.0)
+
+    added = vocab_pages.attach_vocab(tall, {"0": _rows(14)}, {0: 0})
+
+    assert added[0] > 0
+    assert added[0] < 0.5 * 842.0
+    assert tall.page_count == 1
+    tall.close()
+
+
 def test_attach_junk_vocab_touches_nothing():
     doc = _doc(pages=1)
     before = doc[0].rect.height
@@ -301,6 +326,22 @@ def test_attach_junk_vocab_touches_nothing():
     assert vocab_pages.attach_vocab(doc, "not a dict", {0: 0}) == {}
     assert doc.page_count == 1
     assert doc[0].rect.height == before
+    doc.close()
+
+
+def test_a_page_with_no_anchor_is_dropped_out_loud(caplog):
+    # A key past the end of the document — what a model that echoed a printed
+    # slide number produces — used to take a whole page of words with it in
+    # silence.
+    doc = _doc(pages=2)
+
+    with caplog.at_level("WARNING", logger="doctranslate.vocab_pages"):
+        added = vocab_pages.attach_vocab(
+            doc, {"0": _rows(2), "9": _rows(3)}, {0: 0, 1: 1})
+
+    assert set(added) == {0}
+    assert "9" in caplog.text
+    assert "3 word(s)" in caplog.text
     doc.close()
 
 
