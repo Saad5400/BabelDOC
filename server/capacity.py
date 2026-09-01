@@ -59,9 +59,8 @@ The gate is also where the process gives memory BACK. glibc does not return a
 freed arena to the OS on its own, and the measurement is stark: an overlay that
 takes RSS from 421 MB to 1001 MB leaves it at 1001 MB, and `malloc_trim(0)`
 brings it to 537 MB — 464 MB of the 580 MB was allocator slack, not live data.
-So the last release out — when nothing is in flight and nothing is waiting —
-trims. That is the moment it is both free (no other allocator is being
-disturbed) and worth the 20-250 ms it costs (MEASURED across the builders).
+So every release trims; see `Gate.release` for why "only when the gate falls
+idle" is not enough.
 """
 
 import asyncio
@@ -267,13 +266,26 @@ class Gate:
         return BusyError(label, waited, queued, self.limit, retry_after)
 
     def release(self, label: str) -> None:
+        """Give the slot back, and give the MEMORY back with it.
+
+        Every release trims, not only the last one out. Trimming only when the
+        gate fell idle was the first shape of this and it measured badly: a
+        translation job holds its slot for minutes, so while one is running the
+        gate is never idle, and the slack left behind by each finished rebuild
+        simply accumulated underneath it. On the job-plus-six-rebuilds run,
+        trimming on idle alone peaked at 2957 MB; trimming on every release
+        peaked at 2265 and 2275 MB over two runs, and ENDED at 973 MB rather
+        than 2853 MB (MEASURED, same documents, same order).
+
+        It costs 20-250 ms, against operations measured in seconds, and it is
+        safe with work still in flight — `malloc_trim` takes the arena locks
+        rather than needing the process to be quiet.
+        """
         with self._lock:
             self._in_flight = max(0, self._in_flight - 1)
-            idle = self._in_flight == 0 and not self._queue
             woken = self._wake_locked()
         self._signal(woken)
-        if idle:
-            trim()
+        trim()
 
     # -- context managers --------------------------------------------------
 

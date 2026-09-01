@@ -49,21 +49,46 @@ MAX_CONCURRENT_HEAVY = _positive("ENGINE_MAX_CONCURRENT", "2", int)
 #     POST /v1/convert       360 s (240 s interactive; nginx cuts it at 300 s)
 #
 # and NONE of those POSTs is retried — the file parts are streamed, so a
-# client-side retry would re-send empty ones. So the tightest real budget is
-# 60 s, out of which the build itself needs its share: 40 s of queueing leaves
-# room for the ~4 s compose and the ~30 s overlay that follow it, and gets the
-# 503 to the caller BEFORE its own transport timeout, which is the difference
-# between "the engine is busy, try again" and a bare read error.
+# client-side retry would re-send empty ones, which means every 503 the gate
+# emits is a real error in front of a real reader. So the budget is not one
+# number: it is the caller's own timeout, minus the time the build itself
+# still needs after it is let in (MEASURED: ~4 s compose, ~1 s strip-vocab,
+# ~2 s notes-space, up to ~32 s for a 73-page overlay), minus margin.
 #
-# Two things are deliberately NOT subject to this:
+# The numbers are HALF the caller's budget, not most of it, and that is the
+# one surprising thing here. A deadline is only as punctual as the event loop
+# that fires it, and under two concurrent real overlays this loop is not
+# punctual: MEASURED, a /healthz that normally answers in 8 ms took as long as
+# 15 s, and a compose given a 40 s budget was refused after 63.6 s — 23.6 s
+# late, and by then past the 60 s at which its caller had already given up. A
+# 503 that arrives after the client has stopped listening is not an honest
+# answer, it is a bare read error with extra steps. So each budget leaves room
+# for that lateness: 30 s + ~24 s worst observed still lands inside 60 s, and
+# 60 s + ~24 s inside 120 s.
+#
+# (The lateness itself is GIL contention between the two CPU-bound builders
+# and the loop, it predates this gate — the same measurement on the base
+# branch is worse, 30.8 s worst case — and it is not something a queue can
+# fix. It is written down here because it is what sizes these numbers.)
+#
+# /v1/convert keeps the default despite its far longer client budget: its own
+# render can take Gotenberg's full 300 s afterwards, and nginx cuts the
+# synchronous path at 300 s regardless, so time spent queueing is time the
+# render will not get.
+#
+# Two things are deliberately NOT subject to any of this:
 #   * translation JOBS — durable on disk, polled rather than held open, so
 #     they wait as long as it takes (server/capacity.py);
 #   * /healthz and the job-status GETs — they never enter the gate at all.
 #     catodemy retries a status poll exactly once, 200 ms later, and then
 #     abandons a translation that is still running, so a status poll that
 #     queued behind an overlay would throw away paid work.
-ADMISSION_WAIT_SECONDS = _positive("ENGINE_ADMISSION_WAIT_SECONDS", "40",
+ADMISSION_WAIT_SECONDS = _positive("ENGINE_ADMISSION_WAIT_SECONDS", "30",
                                    float)
+
+#: For /v1/overlay and /v1/notes-space, whose caller allows 120 s.
+LONG_ADMISSION_WAIT_SECONDS = _positive("ENGINE_LONG_ADMISSION_WAIT_SECONDS",
+                                        "60", float)
 
 # The shared Gotenberg service — the office suite /v1/convert renders through.
 #

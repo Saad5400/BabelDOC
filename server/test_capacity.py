@@ -234,29 +234,38 @@ def test_a_translation_job_waits_rather_than_being_refused(limit):
     assert ran.is_set(), "the translation was never let in"
 
 
-def test_the_last_one_out_hands_the_memory_back(limit, monkeypatch):
+def test_every_release_hands_the_memory_back(limit, monkeypatch):
     """glibc keeps every high-water mark unless it is told not to.
 
     MEASURED: one 73-page overlay takes the process from 421 MB to 1001 MB and
     LEAVES it there; `malloc_trim(0)` returns 464 MB of that. Without this the
     engine's floor climbs with every document it has ever seen, which is how
     documents that each fit inside the cap add up to an OOM.
+
+    EVERY release, not just the last one out — which is what this first did.
+    A translation job holds its slot for minutes, so while one runs the gate
+    is never idle and the slack from each finished rebuild just piles up
+    underneath it: 2957 MB peak trimming on idle, 2265-2275 MB trimming on
+    every release, same documents.
     """
     limit(2)
     trims: list[int] = []
     monkeypatch.setattr(capacity, "trim", lambda: trims.append(1))
 
-    async def two_then_none():
+    async def two_overlapping():
         first = capacity.slot("a")
         await first.__aenter__()
         second = capacity.slot("b")
         await second.__aenter__()
         await first.__aexit__(None, None, None)
-        assert not trims, "trimmed while work was still in flight"
+        assert trims == [1], (
+            "a release while other work is still in flight did not trim — "
+            "which is exactly the case that matters, because a translation "
+            "job keeps the gate busy for minutes")
         await second.__aexit__(None, None, None)
 
-    asyncio.run(two_then_none())
-    assert trims == [1], "the last release did not trim"
+    asyncio.run(two_overlapping())
+    assert trims == [1, 1]
 
 
 def test_trim_is_harmless_where_there_is_no_malloc_trim(monkeypatch):
@@ -483,3 +492,82 @@ def test_healthz_and_job_status_answer_while_the_gate_is_saturated(
     # requests in and two of them queueing, it does not.
     assert max(health) < 1.5, f"/healthz worst case {max(health):.2f}s"
     assert max(status) < 1.5, f"job status worst case {max(status):.2f}s"
+
+
+def test_the_endpoints_with_a_more_patient_caller_wait_longer(client,
+                                                              monkeypatch):
+    """The wait is the CALLER's budget minus the build, not one number.
+
+    catodemy allows /v1/compose and /v1/strip-vocab 60 s and /v1/overlay and
+    /v1/notes-space 120 s, and retries none of them. Handing every endpoint
+    the tightest of those refuses work whose caller would have waited — and
+    both numbers are half the caller's budget rather than most of it, because
+    a starved event loop fires its deadlines late (server/config.py).
+    """
+    asked: list[float | None] = []
+    real = capacity.slot
+
+    def record(label, wait_seconds=None):
+        asked.append(wait_seconds)
+        return real(label, wait_seconds)
+
+    monkeypatch.setattr(capacity, "slot", record)
+    headers = {"X-Internal-Token": TOKEN}
+
+    client.post("/v1/notes-space", headers=headers,
+                files={"file": ("f.pdf", _pdf(), "application/pdf")},
+                data={"sides": "bottom", "size": "md"})
+    client.post("/v1/compose", headers=headers,
+                files={"original": ("o.pdf", _pdf(), "application/pdf"),
+                       "translated": ("t.pdf", _pdf(), "application/pdf")},
+                data={"format": "alternating"})
+
+    assert asked == [config.LONG_ADMISSION_WAIT_SECONDS, None], asked
+    assert config.LONG_ADMISSION_WAIT_SECONDS > config.ADMISSION_WAIT_SECONDS
+
+
+def test_healthz_asks_each_binary_its_version_once(client, monkeypatch):
+    """Not once per probe.
+
+    /healthz forked `tesseract --version` and `ocrmypdf --version` — a whole
+    Python program — on every call, so the endpoint that decides whether this
+    container gets RESTARTED was itself two process spawns competing with the
+    translation it reports on. MEASURED under two concurrent real 73-page
+    overlays: median 0.631 s on the base branch against 0.036-0.160 s here,
+    and the base branch answered one probe `503 degraded` because its
+    Gotenberg check timed out behind its own forks. A health check that calls
+    a healthy engine broken is a restart, and a restart fails the paid run.
+    """
+    from server import app as app_module
+
+    app_module._VERSION_CACHE.clear()
+    spawned: list[tuple[str, ...]] = []
+    real = app_module.subprocess.run
+
+    def counting(argv, **kwargs):
+        spawned.append(tuple(argv))
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(app_module.subprocess, "run", counting)
+
+    first = client.get("/healthz").json()
+    for _ in range(4):
+        client.get("/healthz")
+
+    assert len(spawned) == 2, spawned
+    # And the cache is the same answer, not a placeholder for one.
+    assert client.get("/healthz").json()["versions"] == first["versions"]
+
+
+def test_a_missing_binary_is_asked_about_again(monkeypatch):
+    """"missing" is the one answer worth re-asking: an operator may be fixing it."""
+    from server import app as app_module
+
+    app_module._VERSION_CACHE.clear()
+
+    def absent(*_args, **_kwargs):
+        raise OSError("no such binary")
+
+    monkeypatch.setattr(app_module.subprocess, "run", absent)
+    assert app_module._cmd_version(("tesseract", "--version")) == "missing"
+    assert not app_module._VERSION_CACHE

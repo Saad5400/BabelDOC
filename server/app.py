@@ -415,13 +415,47 @@ def require_token(x_internal_token: str | None = Header(default=None)) -> None:
         raise HTTPException(status_code=401, detail="invalid X-Internal-Token")
 
 
-def _cmd_version(argv: list[str]) -> str:
+#: Answers from `_cmd_version` that are worth keeping. Successes only.
+_VERSION_CACHE: dict[tuple[str, ...], str] = {}
+
+
+def _cmd_version(argv: tuple[str, ...]) -> str:
+    """The version a binary in this image reports, asked ONCE.
+
+    Cached for the life of the process because the answer cannot change:
+    the binaries are baked into the image, and a `docker exec` that replaced
+    one would not be a case worth paying for on every probe.
+
+    And the cost was not small. /healthz forked `tesseract --version` and
+    `ocrmypdf --version` — the latter is a whole Python program — on every
+    single call, so the endpoint that decides whether this container gets
+    RESTARTED was itself two process spawns competing with the translation it
+    was reporting on. MEASURED under two concurrent real 73-page overlays,
+    against the base branch on the same harness: median 0.631 s uncached
+    against 0.036-0.160 s cached, and the uncached run answered one probe
+    `503 degraded` because its Gotenberg check timed out behind its own
+    forks — a health check reporting a healthy engine as broken, which is a
+    restart, and a restart fails the paid run.
+
+    What stays live is the only thing that can actually change while the
+    process runs: Gotenberg's reachability, which is a network probe.
+    """
+    cached = _VERSION_CACHE.get(argv)
+    if cached is not None:
+        return cached
+
     try:
-        out = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+        out = subprocess.run(list(argv), capture_output=True, text=True,
+                             timeout=15)
         first = (out.stdout or out.stderr).strip().splitlines()
-        return first[0] if first else "unknown"
+        version = first[0] if first else "unknown"
     except (OSError, subprocess.TimeoutExpired):
+        # Deliberately NOT cached: "missing" is the one answer worth asking
+        # again for, because it is the one an operator might be fixing.
         return "missing"
+
+    _VERSION_CACHE[argv] = version
+    return version
 
 
 @app.get("/healthz")
@@ -433,16 +467,18 @@ async def healthz():
     # reports Gotenberg's own libreoffice component: a Gotenberg that answers
     # while its LibreOffice is down would convert nothing.
     #
-    # Async because that probe is: the version calls are subprocesses and would
-    # block the loop for as long as they run, so they go to a worker thread —
-    # which is what an ordinary `def` endpoint got for free and this one has to
-    # ask for.
+    # Async because that probe is: the version calls are subprocesses on their
+    # first pass and would block the loop for as long as they run, so they go
+    # to a worker thread — which is what an ordinary `def` endpoint got for
+    # free and this one has to ask for. After that first pass `_cmd_version`
+    # answers from its cache and the hop is a formality; what it is NOT is a
+    # fork per probe while a translation is running.
     versions = {
         "babeldoc": babeldoc_version,
         "tesseract": await anyio.to_thread.run_sync(
-            _cmd_version, ["tesseract", "--version"]),
+            _cmd_version, ("tesseract", "--version")),
         "ocrmypdf": await anyio.to_thread.run_sync(
-            _cmd_version, ["ocrmypdf", "--version"]),
+            _cmd_version, ("ocrmypdf", "--version")),
         "gotenberg": await convert.service_status(),
     }
     ok = all(v != "missing" for v in versions.values())
@@ -607,7 +643,8 @@ async def overlay(
             status_code=422,
             detail=f"style must be one of {interlinear.OVERLAY_STYLES}")
 
-    async with capacity.slot(f"overlay {style}"):
+    async with capacity.slot(f"overlay {style}",
+                             config.LONG_ADMISSION_WAIT_SECONDS):
         original_bytes = await original.read()
         sidecar_bytes = await sidecar.read()
 
@@ -786,7 +823,8 @@ async def add_notes_space(
     except notes_space.NotesSpaceError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    async with capacity.slot("notes-space"):
+    async with capacity.slot("notes-space",
+                             config.LONG_ADMISSION_WAIT_SECONDS):
         data = await file.read()
 
         if len(data) > MAX_UPLOAD_BYTES:
