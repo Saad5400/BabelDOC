@@ -565,8 +565,28 @@ class ParagraphFinder:
     #    (measured: 'focus o' n=6 w=13.2 h=35.2 -> 0.38 against 1.8, while
     #    the same page's 'device drivers' n=13 w=66.6 h=10.9 -> 6.1
     #    against 3.9).
+    #
+    # A tall line is not necessarily a rotated one, though: a STACKED
+    # construct — a fraction, a sub/superscripted expression — is one line
+    # occupying several baselines, and it fails the aspect test for a
+    # completely different reason. Only the character DISTRIBUTION tells the
+    # two apart, so the aspect test is qualified by it (run39 p15 and run67
+    # p6, MEASURED through this engine):
+    #
+    #     '0.91 m x 1x106um / 1 m = 9.1 x 10^5 u m'  n=25 bands=3  8.3/band
+    #     '103 m x 1x106um / 1 m = 10^9 um'          n=20 bands=3  6.7/band
+    #     'f this cou'                               n= 8 bands=7  1.1/band
+    #     'focus o'                                  n= 6 bands=6  1.0/band
+    #
+    # A rotated run puts one glyph on each baseline because every glyph IS
+    # its own line; a stacked formula puts a whole row on each. Anything
+    # above 2 characters per baseline is a stacked construct and is left
+    # alone — without this the guard deleted both of run39 p15's fractions
+    # outright.
     ROTATED_MIN_CHARS = 4
     ROTATED_ASPECT_PER_CHAR = 0.3
+    ROTATED_MAX_CHARS_PER_BASELINE = 2.0
+    ROTATED_BASELINE_TOLERANCE = 0.5
     ROTATED_COLUMN_MIN_LINES = 6
     ROTATED_COLUMN_SHARE = 0.7
     ROTATED_BOX_ASPECT = 1.5
@@ -580,6 +600,36 @@ class ParagraphFinder:
         )
 
     @classmethod
+    def _baseline_bands(cls, line: PdfLine) -> list[list[PdfCharacter]]:
+        """The line's characters grouped by the baseline they sit on.
+
+        One band for ordinary text, one per row for a stacked construct,
+        one per GLYPH for a run the extractor read down a column.
+        """
+        chars = [
+            char
+            for char in line.pdf_character
+            if char.box is not None
+            and char.box.y is not None
+            and char.char_unicode
+            and not char.char_unicode.isspace()
+        ]
+        if not chars:
+            return []
+        heights = sorted(char.box.y2 - char.box.y for char in chars)
+        median_height = heights[len(heights) // 2]
+        tolerance = max(0.5, cls.ROTATED_BASELINE_TOLERANCE * median_height)
+        bands: list[tuple[float, list[PdfCharacter]]] = []
+        for char in sorted(chars, key=lambda c: -c.box.y):
+            for baseline, members in bands:
+                if abs(char.box.y - baseline) <= tolerance:
+                    members.append(char)
+                    break
+            else:
+                bands.append((char.box.y, [char]))
+        return [members for _baseline, members in bands]
+
+    @classmethod
     def _line_is_rotated(cls, line: PdfLine) -> bool | None:
         """True/False for a line long enough to judge, None for too short."""
         if line.box is None or not line.pdf_character:
@@ -591,7 +641,15 @@ class ParagraphFinder:
         height = line.box.y2 - line.box.y
         if width <= 0 or height <= 0:
             return None
-        return width / height < cls.ROTATED_ASPECT_PER_CHAR * chars
+        if width / height >= cls.ROTATED_ASPECT_PER_CHAR * chars:
+            return False
+        # Tall for its width — but a stacked construct is tall because it
+        # has rows, not because it runs downwards. Rows have many
+        # characters on one baseline; a column has one.
+        bands = cls._baseline_bands(line)
+        if bands and chars / len(bands) > cls.ROTATED_MAX_CHARS_PER_BASELINE:
+            return False
+        return True
 
     def _is_a_glyph_column(self, paragraph: PdfParagraph) -> bool:
         lines = [

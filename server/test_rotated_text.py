@@ -34,6 +34,54 @@ def _line(text, x0, y0, x1, y1):
     )
 
 
+def _column_line(text, x0, y0, x1, y1):
+    """A line the extractor read DOWN a column: one glyph per baseline.
+
+    This is what a rotated run really looks like in the IL — the shape the
+    guard has to recognise — as opposed to _line, where every character
+    shares the line's own box and therefore its baseline.
+    """
+    step = (y1 - y0) / max(len(text), 1)
+    return il_version_1.PdfLine(
+        box=_box(x0, y0, x1, y1),
+        pdf_character=[
+            il_version_1.PdfCharacter(
+                box=_box(x0, y0 + i * step, x1, y0 + (i + 1) * step),
+                char_unicode=c,
+            )
+            for i, c in enumerate(text)
+        ],
+    )
+
+
+def _stacked_line(rows, x0, y0, x1, y1):
+    """One line occupying several baselines — a fraction, a superscript.
+
+    Each row is (text, row_x0, row_x1); the rows are stacked top to bottom
+    inside the line's box, every character of a row on that row's baseline.
+    """
+    step = (y1 - y0) / max(len(rows), 1)
+    characters = []
+    for index, (text, row_x0, row_x1) in enumerate(rows):
+        row_y = y1 - (index + 1) * step
+        width = (row_x1 - row_x0) / max(len(text), 1)
+        characters.extend(
+            il_version_1.PdfCharacter(
+                box=_box(
+                    row_x0 + i * width,
+                    row_y,
+                    row_x0 + (i + 1) * width,
+                    row_y + step,
+                ),
+                char_unicode=c,
+            )
+            for i, c in enumerate(text)
+        )
+    return il_version_1.PdfLine(
+        box=_box(x0, y0, x1, y1), pdf_character=characters
+    )
+
+
 def _paragraph(lines, box=None):
     return il_version_1.PdfParagraph(
         box=box,
@@ -68,9 +116,21 @@ SIDEBAR = _paragraph(
 # run67 p6: a rotated label whose glyphs did cluster into words, but whose
 # lines are far too narrow to hold their characters horizontally.
 ROTATED_LABEL = _paragraph([
-    _line("rse", 5.0, 200.0, 10.3, 214.9),
-    _line("f this ", 5.0, 150.0, 18.2, 193.6),
-    _line("cou fo", 5.0, 110.0, 18.2, 145.2),
+    _column_line("rse", 5.0, 200.0, 10.3, 214.9),
+    _column_line("f this ", 5.0, 150.0, 18.2, 193.6),
+    _column_line("cou fo", 5.0, 110.0, 18.2, 145.2),
+])
+
+# run39 p15's third worked example: one line, three baselines, a whole row
+# of characters on each. Tall for its width for a completely different
+# reason than a rotated run, and the guard used to delete it.
+STACKED_FORMULA = _paragraph([
+    _stacked_line(
+        [("1x106um", 356.2, 424.3),
+         ("1 m", 376.8, 403.8),
+         ("0.91 m x = 9.1 x 105 u m", 286.4, 542.3)],
+        286.4, 82.8, 542.3, 123.9,
+    )
 ])
 
 
@@ -108,8 +168,29 @@ def test_a_short_stack_is_not_a_glyph_column():
     assert not _finder()._is_rotated_text_paragraph(paragraph)
 
 
+def test_a_stacked_formula_is_not_rotated():
+    # run39 p15: both worked examples are one line across three baselines.
+    # Judged on aspect alone they read as rotated, and the guard deleted
+    # them — the page was delivered with two empty parentheses and a
+    # fraction rule where the arithmetic used to be.
+    assert not _finder()._is_rotated_text_paragraph(STACKED_FORMULA)
+
+
+def test_a_stacked_construct_is_told_from_a_column_by_its_baselines():
+    # The measurement that separates them (run39 p15 / run67 p6):
+    # a formula puts a row on each baseline, a column puts one glyph.
+    formula_line = STACKED_FORMULA.pdf_paragraph_composition[0].pdf_line
+    rotated_line = ROTATED_LABEL.pdf_paragraph_composition[2].pdf_line
+    finder = _finder()
+    formula_bands = finder._baseline_bands(formula_line)
+    rotated_bands = finder._baseline_bands(rotated_line)
+    assert len(formula_bands) == 3
+    assert finder._line_char_count(formula_line) / len(formula_bands) > 2.0
+    assert finder._line_char_count(rotated_line) / len(rotated_bands) <= 2.0
+
+
 def test_restore_drops_only_the_rotated_paragraphs():
     good = _paragraph([_line("device drivers", 0.0, 100.0, 66.6, 110.9)])
-    page = _page([SIDEBAR, good, ROTATED_LABEL])
+    page = _page([SIDEBAR, good, ROTATED_LABEL, STACKED_FORMULA])
     _finder().restore_rotated_text_paragraphs(page)
-    assert page.pdf_paragraph == [good]
+    assert page.pdf_paragraph == [good, STACKED_FORMULA]
