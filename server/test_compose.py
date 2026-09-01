@@ -70,7 +70,7 @@ def arabic_text_layer_repair(monkeypatch):
 
     if not hasattr(page_fonts, "repair_arabic_text_layer"):
         monkeypatch.setattr(page_fonts, "repair_arabic_text_layer",
-                            lambda doc: 0, raising=False)
+                            lambda _doc: 0, raising=False)
 
 
 @pytest.fixture(scope="module")

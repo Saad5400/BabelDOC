@@ -664,8 +664,15 @@ def compose_dual(original_bytes: bytes, translated_bytes: bytes,
             # sidecar carries for those pages is rendered fresh below.
             translated_pages = translated_pages[:content]
 
-    properties = _document_properties(translated, original)
-    outline = _outline_of(original_bytes)
+    try:
+        properties = _document_properties(translated, original)
+        outline = _outline_of(original_bytes)
+    except Exception:  # noqa: BLE001 - both inputs are uploader-supplied
+        # What a document says about itself is a nicety; a malformed
+        # catalog must not cost the reader the dual itself.
+        logger.exception("compose: reading the inputs' own properties "
+                         "failed; building the dual without them")
+        properties, outline = {}, []
 
     build = _alternating if fmt == "alternating" else _side_by_side
     out = BytesIO()
