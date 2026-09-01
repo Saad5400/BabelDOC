@@ -280,9 +280,15 @@ _STRIP_COLUMN_GAP = 16.0
 _STRIP_MIN_COLUMN = 190.0  # a column narrower than this wraps every row
 _STRIP_MAX_COLUMNS = 4
 _DIVIDER_COLOR = (0xE2 / 255, 0xE8 / 255, 0xF0 / 255)  # #E2E8F0
-# A strip taller than this share of the page means the layout degenerated
-# (a tiny page, enormous notes); the caller falls back to an inserted page.
-_STRIP_MAX_SHARE = 0.9
+# The strip borrows room from the page it explains, so it may take at most a
+# THIRD of the delivered sheet — a band this share of the original page. Past
+# it the aid has become the page: run32's 335pt slides carried a 277pt band
+# (83%, 45% of the delivered sheet) under the 0.9 that used to stand here.
+# The caller falls back to an inserted page, which keeps the slide its own
+# size. On a tall page the share never binds — MAX_PER_PAGE does: 20 rows
+# measure ~275pt at most (run23's A4, 0.35), so this only ever fires on the
+# short slide pages where the defect lives.
+_STRIP_MAX_SHARE = 0.5
 
 
 def _strip_columns(rows: list[dict], fonts: PageFonts,

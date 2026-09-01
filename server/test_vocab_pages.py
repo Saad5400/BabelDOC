@@ -293,6 +293,31 @@ def test_rows_that_would_dwarf_the_page_fall_back_too():
     doc.close()
 
 
+def test_a_band_over_half_the_page_falls_back_rather_than_growing_it():
+    # run32's shape: 14 rows measured 277pt under a 595x335 slide — 83% of
+    # the slide, 45% of the delivered sheet, and it passed the old 0.9 guard.
+    short = pymupdf.open()
+    short.new_page(width=595.0, height=335.0)
+
+    added = vocab_pages.attach_vocab(short, {"0": _rows(14)}, {0: 0})
+
+    assert added[0] < 0  # an inserted page, not a band the size of the slide
+    assert short[0].rect.height == 335.0  # the slide keeps its own geometry
+    short.close()
+
+    # The same rows on a page tall enough to carry them still get their strip:
+    # it is the SHARE of the page that decides, not the number of rows.
+    tall = pymupdf.open()
+    tall.new_page(width=595.0, height=842.0)
+
+    added = vocab_pages.attach_vocab(tall, {"0": _rows(14)}, {0: 0})
+
+    assert added[0] > 0
+    assert added[0] < 0.5 * 842.0
+    assert tall.page_count == 1
+    tall.close()
+
+
 def test_attach_junk_vocab_touches_nothing():
     doc = _doc(pages=1)
     before = doc[0].rect.height
