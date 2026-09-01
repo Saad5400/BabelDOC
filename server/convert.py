@@ -54,6 +54,11 @@ CONVERTIBLE_EXTENSIONS = (
 # right and none of them are reproducible against a live service on demand.
 TRANSPORT: httpx.AsyncBaseTransport | None = None
 
+# Answers that are about the SERVICE, not about the document. Everything else
+# non-200 is Gotenberg telling us it looked at the file and could not render
+# it, which is the caller's 422.
+UNAVAILABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+
 
 class ConvertError(Exception):
     """The document could not be turned into a PDF."""
@@ -67,6 +72,10 @@ class ConvertUnavailableError(ConvertError):
     while this one says "the machinery is busy or down, the same file will work
     in a minute". Telling a reader to re-export a perfectly good deck because
     a queue was full is the failure this class exists to prevent.
+
+    The distinction is load-bearing beyond the wording: the caller maps this
+    to 503 and its own retry keys off the status, so a fault that reaches it
+    as a 422 is not merely mis-worded — it is un-retryable.
     """
 
 
@@ -106,9 +115,22 @@ async def office_to_pdf(data: bytes, filename: str) -> bytes:
                 files={"files": (upload_name, data,
                                  "application/octet-stream")},
             )
+    # Order matters, and it used to be wrong. `TimeoutException` was caught
+    # first, and ConnectTimeout and PoolTimeout are both subclasses of it — so
+    # a Gotenberg that was up but not answering (hibernated, restarting, a net
+    # partition) and an engine that had exhausted its OWN connection pool both
+    # reached the caller as "this document is bad", and the
+    # ConvertUnavailableError branch written for exactly those cases was
+    # unreachable. The two timeouts that are about REACHING the service are
+    # named ahead of the one that is about the render.
+    except (httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+        raise ConvertUnavailableError(
+            f"the conversion service could not be reached: {exc}") from exc
     except httpx.TimeoutException as exc:
-        # Same wording the soffice ceiling used to produce: from the caller's
-        # side a render that never finished is one story, wherever it ran.
+        # A read that ran past the ceiling: Gotenberg took the document and
+        # never came back with it. Same wording the soffice ceiling used to
+        # produce — from the caller's side a render that never finished is one
+        # story, wherever it ran.
         raise ConvertError("converting the document to PDF timed out") from exc
     except httpx.RequestError as exc:
         raise ConvertUnavailableError(
@@ -119,6 +141,18 @@ async def office_to_pdf(data: bytes, filename: str) -> bytes:
         # saturated — so this must never read as "your file is broken".
         raise ConvertUnavailableError(
             "the conversion service is busy; try again in a moment")
+
+    if response.status_code in UNAVAILABLE_STATUSES:
+        # Something between us and LibreOffice is having a bad minute rather
+        # than objecting to the document: a proxy in front of Gotenberg (502),
+        # a gateway that gave up waiting (504), a rate limiter (429), or
+        # Gotenberg's own internals — a LibreOffice that ran out of memory
+        # answers 500. None of those are the file, and until now all of them
+        # were reported as the file: they fell through to the 422 below, which
+        # is the one thing this module exists to stop, and it also defeated
+        # catodemy's own 502/503/504 retry, which never saw a status to act on.
+        raise ConvertUnavailableError(
+            "the conversion service is unavailable; try again in a moment")
 
     if response.status_code != 200:
         raise ConvertError(
