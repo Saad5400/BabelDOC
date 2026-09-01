@@ -164,7 +164,7 @@ ENDPOINTS = list(_requests(b"", b""))
 @pytest.mark.parametrize("endpoint", ENDPOINTS)
 @pytest.mark.parametrize("flavour", list(BAD_PDFS))
 def test_a_pdf_the_engine_cannot_use_is_refused_not_crashed(client, endpoint,
-                                                            flavour, request):
+                                                            flavour):
     """422, never 500, for every bad PDF at every part of every endpoint.
 
     This single assertion over the cross product is the one nobody wrote.

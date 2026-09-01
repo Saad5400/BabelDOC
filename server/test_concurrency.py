@@ -84,6 +84,13 @@ def live_server():
     from server import config
 
     port = _free_port()
+
+    # Set directly rather than via monkeypatch: this fixture is module-scoped
+    # and monkeypatch is function-scoped. Restored below, because a token left
+    # configured (or a worker left stubbed) would leak into every test that
+    # runs after this file.
+    previous_token = config.DOCTRANSLATE_TOKEN
+    previous_worker = app_module.jobs.start_worker
     config.DOCTRANSLATE_TOKEN = TOKEN
     app_module.jobs.start_worker = lambda: None
 
@@ -106,6 +113,8 @@ def live_server():
 
     server.should_exit = True
     thread.join(timeout=10)
+    config.DOCTRANSLATE_TOKEN = previous_token
+    app_module.jobs.start_worker = previous_worker
 
 
 def _slow(result):
