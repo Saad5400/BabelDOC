@@ -386,6 +386,87 @@ def test_lines_whose_font_boxes_overlap_are_still_told_apart():
         ceiling = line.y1
 
 
+def test_the_page_is_asked_where_it_may_be_cut_not_only_the_font():
+    """The pixel check, on its own: ink the object model cannot see.
+
+    A cut is a place the page is stretched, so the only question that matters
+    is whether the page CHANGES from one row to the next there. Object bounds
+    answer it from font and path metrics, and those can be wrong — which is
+    the whole reason this check exists.
+
+    It is a SECOND line of defence, not the only one: a strip taken wholly
+    inside a thick mark is uniform and passes here, and is refused where it
+    always was, by {@link interlinear._cut_items} keeping horizontal rules out
+    of the gaps in the first place.
+    """
+    builder = _Builder()
+    builder.page.draw_line(pymupdf.Point(50, 300), pymupdf.Point(545, 300),
+                           color=(0, 0, 0), width=2.0)
+    doc = pymupdf.open(stream=BytesIO(builder.pdf()), filetype="pdf")
+
+    try:
+        rows = interlinear._CutRows(doc[0])
+
+        # Blank paper: nothing changes down it, so it may be cut anywhere.
+        assert rows.constant(50, 545, 150, 150.6)
+        # Onto the rule's edge: the page changes there, so it may not.
+        assert not rows.constant(50, 545, 298.8, 299.4)
+        # Beside the rule, where it does not reach.
+        assert rows.constant(10, 45, 298.8, 299.4)
+        # Off the page is not a place to cut either.
+        assert not rows.constant(50, 545, -20, -19.4)
+    finally:
+        doc.close()
+
+
+def test_a_cut_is_walked_up_out_of_ink_the_gaps_did_not_report():
+    """The run44 defect, reproduced through the seam it came through.
+
+    `_cut_above` works in gaps built from object bounds. run44's title face
+    reports its 28 pt title as starting at y 63.0 while the glyphs reach up to
+    y 47.2, so the gap above the title ran 16 pt down INSIDE the letters and
+    the cut landed there: the sliced ascenders stayed above the band, the
+    0.6 pt strip smeared them down it as gold bars, and the gloss was drawn on
+    the wreckage — 16 of that document's 17 pages.
+
+    Here the same lie is told directly: a title whose ink starts at y 303, a
+    `line` claiming to start at 318, and a gap claiming clear air all the way
+    down to it.
+    """
+    builder = _Builder()
+    builder.text(60, 300, "Propositions", 28.0)
+    doc = pymupdf.open(stream=BytesIO(builder.pdf()), filetype="pdf")
+
+    try:
+        rows = interlinear._CutRows(doc[0])
+
+        def clean(cut, strip):
+            return rows.constant(50, 545, cut - strip / 2, cut + strip / 2)
+
+        # Where the glyphs really are, so the test cannot pass by accident if
+        # the font's metrics change under it.
+        ink = doc[0].get_text("dict")["blocks"][0]["lines"][0]["spans"][0]["bbox"]
+        assert ink[1] < 318 < ink[3]
+
+        line = pymupdf.Rect(60, 318, 400, 340)
+        gaps = [(200.0, 318.0)]
+
+        trusting = interlinear._cut_above(line, gaps, [], 40.0, False)
+        checked = interlinear._cut_above(line, gaps, [], 40.0, False, clean)
+
+        # What the gaps alone say: cut at the foot of the gap, on a strip the
+        # page itself reports as ink.
+        assert trusting is not None
+        assert not clean(*trusting)
+        # What the page says: a strip that really is one flat slice of
+        # background, well clear of the letters the other cut was inside.
+        assert checked is not None
+        assert clean(*checked)
+        assert checked[0] < trusting[0] - 10
+    finally:
+        doc.close()
+
+
 def test_an_image_beside_the_text_is_not_sliced():
     builder = _Builder()
     builder.image(pymupdf.Rect(360, 80, 520, 500))

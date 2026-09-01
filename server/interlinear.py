@@ -1178,6 +1178,26 @@ _STRIP_HEIGHT = 0.6
 # paragraph- and region-level attachments are the deliberate way to go further.
 _CUT_LOOKUP = 0.75
 
+# The cut check's view of the page: its pixels at this many per point. A cut
+# asks one question — does the page CHANGE from one row to the next here — and
+# 2 px/pt resolves the anti-aliased fringe of a hairline rule to a couple of
+# rows, which is all the question needs.
+_CUT_SCALE = 2.0
+
+# A grey step this big between vertically neighbouring pixels is something
+# drawn, not a gradient. Same reasoning and same number as the raster lane's
+# {@link _RASTER_EDGE_STEP}: type and line art clear it by a wide margin, a
+# background's soft blend stays under it.
+_CUT_EDGE_STEP = 20
+
+# How far up its gap a cut may be walked while looking for clean air, in
+# points. A face whose metrics under-report its ascent (run44's subset `35`
+# reports a 28 pt title as starting 16 pt below where its glyphs really do)
+# leaves the free gap running down into the letters, and the walk is what
+# finds the top of them again. Bounded because a gap on a mostly-blank page
+# can be hundreds of points tall and every step costs a mask query.
+_CUT_WALK = 24.0
+
 # Region splitting. A corridor is the strongest evidence a page has two
 # independent flows, so columns are looked for first — but only in a region
 # tall enough to hold more than one line of text. Splitting a single line at
@@ -1224,6 +1244,60 @@ def _text_ink(page: pymupdf.Page) -> list[pymupdf.Rect]:
                     if span["text"].strip()]
         finally:
             pymupdf.TOOLS.set_small_glyph_heights(False)
+
+
+class _CutRows:
+    """Where the page is vertically constant — the only place it may be cut.
+
+    Every account this module takes of what is drawn is an approximation of
+    one question: may the page be sliced here and a hairline of it stretched
+    over the band that opens? A span's bbox answers it from the FONT's
+    metrics, and a font's metrics can lie. run44's title face — the subset
+    `AAAAAB+35` — reports its 28 pt title as starting at y 63.0 while the
+    glyphs reach up to y 47.2, so the free gap above the title ran 16 pt down
+    into the letters, the cut landed inside them, the sliced ascenders were
+    left behind above the band, the 0.6 pt strip smeared them down it as gold
+    bars, and the gloss was drawn on the wreckage. 16 of that document's 17
+    pages.
+
+    So the page is rasterised once and asked directly: a row of pixels that
+    differs from the row under it is somewhere the page changes, and a strip
+    taken there cannot be stretched invisibly. A vertical rule passing through
+    is unchanged from row to row and stays allowed, exactly as
+    {@link _cut_items} always intended.
+    """
+
+    def __init__(self, page: pymupdf.Page) -> None:
+        self.rect = page.rect
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(_CUT_SCALE, _CUT_SCALE),
+                              colorspace=pymupdf.csGRAY, alpha=False)
+        grey = (numpy.frombuffer(pix.samples, numpy.uint8)
+                .reshape(pix.height, pix.stride)[:, :pix.width]
+                .astype(numpy.int16))
+        step = numpy.abs(numpy.diff(grey, axis=0)) > _CUT_EDGE_STEP
+        # Row `y` of the integral counts the steps in source rows < y, so a
+        # query over [y0, y1) is one subtraction whatever the height.
+        self._integral = numpy.pad(step.cumsum(0).cumsum(1).astype(numpy.int64),
+                                   ((1, 0), (1, 0)))
+
+    def constant(self, x0: float, x1: float, y0: float, y1: float) -> bool:
+        """Is the page unchanging down [y0, y1] across [x0, x1]?"""
+        rows, cols = self._integral.shape[0] - 1, self._integral.shape[1] - 1
+        left = min(max(int((x0 - self.rect.x0) * _CUT_SCALE), 0), cols)
+        right = min(max(int((x1 - self.rect.x0) * _CUT_SCALE) + 1, left), cols)
+        # A step between rows n and n+1 sits at index n, so a strip spanning
+        # source rows [a, b] is asked about steps [a - 1, b] — the boundaries
+        # into and out of it are part of what stretching it would smear.
+        top = min(max(int((y0 - self.rect.y0) * _CUT_SCALE) - 1, 0), rows)
+        bottom = min(max(int((y1 - self.rect.y0) * _CUT_SCALE) + 1, top), rows)
+
+        if right <= left or bottom <= top:
+            # Off the rendered page: nothing is known, and unknown is not a
+            # place to cut.
+            return False
+
+        return not (self._integral[bottom, right] - self._integral[top, right]
+                    - self._integral[bottom, left] + self._integral[top, left])
 
 
 def _cut_items(drawing: dict) -> list[pymupdf.Rect]:
@@ -1516,14 +1590,22 @@ def _split_region(rect: pymupdf.Rect, blockers: list[pymupdf.Rect], depth: int,
 
 
 def _cut_above(line: pymupdf.Rect, gaps: list[tuple[float, float]],
-               blockers: list[pymupdf.Rect], limit: float,
-               strict: bool) -> tuple[float, float] | None:
+               blockers: list[pymupdf.Rect], limit: float, strict: bool,
+               clean: Callable[[float, float], bool] | None = None,
+               ) -> tuple[float, float] | None:
     """`(cut, strip)` — where the region may be opened for `line`, or None.
 
     `strict` is what makes a gloss belong to its line: the cut must be
     reachable from the line with nothing of the page in between, so a gloss is
     never hung above someone else's paragraph. The paragraph- and region-level
     attachments drop it deliberately, having already decided to sit further up.
+
+    `clean(cut, strip)` is the page's own pixels vetting the result
+    ({@link _CutRows}). The gap this works in is built from object bounds, and
+    where those under-report their ink the gap runs down inside the glyphs —
+    so the cut is walked back UP the gap until the page agrees there is
+    nothing there. Walking up costs the gloss a little of its closeness to the
+    line; cutting through the line costs the reader the line.
     """
     top = line.y0
     found = None
@@ -1550,6 +1632,15 @@ def _cut_above(line: pymupdf.Rect, gaps: list[tuple[float, float]],
         return None
 
     cut = ceiling - strip / 2
+
+    if clean is not None:
+        floor = max(low + strip / 2, ceiling - strip / 2 - _CUT_WALK)
+
+        while not clean(cut, strip):
+            cut -= strip
+
+            if cut < floor:
+                return None
 
     if strict:
         for mark in blockers:
@@ -1905,6 +1996,20 @@ def _spaced_page(target: pymupdf.Document, source: pymupdf.Document, index: int,
     root = _split_region(rect, blockers, 0, rect)
     leaves = root.leaves()
     gaps = {id(leaf): _free_gaps(blockers, leaf.rect) for leaf in leaves}
+    # The page's own pixels, which every cut is checked against before it is
+    # committed. One render per page, shared by every leaf on it.
+    rows = _CutRows(page)
+
+    def cleaner(leaf: _Region) -> Callable[[float, float], bool]:
+        # The strip is copied across the whole leaf, so the whole leaf's width
+        # is what has to be constant — not just the line's own span.
+        def clean(cut: float, strip: float) -> bool:
+            return rows.constant(leaf.rect.x0, leaf.rect.x1,
+                                 cut - strip / 2, cut + strip / 2)
+
+        return clean
+
+    clean_for = {id(leaf): cleaner(leaf) for leaf in leaves}
     reach: dict[int, float] = {}
 
     for leaf in leaves:
@@ -1948,7 +2053,7 @@ def _spaced_page(target: pymupdf.Document, source: pymupdf.Document, index: int,
         for line, _chunk in units:
             leaf = _leaf_for(line, leaves)
             found.append((leaf, _cut_above(line, gaps[id(leaf)], blockers,
-                                           limit, True)))
+                                           limit, True, clean_for[id(leaf)])))
 
         if all(cut for _leaf, cut in found):
             # Line by line: the gloss sits directly over the words it renders.
@@ -1965,7 +2070,8 @@ def _spaced_page(target: pymupdf.Document, source: pymupdf.Document, index: int,
             line = units[0][0]
             leaf = _leaf_for(line, leaves)
             cut = _cut_above(line, gaps[id(leaf)], blockers,
-                             line.y0 - leaf.rect.y0 + 1.0, False)
+                             line.y0 - leaf.rect.y0 + 1.0, False,
+                             clean_for[id(leaf)])
             attached = [(leaf, cut, line, text)] if cut else None
 
         if attached is None:
