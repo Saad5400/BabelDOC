@@ -2046,6 +2046,162 @@ class Typesetting:
                     best = dx
         return best
 
+    # A layout region is only allowed to stand for its members when they
+    # agree: this much of a member must lie inside the region, and their
+    # translations must not differ by more than this many points.
+    REGION_MEMBER_COVERAGE = 0.6
+    REGION_MEMBER_DX_TOLERANCE = 0.5
+
+    def _layout_region_anchors(
+        self,
+        page: il_version_1.Page,
+        member_anchors: list[tuple[tuple[float, float, float, float], float]],
+    ) -> list[tuple[tuple[float, float, float, float], float]]:
+        """Anchors from the page's own layout regions.
+
+        A vector path that BRACKETS a group — a parenthesis around a
+        fraction, a rule under a heading — reaches outside the box of the
+        text it belongs to, so containment in a paragraph box misses it and
+        the first larger paragraph that does contain it captures it
+        instead. run39 p15's second worked example lost its parentheses
+        that way: its own text moved by -414.58 pt while the parentheses
+        took the -229.11 pt of the blue paragraph above, and the delivered
+        page showed an empty pair of brackets 180 pt from its fraction.
+
+        The regions the page was parsed into are the grouping the document
+        itself declares, so let a region stand as an anchor for the
+        elements inside it — but only when the members it contains all
+        move together, since a region that spans two groups cannot speak
+        for either.
+        """
+        anchors: list[tuple[tuple[float, float, float, float], float]] = []
+        for layout in page.page_layout or []:
+            if layout.class_name == "fallback_line":
+                continue
+            box = layout.box
+            if box is None or None in (box.x, box.y, box.x2, box.y2):
+                continue
+            members = [
+                (member_box, dx)
+                for member_box, dx in member_anchors
+                if self._box_coverage(member_box, box)
+                >= self.REGION_MEMBER_COVERAGE
+            ]
+            if not members:
+                continue
+            dxs = [dx for _member_box, dx in members]
+            if max(dxs) - min(dxs) > self.REGION_MEMBER_DX_TOLERANCE:
+                continue
+            anchors.append(
+                (
+                    (
+                        min(box.x, *(m[0][0] for m in members)),
+                        min(box.y, *(m[0][1] for m in members)),
+                        max(box.x2, *(m[0][2] for m in members)),
+                        max(box.y2, *(m[0][3] for m in members)),
+                    ),
+                    dxs[0],
+                )
+            )
+        return anchors
+
+    # Layout classes that stand for a piece of GRAPHIC content, i.e. the
+    # regions that can speak for a raster placement's visible extent.
+    GRAPHIC_REGION_CLASSES = frozenset({"figure", "table"})
+    # A region may stand for a placement's ink only if it is essentially
+    # INSIDE that placement: padding makes the ink smaller than the box,
+    # never larger. The allowance covers the detector's own quantisation
+    # (integer pixel boxes, expanded by one pixel) — run14 p22's figure
+    # region reaches 4.09 pt past its placement on the left for that
+    # reason, while run67 p6's region reaches 74.8 pt past its raster
+    # because it is drawn around the raster AND its label column.
+    GRAPHIC_REGION_SLOP_PT = 6.0
+    # And it must actually be that placement rather than a piece of it:
+    # run67 p5's only figure region covers a third of the full-page
+    # background raster it sits on.
+    GRAPHIC_REGION_MIN_COVERAGE = 0.7
+    # Below this the correction is indistinguishable from detector noise,
+    # so the placement keeps its own reflection. run14 p22's real padding
+    # asks for 23.65 pt.
+    GRAPHIC_REGION_MIN_CORRECTION_PT = 10.0
+
+    def _graphic_dx(self, page: il_version_1.Page, box, pivot: float) -> float:
+        """Mirror translation for a placed graphic.
+
+        A raster's PLACEMENT box is not what the reader sees: an image
+        whose alpha mask is empty down one side is placed wider than it
+        prints, and reflecting the placement therefore moves the visible
+        picture by the width of the padding. run14 p22, MEASURED: the
+        figure is placed at x[275.09,505.56] but its soft mask is empty
+        past column 550 of 602, so it prints to x=486.04 — 19.5 pt of
+        nothing on the right. Reflected as placed it printed from x=89.2,
+        which is 16.8 pt OUTSIDE the slide's own border at x=106.0, and its
+        opaque background painted over that border.
+
+        The layout regions were detected on the RENDERED page, so where a
+        region sits INSIDE a placement and fills most of it, the region is
+        that placement's ink and reflecting it puts the picture back where
+        it belongs. A region that reaches outside the placement is
+        something else — a figure drawn around the raster and its labels —
+        and speaking for the raster with it would drag the picture away
+        from the text that stayed put.
+        """
+        own = pivot - box.x - box.x2
+        best_coverage = self.GRAPHIC_REGION_MIN_COVERAGE
+        best = None
+        for layout in page.page_layout or []:
+            if layout.class_name not in self.GRAPHIC_REGION_CLASSES:
+                continue
+            region = layout.box
+            if region is None or None in (
+                region.x, region.y, region.x2, region.y2
+            ):
+                continue
+            slop = self.GRAPHIC_REGION_SLOP_PT
+            if (
+                region.x < box.x - slop
+                or region.y < box.y - slop
+                or region.x2 > box.x2 + slop
+                or region.y2 > box.y2 + slop
+            ):
+                continue  # reaches outside the placement: not its ink
+            coverage = self._box_coverage(
+                (box.x, box.y, box.x2, box.y2), region
+            )
+            if coverage > best_coverage:
+                best_coverage = coverage
+                best = region
+        if best is None:
+            return own
+        corrected = pivot - best.x - best.x2
+        if abs(corrected - own) < self.GRAPHIC_REGION_MIN_CORRECTION_PT:
+            return own
+        return corrected
+
+    @staticmethod
+    def _region_box(region: list[float]) -> il_version_1.Box:
+        return il_version_1.Box(
+            x=float(region[0]),
+            y=float(region[1]),
+            x2=float(region[2]),
+            y2=float(region[3]),
+        )
+
+    @staticmethod
+    def _box_coverage(
+        box: tuple[float, float, float, float], container
+    ) -> float:
+        """Fraction of `box`'s area that lies inside `container`."""
+        x, y, x2, y2 = box
+        area = (x2 - x) * (y2 - y)
+        if area <= 0:
+            return 0.0
+        overlap_x = min(x2, container.x2) - max(x, container.x)
+        overlap_y = min(y2, container.y2) - max(y, container.y)
+        if overlap_x <= 0 or overlap_y <= 0:
+            return 0.0
+        return (overlap_x * overlap_y) / area
+
     def _mirror_scope(
         self,
         page: il_version_1.Page,
@@ -2069,7 +2225,7 @@ class Typesetting:
                 # An image-OCR label rides its raster image: the image
                 # mirrors as a rigid translation (content never flips), so
                 # the label gets exactly the image's dx, not its own.
-                dx = pivot - region[0] - region[2]
+                dx = self._graphic_dx(page, self._region_box(region), pivot)
                 self._shift_raster_region(paragraph, dx)
             else:
                 dx = pivot - box.x - box.x2
@@ -2084,6 +2240,9 @@ class Typesetting:
         # Paragraph boxes are the more precise anchors; cluster bboxes only
         # apply when no paragraph contains the element (smallest wins).
         paragraph_anchors.extend(cluster_anchors)
+        paragraph_anchors.extend(
+            self._layout_region_anchors(page, paragraph_anchors)
+        )
 
         for curve in page.pdf_curve:
             if not in_scope(curve.xobj_id) or not self._box_is_valid(curve.box):
@@ -2103,7 +2262,7 @@ class Typesetting:
                 continue
             dx = self._find_anchor_dx(paragraph_anchors, form.box)
             if dx is None:
-                dx = pivot - form.box.x - form.box.x2
+                dx = self._graphic_dx(page, form.box, pivot)
             if abs(dx) < 1e-6:
                 continue
             self._shift_box_x(form.box, dx)
@@ -2115,7 +2274,7 @@ class Typesetting:
             region = self._raster_region(rect)
             if region is not None:
                 # An image-OCR mask rides its raster image, like its label.
-                dx = pivot - region[0] - region[2]
+                dx = self._graphic_dx(page, self._region_box(region), pivot)
                 self._shift_raster_region(rect, dx)
             else:
                 dx = pivot - rect.box.x - rect.box.x2
@@ -2126,7 +2285,7 @@ class Typesetting:
             if not in_scope(getattr(figure, "xobj_id", None)):
                 continue
             if self._box_is_valid(figure.box):
-                dx = pivot - figure.box.x - figure.box.x2
+                dx = self._graphic_dx(page, figure.box, pivot)
                 if abs(dx) >= 1e-6:
                     self._shift_box_x(figure.box, dx)
 
