@@ -9,6 +9,7 @@ from babeldoc.format.pdf.document_il.il_version_1 import Page
 from babeldoc.format.pdf.document_il.il_version_1 import PdfCharacter
 from babeldoc.format.pdf.document_il.il_version_1 import PdfFormula
 from babeldoc.format.pdf.document_il.il_version_1 import PdfLine
+from babeldoc.format.pdf.document_il.il_version_1 import PdfParagraph
 from babeldoc.format.pdf.document_il.il_version_1 import PdfParagraphComposition
 from babeldoc.format.pdf.document_il.il_version_1 import PdfSameStyleCharacters
 from babeldoc.format.pdf.document_il.il_version_1 import PdfStyle
@@ -755,6 +756,21 @@ class StylesAndFormulas:
         return [members for _baseline, members in rows]
 
     @classmethod
+    def _paragraph_is_one_stack(cls, paragraph: PdfParagraph) -> bool:
+        """True when the paragraph is nothing but one stacked line.
+
+        A stack that shares its paragraph with prose cannot be made
+        unbreakable: the line filler has nowhere to put a 250 pt
+        indivisible unit after a sentence, and on run39 p10 it drew the
+        formula straight over the Arabic it follows (2 span overlaps
+        became 12). Only a paragraph that IS the stack becomes one block.
+        """
+        compositions = paragraph.pdf_paragraph_composition or []
+        return len(compositions) == 1 and cls._is_vertical_stack(
+            compositions[0].pdf_line
+        )
+
+    @classmethod
     def _is_vertical_stack(cls, line: PdfLine | None) -> bool:
         """True when the line puts one row of characters above another."""
         if line is None or not line.pdf_character:
@@ -1004,10 +1020,17 @@ class StylesAndFormulas:
             for line_index, composition in enumerate(
                 paragraph.pdf_paragraph_composition
             ):
-                if self._is_vertical_stack(composition.pdf_line):
+                if self._paragraph_is_one_stack(paragraph):
                     # One rigid block: a fraction's rows are positioned
                     # against each other, so anything that lays its parts
                     # out independently takes it apart.
+                    #
+                    # Only when the paragraph IS the stack. A stack that
+                    # shares its paragraph with prose cannot be made
+                    # unbreakable: the line filler has nowhere to put a
+                    # 250 pt indivisible unit after a sentence, and on
+                    # run39 p10 it drew the formula straight over the
+                    # Arabic it follows.
                     stacked = self.create_composition(
                         composition.pdf_line.pdf_character, True, line_index
                     )

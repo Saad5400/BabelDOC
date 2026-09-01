@@ -231,3 +231,29 @@ def test_fallback_line_regions_are_not_anchors():
         )
         == []
     )
+
+
+def test_a_stack_sharing_its_paragraph_with_prose_is_left_alone():
+    # run39 p10: the same construct, but the paragraph also carries the
+    # sentence that introduces it. An indivisible 250 pt unit cannot be
+    # placed after a sentence, and the line filler drew the formula
+    # straight over the Arabic — 2 span overlaps became 12. Only a
+    # paragraph that IS the stack becomes one block.
+    sentence = _line(
+        _row("Converting 5.3 cm2 to m2 will be:", 49.0, 320.0, 263.0, 332.0)
+    )
+    alone = il_version_1.PdfParagraph(
+        box=_box(285.8, 475.7, 543.5, 512.5),
+        pdf_paragraph_composition=[
+            il_version_1.PdfParagraphComposition(pdf_line=FRACTION)
+        ],
+    )
+    with_prose = il_version_1.PdfParagraph(
+        box=_box(49.0, 253.0, 543.5, 332.0),
+        pdf_paragraph_composition=[
+            il_version_1.PdfParagraphComposition(pdf_line=sentence),
+            il_version_1.PdfParagraphComposition(pdf_line=FRACTION),
+        ],
+    )
+    assert _styles()._paragraph_is_one_stack(alone)
+    assert not _styles()._paragraph_is_one_stack(with_prose)
