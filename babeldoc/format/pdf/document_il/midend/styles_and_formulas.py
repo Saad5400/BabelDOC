@@ -162,6 +162,10 @@ class StylesAndFormulas:
         # Identities of PdfFormula objects created from code paragraphs.
         # These must never be split or converted back to translatable text.
         self._code_formula_ids: set[int] = set()
+        # Identities of PdfFormula objects created from a VERTICAL STACK —
+        # a fraction and anything else built by putting one row of
+        # characters above another. Same contract: one rigid block.
+        self._stacked_formula_ids: set[int] = set()
 
     def update_formula_data(self, formula: PdfFormula):
         update_formula_data(formula)
@@ -671,6 +675,7 @@ class StylesAndFormulas:
     def process_page(self, page: Page):
         """处理页面，包括公式识别和偏移量计算"""
         self._code_formula_ids.clear()
+        self._stacked_formula_ids.clear()
         self.detect_code_paragraphs(page)
         self.process_page_formulas(page)
         # self.process_page_offsets(page)
@@ -698,6 +703,82 @@ class StylesAndFormulas:
         max_x = max(char.visual_bbox.box.x2 for char in line.pdf_character)
         max_y = max(char.visual_bbox.box.y2 for char in line.pdf_character)
         line.box = Box(min_x, min_y, max_x, max_y)
+
+    # ------------------------------------------------------------------
+    # Vertical stacks (a fraction is a group, not a sequence)
+    # ------------------------------------------------------------------
+
+    # A stacked construct is one LINE whose characters sit on more than one
+    # baseline, with one row placed above another in the same column. Read
+    # as a sequence its parts are independent, so RTL mirroring reverses
+    # them against each other and the numerator lands beside the
+    # denominator instead of above it (run39 p15: source numerator
+    # x[356.2,424.3] over denominator x[376.8,403.7], 19 pt apart and
+    # concentric; delivered numerator x[455.1,506.5] and denominator
+    # x[416.7,438.7], 4.5 pt apart and horizontally DISJOINT).
+    #
+    # Two baselines alone do not make a stack — a superscript is two
+    # baselines too. What makes it a stack is that the rows occupy the same
+    # COLUMN: they overlap horizontally. MEASURED over 14 real pages from 8
+    # production documents, only 4 lines have more than one baseline band,
+    # all 4 are fractions, and every one of them overlaps by 1.00 of the
+    # narrower row; nothing else in the sample reaches 0.5.
+    STACK_BASELINE_TOLERANCE = 0.5
+    STACK_MIN_ROW_OVERLAP = 0.5
+    STACK_MIN_ROW_CHARS = 2
+
+    @classmethod
+    def _baseline_rows(cls, line: PdfLine) -> list[list[PdfCharacter]]:
+        """The line's characters grouped by the baseline they sit on."""
+        chars = [
+            char
+            for char in line.pdf_character
+            if char.box is not None
+            and char.box.y is not None
+            and char.char_unicode
+            and not char.char_unicode.isspace()
+        ]
+        if not chars:
+            return []
+        heights = sorted(char.box.y2 - char.box.y for char in chars)
+        tolerance = max(
+            0.5, cls.STACK_BASELINE_TOLERANCE * heights[len(heights) // 2]
+        )
+        rows: list[tuple[float, list[PdfCharacter]]] = []
+        for char in sorted(chars, key=lambda c: -c.box.y):
+            for baseline, members in rows:
+                if abs(char.box.y - baseline) <= tolerance:
+                    members.append(char)
+                    break
+            else:
+                rows.append((char.box.y, [char]))
+        return [members for _baseline, members in rows]
+
+    @classmethod
+    def _is_vertical_stack(cls, line: PdfLine | None) -> bool:
+        """True when the line puts one row of characters above another."""
+        if line is None or not line.pdf_character:
+            return False
+        rows = [
+            row
+            for row in cls._baseline_rows(line)
+            if len(row) >= cls.STACK_MIN_ROW_CHARS
+        ]
+        if len(rows) < 2:
+            return False
+        spans = [
+            (min(c.box.x for c in row), max(c.box.x2 for c in row))
+            for row in rows
+        ]
+        for index, (x0, x1) in enumerate(spans):
+            for other_x0, other_x1 in spans[index + 1 :]:
+                narrower = min(x1 - x0, other_x1 - other_x0)
+                if narrower <= 0:
+                    continue
+                overlap = min(x1, other_x1) - max(x0, other_x0)
+                if overlap / narrower >= cls.STACK_MIN_ROW_OVERLAP:
+                    return True
+        return False
 
     def _classify_characters_in_composition(
         self,
@@ -923,6 +1004,17 @@ class StylesAndFormulas:
             for line_index, composition in enumerate(
                 paragraph.pdf_paragraph_composition
             ):
+                if self._is_vertical_stack(composition.pdf_line):
+                    # One rigid block: a fraction's rows are positioned
+                    # against each other, so anything that lays its parts
+                    # out independently takes it apart.
+                    stacked = self.create_composition(
+                        composition.pdf_line.pdf_character, True, line_index
+                    )
+                    self._stacked_formula_ids.add(id(stacked.pdf_formula))
+                    new_paragraph_compositions.append(stacked)
+                    continue
+
                 (
                     tagged_chars,
                     first_is_bullet,
@@ -1304,6 +1396,10 @@ class StylesAndFormulas:
         if id(formula) in self._code_formula_ids:
             # Code paragraphs must stay verbatim.
             return False
+        if id(formula) in self._stacked_formula_ids:
+            # A stacked construct is one rigid block: turning any part of
+            # it back into text re-flows that part out of the stack.
+            return False
         if all(char.formula_layout_id for char in formula.pdf_character):
             return False
 
@@ -1317,6 +1413,10 @@ class StylesAndFormulas:
 
         if id(formula) in self._code_formula_ids:
             # Code paragraphs are preserved as one block; never split them.
+            return False
+        if id(formula) in self._stacked_formula_ids:
+            # Splitting a stack at its comma detaches numerator from
+            # denominator: the halves are then placed independently.
             return False
         if all(x.formula_layout_id for x in formula.pdf_character):
             return False
