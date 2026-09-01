@@ -595,9 +595,19 @@ def _finalize(composed: bytes, *, fmt: str, sidecar: dict | None,
         # until this rewrites what each glyph claims to be. The mono's own
         # body arrives already repaired; these strips are drawn fresh here
         # and would otherwise be the one broken layer in the file.
+        #
+        # Guarded like every other optional layer in this file — and for one
+        # concrete reason: it lands with the engine-text fix, so on a build
+        # without that fix an unguarded call would take the vocab strips and
+        # the compacting save down with it, trading a text layer for the
+        # page itself.
         from server import page_fonts
 
-        page_fonts.repair_arabic_text_layer(doc)
+        try:
+            page_fonts.repair_arabic_text_layer(doc)
+        except Exception:  # noqa: BLE001 - a text layer is never worth a page
+            logger.exception("compose: repairing the Arabic text layer "
+                             "failed; shipping the dual as drawn")
 
         out = BytesIO()
         # garbage=4 folds the per-page copies of the merged sources' fonts
