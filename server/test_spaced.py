@@ -923,3 +923,110 @@ def test_a_raster_label_rides_its_image_down_the_opened_page():
 
     for rect in inside:
         assert any(plate.contains(rect) for plate in plates)
+
+
+def test_a_label_boxed_in_by_table_rules_is_still_glossed():
+    """The pixel veto can never be cleared by a label in a table cell.
+
+    There is a rule a couple of points above it and another a couple below,
+    so neither band is ever quiet — and 738 of the corpus's 1058 in-image
+    blocks were skipped for it (run59 96.6%, run39 93.2%). run39 p6 is a
+    physics slide whose entire content is two rendered tables of SI units,
+    delivered untranslated.
+
+    A translucent plate clipping a table rule is a far better outcome for the
+    reader than an untranslated table.
+    """
+    builder = _Builder()
+    image = pymupdf.Rect(100, 200, 400, 440)
+    label = pymupdf.Rect(150, 300, 260, 312)
+
+    scale = 4
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(
+        0, 0, int(image.width * scale), int(image.height * scale)))
+    pix.set_rect(pix.irect, (250, 250, 250))
+
+    def bar(rect, color):
+        pix.set_rect(pymupdf.IRect(int((rect.x0 - image.x0) * scale),
+                                   int((rect.y0 - image.y0) * scale),
+                                   int((rect.x1 - image.x0) * scale),
+                                   int((rect.y1 - image.y0) * scale)), color)
+
+    # A row of the table: the label, with a rule two points above and below.
+    bar(label, (40, 40, 60))
+    bar(pymupdf.Rect(image.x0, label.y0 - 3, image.x1, label.y0 - 2),
+        (30, 30, 30))
+    bar(pymupdf.Rect(image.x0, label.y1 + 2, image.x1, label.y1 + 3),
+        (30, 30, 30))
+    builder.page.insert_image(image, pixmap=pix)
+
+    height = PAGE[1]
+    sidecar = builder.sidecar()
+    sidecar["pages"][0]["blocks"].append({
+        "box": [label.x0, height - label.y1, label.x1, height - label.y0],
+        "lines": [[label.x0, height - label.y1, label.x1, height - label.y0]],
+        "source": "candela",
+        "target": AR_TWO,
+        "font_size": 10.0,
+        "label": "plain text",
+        "on_raster": True,
+        "region": [image.x0, height - image.y1, image.x1, height - image.y0],
+    })
+
+    pdf, report = interlinear.render_overlay(builder.pdf(), sidecar,
+                                             style=STYLE)
+
+    assert report["raster_drawn"] == 1, "the boxed-in label got no gloss"
+    assert report["raster_skipped"] == 0
+
+    # Drawn on the artwork, but never on the label it glosses.
+    inside = [rect for rect in _arabic(pdf) if image.contains(rect)]
+    assert inside
+
+    for rect in inside:
+        overlap = rect & label
+        assert not overlap.is_valid or overlap.is_empty
+
+
+def test_a_crowded_plate_never_covers_another_label():
+    """What the crowded retry may still not do."""
+    builder = _Builder()
+    image = pymupdf.Rect(100, 200, 400, 440)
+    rows = [pymupdf.Rect(150, 290 + index * 16, 260, 302 + index * 16)
+            for index in range(3)]
+
+    scale = 4
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(
+        0, 0, int(image.width * scale), int(image.height * scale)))
+    pix.set_rect(pix.irect, (250, 250, 250))
+
+    for row in rows:
+        pix.set_rect(pymupdf.IRect(int((row.x0 - image.x0) * scale),
+                                   int((row.y0 - image.y0) * scale),
+                                   int((row.x1 - image.x0) * scale),
+                                   int((row.y1 - image.y0) * scale)),
+                     (40, 40, 60))
+
+    builder.page.insert_image(image, pixmap=pix)
+
+    height = PAGE[1]
+    sidecar = builder.sidecar()
+    sidecar["pages"][0]["blocks"] += [{
+        "box": [row.x0, height - row.y1, row.x1, height - row.y0],
+        "lines": [[row.x0, height - row.y1, row.x1, height - row.y0]],
+        "source": f"row {index}",
+        "target": AR_TWO,
+        "font_size": 10.0,
+        "label": "plain text",
+        "on_raster": True,
+        "region": [image.x0, height - image.y1, image.x1, height - image.y0],
+    } for index, row in enumerate(rows)]
+
+    pdf, _report = interlinear.render_overlay(builder.pdf(), sidecar,
+                                              style=STYLE)
+
+    for rect in _arabic(pdf):
+        for row in rows:
+            overlap = rect & row
+            assert not overlap.is_valid or overlap.is_empty, \
+                f"a gloss was drawn over the label at {row}"

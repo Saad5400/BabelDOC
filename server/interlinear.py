@@ -141,6 +141,22 @@ _RASTER_INK_DILATION = 2
 # forgiven and anything that could be part of a letter is not.
 _RASTER_INK_TOLERANCE = 0.003
 
+# What a plate may sit on when the alternative is no gloss at all. The strict
+# tolerance above can never be cleared by a label in a TABLE CELL — there is a
+# rule a couple of points above it and another a couple below, so neither band
+# is ever quiet — and a dense diagram is the same story. 738 of the corpus's
+# 1058 in-image blocks were skipped for it: run59 96.6%, run39 93.2%, and
+# run39 p6 is a physics slide whose entire content is two rendered tables of
+# SI units, delivered untranslated.
+#
+# A translucent plate clipping a table rule is a far better outcome for the
+# reader than an untranslated table, so a label with nowhere quiet to go is
+# offered the crowded band instead of being given up on. What it may still
+# never cover is another LABEL — the plate is kept off every other block's own
+# box — and it is drawn at the legibility floor so it covers as little as it
+# can.
+_RASTER_CROWDED_TOLERANCE = 0.4
+
 # Corner rounding of the legibility plate, as the fraction of its short side
 # pymupdf's draw_rect wants. Enough to read as a tag laid on the artwork
 # rather than a patch torn out of it.
@@ -820,8 +836,9 @@ class _RegionInk:
 
         self._integral = numpy.pad(edge.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
 
-    def inky(self, rect: pymupdf.Rect) -> bool:
-        """Does a plate here sit on something that was drawn?"""
+    def inky(self, rect: pymupdf.Rect,
+             tolerance: float = _RASTER_INK_TOLERANCE) -> bool:
+        """Does a plate here sit on more than `tolerance` of what was drawn?"""
         rows, cols = self._integral.shape[0] - 1, self._integral.shape[1] - 1
         x0 = max(int((rect.x0 - self.clip.x0) * _RASTER_SCALE), 0)
         y0 = max(int((rect.y0 - self.clip.y0) * _RASTER_SCALE), 0)
@@ -837,13 +854,14 @@ class _RegionInk:
         count = (self._integral[y1, x1] - self._integral[y0, x1]
                  - self._integral[y1, x0] + self._integral[y0, x0])
 
-        return count > area * _RASTER_INK_TOLERANCE
+        return count > area * tolerance
 
 
 def _raster_placement(layout: _Layout, text: str, anchor: pymupdf.Rect,
                       region: pymupdf.Rect, source_size: float,
-                      ink: _RegionInk,
-                      taken: list[pymupdf.Rect]) -> tuple[pymupdf.Rect, float] | None:
+                      ink: _RegionInk, taken: list[pymupdf.Rect],
+                      tolerance: float = _RASTER_INK_TOLERANCE,
+                      ) -> tuple[pymupdf.Rect, float] | None:
     """Where one raster gloss's plate would go — nothing is drawn.
 
     The band directly above the label first — a gloss reads as belonging to
@@ -853,6 +871,11 @@ def _raster_placement(layout: _Layout, text: str, anchor: pymupdf.Rect,
     quiet". A size step that would land the plate on a border or a neighbour
     shrinks past it; a label with no quiet pixels either way is given up on,
     and the caller counts it.
+
+    A raised `tolerance` is the crowded retry — see
+    {@link _RASTER_CROWDED_TOLERANCE}. It asks the same questions in the same
+    order and only accepts more ink under the answer, at the smallest size
+    that is still worth reading.
 
     Only the plate comes back: the text's own rect is derived from it at draw
     time by peeling the padding off.
@@ -875,9 +898,15 @@ def _raster_placement(layout: _Layout, text: str, anchor: pymupdf.Rect,
         (max(region.x0, anchor.x0 - stretch), min(region.x1, anchor.x1 + stretch)),
     ))
 
+    crowded = tolerance > _RASTER_INK_TOLERANCE
     start = min(max(source_size * options.scale, options.min_font_size),
                 options.max_font_size)
     floor = options.min_font_size * options.squeeze
+
+    if crowded:
+        # Nothing here is free, so the plate takes the least it can and stops
+        # at the floor the layout calls legible rather than below it.
+        start = floor = options.min_font_size
 
     for below in (False, True):
         for span_x0, span_x1 in spans:
@@ -902,7 +931,7 @@ def _raster_placement(layout: _Layout, text: str, anchor: pymupdf.Rect,
 
                 if (plate.y0 >= region.y0 and plate.y1 <= region.y1
                         and not any(plate.intersects(other) for other in taken)
-                        and not ink.inky(plate)):
+                        and not ink.inky(plate, tolerance)):
                     return plate, size
 
                 if size <= floor:
@@ -935,6 +964,11 @@ def _render_raster(page: pymupdf.Page, blocks: list[dict], layout: _Layout,
     typical = _typical_size(blocks)
     masks: dict[tuple[float, float, float, float], _RegionInk] = {}
     taken: list[pymupdf.Rect] = []
+    placed: list[tuple[dict, pymupdf.Rect, pymupdf.Rect, float]] = []
+    # Every label on the page, which is the one thing a crowded plate may
+    # still never cover — a gloss that hides the word it glosses, or its
+    # neighbour, has taken more than it gave.
+    labels: list[pymupdf.Rect] = []
     drawn = skipped = 0
 
     for block in blocks:
@@ -955,9 +989,36 @@ def _render_raster(page: pymupdf.Page, blocks: list[dict], layout: _Layout,
         if key not in masks:
             masks[key] = _RegionInk(page, region)
 
+        labels.append(anchor)
         source_size = _source_size(block, anchor, typical)
         found = _raster_placement(layout, block["target"].strip(), anchor,
                                   region, source_size, masks[key], taken)
+
+        if found is None:
+            # Nowhere quiet. Held back rather than skipped: the crowded retry
+            # below runs once every label that COULD have a quiet band has
+            # taken one, so a plate that has to sit on the artwork is never
+            # the reason another label lost its clean place.
+            placed.append((block, anchor, region, source_size))
+            continue
+
+        plate, size = found
+        pad = options.plate_padding
+        # Plate first, text second: the text must sit ON the plate, and both
+        # over the artwork.
+        page.draw_rect(plate, color=None, fill=plate_rgb,
+                       fill_opacity=options.plate_opacity, radius=_PLATE_RADIUS)
+        layout.draw(page, plate + (pad, pad, -pad, -pad),
+                    block["target"].strip(), size, align="center")
+        taken.append(plate)
+        drawn += 1
+
+    for block, anchor, region, source_size in placed:
+        found = _raster_placement(
+            layout, block["target"].strip(), anchor, region, source_size,
+            masks[tuple(region)],
+            taken + [label for label in labels if label != anchor],
+            _RASTER_CROWDED_TOLERANCE)
 
         if found is None:
             skipped += 1
@@ -965,8 +1026,6 @@ def _render_raster(page: pymupdf.Page, blocks: list[dict], layout: _Layout,
 
         plate, size = found
         pad = options.plate_padding
-        # Plate first, text second: the text must sit ON the plate, and both
-        # over the artwork.
         page.draw_rect(plate, color=None, fill=plate_rgb,
                        fill_opacity=options.plate_opacity, radius=_PLATE_RADIUS)
         layout.draw(page, plate + (pad, pad, -pad, -pad),
