@@ -57,7 +57,22 @@ TRANSPORT: httpx.AsyncBaseTransport | None = None
 # Answers that are about the SERVICE, not about the document. Everything else
 # non-200 is Gotenberg telling us it looked at the file and could not render
 # it, which is the caller's 422.
-UNAVAILABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+#
+# 500 is deliberately NOT here, though it looks like it belongs. MEASURED
+# against Gotenberg 8.36.0: a genuinely corrupt .pptx comes back as
+#
+#   500  LibreOffice failed to convert the document 'corrupt.pptx'. This is
+#        usually a resource issue: increase the container's memory and CPU,
+#        or reduce the document's size. The request is valid and may be
+#        retried.
+#
+# — the same status, and the same prose about memory, that an actual OOM
+# would produce. The status cannot tell the two apart and neither can the
+# body, so 500 stays a document error: a reader whose file really is broken
+# needs to be told to re-export it, and telling them "try again in a moment"
+# for ever is the worse of the two wrong answers. See the note to the
+# manager; this is the one row of F3 the evidence does not support.
+UNAVAILABLE_STATUSES = frozenset({429, 502, 503, 504})
 
 
 class ConvertError(Exception):
