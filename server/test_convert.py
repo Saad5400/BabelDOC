@@ -213,6 +213,91 @@ def _uploaded_name(request: httpx.Request) -> str:
     return body[at:body.index(b'"', at)].decode()
 
 
+# --------------------------------------------------------------------------
+# The 503-vs-422 promise, asserted where the caller actually reads it
+# --------------------------------------------------------------------------
+
+#: (what Gotenberg does, the status /v1/convert must answer with).
+#: The existing tests below assert the exception CLASS, which is a weaker
+#: statement than the one catodemy relies on: its retry keys off the HTTP
+#: status (NormalizeToPdf retries 502/503/504 and nothing else), so a fault
+#: that reaches it as 422 is not merely mis-worded, it is un-retryable.
+CONVERT_FAULTS = [
+    # Reaching the service at all. ConnectTimeout and PoolTimeout are
+    # subclasses of TimeoutException, so the old ordering caught them in the
+    # "the render timed out" branch and blamed the document — which is what a
+    # hibernated or restarting Gotenberg looks like from here.
+    ("connect-timeout", httpx.ConnectTimeout, 503),
+    ("pool-timeout", httpx.PoolTimeout, 503),
+    ("connect-error", httpx.ConnectError, 503),
+    ("protocol-error", httpx.RemoteProtocolError, 503),
+    # Answers about the service rather than the document.
+    ("429-rate-limited", 429, 503),
+    ("502-bad-gateway", 502, 503),
+    ("503-queue-full", 503, 503),
+    ("504-gateway-timeout", 504, 503),
+    # Answers about the document.
+    ("400-bad-request", 400, 422),
+    ("500-libreoffice-failed", 500, 422),
+    ("200-but-not-a-pdf", (200, b"<html>error</html>"), 422),
+]
+
+
+@pytest.mark.parametrize(("name", "fault", "expected"),
+                         CONVERT_FAULTS,
+                         ids=[row[0] for row in CONVERT_FAULTS])
+def test_the_endpoint_tells_a_busy_service_from_a_bad_document(
+        client, monkeypatch, name, fault, expected):
+    """What /v1/convert answers, for each way the render can go wrong.
+
+    500 is deliberately a 422. MEASURED against the real Gotenberg 8.36.0, a
+    genuinely corrupt .pptx answers 500 with prose about memory saying the
+    request "may be retried" — the same status and the same words an actual
+    resource failure produces. Neither separates them, so it stays the
+    document's fault: a reader whose file really is broken has to be told to
+    re-export it.
+    """
+    if isinstance(fault, tuple):
+        transport = _replies(*fault)
+    elif isinstance(fault, int):
+        transport = _replies(fault, b"gotenberg says something")
+    else:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise fault("simulated", request=request)
+
+        transport = _transport(handler)
+
+    monkeypatch.setattr(convert, "TRANSPORT", transport)
+
+    response = client.post(
+        "/v1/convert",
+        headers={"X-Internal-Token": TOKEN},
+        files={"file": ("05-OS.pptx", b"deck",
+                        "application/vnd.openxmlformats-officedocument."
+                        "presentationml.presentation")},
+    )
+
+    assert response.status_code == expected, (
+        f"{name}: /v1/convert answered {response.status_code}, expected "
+        f"{expected} — {response.text[:200]}")
+
+
+def test_a_503_never_tells_the_reader_their_file_is_broken(client, monkeypatch):
+    """The wording, not just the status: this is the lie the class exists to
+    stop, and it is the sentence the user reads."""
+    monkeypatch.setattr(convert, "TRANSPORT", _replies(502, b"bad gateway"))
+
+    response = client.post(
+        "/v1/convert", headers={"X-Internal-Token": TOKEN},
+        files={"file": ("05-OS.pptx", b"deck", "application/octet-stream")})
+
+    assert response.status_code == 503
+    detail = response.json()["detail"].lower()
+    assert "unavailable" in detail or "busy" in detail, detail
+    for lie in ("corrupt", "re-export", "password"):
+        assert lie not in detail, detail
+
+
 @pytest.mark.anyio
 async def test_a_full_queue_reads_as_busy_not_as_a_bad_document(monkeypatch):
     """503 is Gotenberg's bounded queue, and the wording has to say so.

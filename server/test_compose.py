@@ -55,6 +55,24 @@ def _text_pdf(marker: str, size: tuple[float, float]) -> bytes:
     return bytes(out)
 
 
+@pytest.fixture(autouse=True)
+def arabic_text_layer_repair(monkeypatch):
+    """`page_fonts.repair_arabic_text_layer` while its branch is unmerged.
+
+    compose calls it on every finished dual (the fresh vocab strips are
+    drawn here, so their broken text layer is this module's to repair). The
+    function itself belongs to server/page_fonts.py and lands with the
+    engine-text fix; until then a no-op stands in, so these tests exercise
+    the composition rather than the absence of a dependency. Once it is
+    there, this fixture does nothing and the real one runs.
+    """
+    from server import page_fonts
+
+    if not hasattr(page_fonts, "repair_arabic_text_layer"):
+        monkeypatch.setattr(page_fonts, "repair_arabic_text_layer",
+                            lambda _doc: 0, raising=False)
+
+
 @pytest.fixture(scope="module")
 def original_pdf() -> bytes:
     return _pdf([LETTER] * 3)
@@ -126,12 +144,27 @@ def test_alternating_keeps_page_order_of_text(client):
     assert "TRANSMARK" in pages[1].extract_text()
 
 
-def test_a_longer_translated_appends_its_tail_instead_of_pairing_blanks(
+def test_an_unexplained_longer_translated_is_refused(client, original_pdf,
+                                                     translated_pdf):
+    # Swap the inputs: original (2 pages) shorter than translated (3 pages),
+    # with nothing saying why. The extra page could be an appended tail — or
+    # a «كلمات هذه الصفحة» page the mono run had to INSERT between content
+    # pages, in which case pairing positionally mis-pairs every unit after
+    # it. Unknowable here, so it is refused rather than guessed.
+    for fmt in ("alternating", "side_by_side"):
+        resp = _post(client, translated_pdf, original_pdf, fmt)
+        assert resp.status_code == 422
+        assert "artifact_layout" in resp.json()["detail"]
+
+
+def test_a_longer_translated_appends_its_tail_when_the_layout_explains_it(
         client, original_pdf, translated_pdf):
-    # Swap the inputs: original (2 pages) shorter than translated (3 pages).
-    # A mono result may end with appended appendix pages of its own, so the
-    # tail is kept whole at the end rather than interleaved against blanks.
-    resp = _post(client, translated_pdf, original_pdf, "alternating")
+    # The same shape, with the sidecar's layout saying all three pages are
+    # content: the extra one is then known to be a tail and is appended
+    # whole at the end rather than interleaved against a blank.
+    resp = _post_with_sidecar(
+        client, translated_pdf, original_pdf, "alternating",
+        _sidecar_json(3, artifact_layout={"content_pages": [0, 1, 2]}))
     assert resp.status_code == 200
     pages = _pages(resp)
     assert len(pages) == 5  # 2 pairs + 1 tail page
@@ -141,7 +174,9 @@ def test_a_longer_translated_appends_its_tail_instead_of_pairing_blanks(
 
 def test_side_by_side_appends_the_translated_tail_full_width(
         client, original_pdf, translated_pdf):
-    resp = _post(client, translated_pdf, original_pdf, "side_by_side")
+    resp = _post_with_sidecar(
+        client, translated_pdf, original_pdf, "side_by_side",
+        _sidecar_json(3, artifact_layout={"content_pages": [0, 1, 2]}))
     assert resp.status_code == 200
     pages = _pages(resp)
     assert len(pages) == 3  # 2 pairs + 1 tail page
@@ -332,22 +367,24 @@ def test_baked_strips_are_cropped_back_off_before_composing(client):
 def test_a_pre_feature_sidecar_still_tail_trims_by_total_pages(client):
     # No "vocab", no "artifact_layout" — a sidecar from before this feature,
     # sent with a translated input that carries a baked tail past
-    # total_pages. The tail is dropped, nothing is interleaved.
-    original = _pdf([LETTER] * 2)
+    # total_pages. The tail is dropped, nothing is interleaved. (Three
+    # originals, so the input is not LONGER than the original and the
+    # trim is a trim rather than a guess — see the refusal test above.)
+    original = _pdf([LETTER] * 3)
     translated = _pdf([A4] * 2 + [(500.0, 500.0)])
     resp = _post_with_sidecar(client, original, translated, "alternating",
                               _sidecar_json(2))
     assert resp.status_code == 200
     pages = _pages(resp)
     assert (500.0, 500.0) not in [_size(p) for p in pages]
-    assert len(pages) == 4
-    assert [_size(p) for p in pages] == [LETTER, A4, LETTER, A4]
+    assert len(pages) == 6
+    assert [_size(p) for p in pages[:4]] == [LETTER, A4, LETTER, A4]
 
 
 def test_a_crafted_artifact_layout_is_refused_whole(client):
     # Duplicated / non-increasing positions would double pages; the layout is
     # ignored and the total_pages tail-trim takes over.
-    original = _pdf([LETTER] * 2)
+    original = _pdf([LETTER] * 3)
     translated = _pdf([A4] * 2 + [(500.0, 500.0)])
     resp = _post_with_sidecar(
         client, original, translated, "alternating",
@@ -468,3 +505,251 @@ def test_a_junk_vocab_value_is_422(client, original_pdf, translated_pdf):
                               "alternating", _sidecar_json(2, vocab=VOCAB),
                               vocab="maybe")
     assert resp.status_code == 422
+
+
+# --------------------------------------------------------------------------
+# What the finished document carries: one compacting save, the inputs' own
+# declarations, the original's outline, the seam, and /Rotate
+# --------------------------------------------------------------------------
+
+def _imaged_pdf(pages: int, size: tuple[float, float] = A4) -> bytes:
+    """`pages` pages all showing the SAME image.
+
+    A composed page merges its two sources' resources into itself, so a
+    shared image is exactly what a dual duplicates if nothing folds it back
+    together afterwards.
+    """
+    import pymupdf
+
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 160, 160))
+    pix.set_rect(pix.irect, (255, 255, 255))
+    for x in range(0, 160, 2):  # stripes: cheap to build, poor to compress
+        pix.set_rect(pymupdf.IRect(x, 0, x + 1, 160), (17 * x % 256,) * 3)
+    image = pix.tobytes("png")
+
+    doc = pymupdf.open()
+    try:
+        for _ in range(pages):
+            page = doc.new_page(width=size[0], height=size[1])
+            page.insert_image(pymupdf.Rect(20, 20, size[0] - 20, size[1] - 20),
+                              stream=image)
+        return doc.tobytes(garbage=4, deflate=True)
+    finally:
+        doc.close()
+
+
+def _declaring_pdf(pages: int, *, title: str | None = None,
+                   lang: str | None = None, direction: str | None = None,
+                   outline: list | None = None,
+                   rotation: dict[int, int] | None = None) -> bytes:
+    """A PDF that declares things about itself, for the carry-over tests."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    try:
+        for index in range(pages):
+            page = doc.new_page(width=A4[0], height=A4[1])
+            page.insert_text((72, 72), f"PAGE{index}", fontsize=24)
+            if rotation and index in rotation:
+                page.set_rotation(rotation[index])
+        if title:
+            doc.set_metadata({**(doc.metadata or {}), "title": title})
+        if lang:
+            doc.xref_set_key(doc.pdf_catalog(), "Lang",
+                             pymupdf.get_pdf_str(lang))
+        if direction:
+            doc.xref_set_key(doc.pdf_catalog(), "ViewerPreferences/Direction",
+                             direction)
+        if outline:
+            doc.set_toc(outline)
+        return doc.tobytes()
+    finally:
+        doc.close()
+
+
+def _opened(response):
+    import pymupdf
+
+    return pymupdf.open(stream=BytesIO(response.content), filetype="pdf")
+
+
+def test_an_interleaved_mono_without_its_layout_is_refused_not_mis_paired(
+        client):
+    # The shape the engine's own vocab fallback produces: content, vocab,
+    # content, vocab. Told which pages are content, the dual pairs them
+    # exactly; not told, the same file would pair unit 2 with a VOCAB page
+    # — so it is refused instead.
+    from pypdf import PdfWriter as _Writer
+
+    merged = _Writer()
+    for marker in ("CONTENTA", "VOCABA", "CONTENTB", "VOCABB"):
+        merged.append(BytesIO(_text_pdf(marker, A4)))
+    buf = BytesIO()
+    merged.write(buf)
+    translated = buf.getvalue()
+    original = _pdf([LETTER] * 2)
+
+    refused = _post_with_sidecar(client, original, translated, "alternating",
+                                 _sidecar_json(2))
+    assert refused.status_code == 422
+
+    resp = _post_with_sidecar(
+        client, original, translated, "alternating",
+        _sidecar_json(2, artifact_layout={"content_pages": [0, 2]}))
+    assert resp.status_code == 200
+    pages = _pages(resp)
+    assert len(pages) == 4
+    assert "CONTENTA" in pages[1].extract_text()
+    assert "CONTENTB" in pages[3].extract_text()
+    joined = " ".join(page.extract_text() for page in pages)
+    assert "VOCAB" not in joined
+
+
+def test_the_dual_is_compacted_whether_or_not_the_vocab_layer_runs(client):
+    # The vocab path used to be the only one that re-serialized the
+    # document, so it was the only one that ever got a compacting save:
+    # asking for NO word list handed the reader a file up to 3.4x larger
+    # than the same pages with one.
+    original, translated = _imaged_pdf(4), _imaged_pdf(4)
+    sidecar = _sidecar_json(4, vocab=VOCAB)
+    with_vocab = _post_with_sidecar(client, original, translated,
+                                    "side_by_side", sidecar)
+    without = _post_with_sidecar(client, original, translated, "side_by_side",
+                                 sidecar, vocab="0")
+    assert with_vocab.status_code == without.status_code == 200
+    # Dropping a layer must never grow the file.
+    assert len(without.content) <= len(with_vocab.content)
+    # And the one image the eight merged halves share is stored once.
+    doc = _opened(without)
+    try:
+        xrefs = {image[0] for index in range(doc.page_count)
+                 for image in doc.get_page_images(index)}
+    finally:
+        doc.close()
+    assert len(xrefs) == 1
+
+
+def test_the_dual_inherits_what_the_mono_declares_about_itself(client):
+    original = _declaring_pdf(2, title="the user's own upload", lang="en")
+    translated = _declaring_pdf(2, title="الترجمة", lang="ar",
+                                direction="/R2L")
+    resp = _post(client, original, translated, "alternating")
+    assert resp.status_code == 200
+    doc = _opened(resp)
+    try:
+        assert doc.metadata["title"] == "الترجمة"
+        assert "ar" in doc.xref_get_key(doc.pdf_catalog(), "Lang")[1]
+        assert doc.xref_get_key(doc.pdf_catalog(),
+                                "ViewerPreferences/Direction")[1] == "/R2L"
+    finally:
+        doc.close()
+
+
+def test_a_mono_without_a_title_hands_the_originals_through(client):
+    original = _declaring_pdf(2, title="the user's own upload")
+    resp = _post(client, original, _declaring_pdf(2), "alternating")
+    assert resp.status_code == 200
+    doc = _opened(resp)
+    try:
+        assert doc.metadata["title"] == "the user's own upload"
+    finally:
+        doc.close()
+
+
+@pytest.mark.parametrize(("fmt", "expected"), [("alternating", [1, 5]),
+                                               ("side_by_side", [1, 3])])
+def test_the_originals_outline_is_remapped_onto_the_units(client, fmt,
+                                                          expected):
+    # Original pages 1 and 3 are bookmarked; in the dual those units start
+    # at pages 1 and 5 (alternating) / 1 and 3 (side_by_side) — the unit's
+    # ORIGINAL page, where the reader starts reading it.
+    original = _declaring_pdf(3, outline=[[1, "Start", 1],
+                                          [2, "Middle", 3]])
+    resp = _post(client, original, _declaring_pdf(3), fmt)
+    assert resp.status_code == 200
+    doc = _opened(resp)
+    try:
+        toc = doc.get_toc(simple=True)
+    finally:
+        doc.close()
+    assert [title for _level, title, _page in toc] == ["Start", "Middle"]
+    assert [page for _level, _title, page in toc] == expected
+
+
+def test_side_by_side_draws_a_gutter_at_the_seam(client):
+    resp = _post(client, _pdf([LETTER] * 2), _pdf([LETTER] * 2),
+                 "side_by_side")
+    assert resp.status_code == 200
+    doc = _opened(resp)
+    try:
+        page = doc[0]
+        seams = [drawing for drawing in page.get_drawings()
+                 if abs(drawing["rect"].x0 - page.rect.width / 2) < 1
+                 and abs(drawing["rect"].x1 - page.rect.width / 2) < 1]
+    finally:
+        doc.close()
+    assert len(seams) == 1  # one hairline, full height, on the midline
+    assert seams[0]["rect"].height == pytest.approx(LETTER[1])
+
+
+def test_alternating_draws_no_gutter(client):
+    resp = _post(client, _pdf([LETTER] * 2), _pdf([LETTER] * 2),
+                 "alternating")
+    assert resp.status_code == 200
+    doc = _opened(resp)
+    try:
+        assert [len(page.get_drawings()) for page in doc] == [0] * 4
+    finally:
+        doc.close()
+
+
+def test_side_by_side_keeps_a_rotated_page_the_way_it_displays(client):
+    # A /Rotate 90 page DISPLAYS landscape; merged content does not carry
+    # the attribute, so without baking it the page would be drawn upright
+    # inside a portrait half — sideways to the reader.
+    original = _declaring_pdf(2, rotation={1: 90})
+    resp = _post(client, original, _declaring_pdf(2), "side_by_side")
+    assert resp.status_code == 200
+    pages = _pages(resp)
+    # Page 2's original half is A4 landscape, so the half is A4's height
+    # wide and the page twice that.
+    assert _size(pages[0]) == (2 * A4[0], A4[1])
+    assert _size(pages[1]) == (2 * A4[1], A4[1])
+
+
+def test_the_arabic_text_layer_is_repaired_after_the_strips_and_before_saving(
+        client, monkeypatch):
+    # The dual inherits the mono's repaired body, but its «كلمات هذه
+    # الصفحة» strips are drawn FRESH here — so the repair has to run on
+    # this document, once the strips are on it and while it can still be
+    # saved.
+    from server import page_fonts
+
+    seen: dict[str, object] = {}
+
+    def spy(doc):
+        seen["pages"] = doc.page_count
+        seen["strips"] = "declared" in doc[1].get_text()
+        doc[0].insert_text((72, 200), "REPAIRRAN", fontsize=18)
+        return 1
+
+    monkeypatch.setattr(page_fonts, "repair_arabic_text_layer", spy,
+                        raising=False)
+    resp = _post_with_sidecar(client, _pdf([LETTER] * 2), _pdf([A4] * 2),
+                              "alternating", _sidecar_json(2, vocab=VOCAB))
+    assert resp.status_code == 200
+    assert seen["pages"] == 4
+    assert seen["strips"] is True          # after the strips were drawn
+    assert "REPAIRRAN" in _page_text(resp, 0)  # and before the save
+
+
+def test_the_dual_carries_no_empty_info_entries(client):
+    # pymupdf writes every metadata key it is handed, so a careless
+    # carry-over puts a null /Author and /Trapped into a delivered file.
+    resp = _post(client, _declaring_pdf(2, title="عنوان"), _declaring_pdf(2),
+                 "side_by_side")
+    assert resp.status_code == 200
+    info = PdfReader(BytesIO(resp.content)).metadata
+    assert info["/Title"] == "عنوان"
+    assert all(value is not None and str(value) != ""
+               for value in info.values())

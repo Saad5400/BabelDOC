@@ -172,3 +172,102 @@ def test_a_non_pdf_is_422(client):
 def test_missing_token_is_401(client):
     resp = _post(client, _blank_pdf([A4]), _sidecar_json(1), token=None)
     assert resp.status_code == 401
+
+
+# --------------------------------------------------------------------------
+# the text layer of a mono this engine did not draw
+# --------------------------------------------------------------------------
+
+def _arabic_classes(pdf_bytes: bytes) -> tuple[int, int]:
+    """(base letters, presentation forms) in a PDF's extracted text.
+
+    Deliberately NOT NFKC-normalized, unlike `_doc_facts`: that fold turns
+    presentation forms into the base letters this counts, which is exactly
+    the difference under test.
+    """
+    doc = pymupdf.open(stream=BytesIO(pdf_bytes), filetype="pdf")
+    try:
+        text = "".join(page.get_text() for page in doc)
+    finally:
+        doc.close()
+
+    base = sum(1 for ch in text
+               if "ؠ" <= ch <= "ي" or "ٱ" <= ch <= "ۓ")
+    presentation = sum(1 for ch in text
+                       if "ﭐ" <= ch <= "﷿"
+                       or "ﹰ" <= ch <= "﻿")
+
+    return base, presentation
+
+
+AR_BODY = "تغيير البرمجيات أمر لا مفر منه، وهو ما تفترضه هذه الصفحة"
+
+
+def _mono_as_banked() -> bytes:
+    """Two A4 pages of Arabic body text, drawn and saved the way a run banked
+    before the CMap fix left it.
+
+    The same `insert_htmlbox` + subset-font path the pipeline draws Arabic
+    through, and then a plain save with NO text-layer repair — so the file
+    renders correctly and extracts as glyph shapes, which is precisely the
+    state of all 87 translations already sitting in production.
+    """
+    fonts = page_fonts.PageFonts([AR_BODY])
+    doc = pymupdf.open()
+
+    for _ in range(2):
+        page = doc.new_page(width=A4[0], height=A4[1])
+        page.insert_htmlbox(pymupdf.Rect(60, 60, A4[0] - 60, 400),
+                            f"<div>{AR_BODY}</div>",
+                            css=fonts.css, archive=fonts.archive)
+
+    out = BytesIO()
+    doc.save(out, garbage=4, deflate=True)
+    doc.close()
+
+    return out.getvalue()
+
+
+def test_a_mono_banked_before_the_cmap_fix_comes_back_searchable(client):
+    """The reason this endpoint repairs a text layer it did not draw.
+
+    Every run banked before the CMap fix stores its Arabic as presentation
+    forms, and those are the runs readers reach for this endpoint with — it
+    exists to re-cut an ALREADY finished translation. A legacy sidecar is the
+    sharpest case: there is nothing to strip, so before the repair these bytes
+    came back exactly as banked, glyph soup and all.
+    """
+    translated = _mono_as_banked()
+    base_in, presentation_in = _arabic_classes(translated)
+    # The fixture really is an old-engine artifact: its shaped Arabic extracts
+    # as glyph shapes rather than as letters.
+    assert presentation_in > 0
+    assert presentation_in > base_in
+
+    resp = _post(client, translated, _sidecar_json(2))
+
+    assert resp.status_code == 200
+    base_out, presentation_out = _arabic_classes(resp.content)
+    # Every shape is now a letter, and no Arabic was lost turning it into one.
+    assert presentation_out == 0
+    assert base_out >= base_in + presentation_in
+    # ...and the reader can actually find it.
+    doc = pymupdf.open(stream=BytesIO(resp.content), filetype="pdf")
+    try:
+        assert any(page.search_for("البرمجيات") for page in doc)
+    finally:
+        doc.close()
+
+
+def test_a_mono_with_no_arabic_is_returned_byte_for_byte(client):
+    """The repair must not cost the no-op its no-op.
+
+    A document with nothing to fix is handed back unserialized — which is
+    what keeps a legacy strip cheap and a current-engine mono free.
+    """
+    translated = _blank_pdf([A4] * 2)
+
+    resp = _post(client, translated, _sidecar_json(2))
+
+    assert resp.status_code == 200
+    assert resp.content == translated
