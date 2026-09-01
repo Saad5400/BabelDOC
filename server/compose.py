@@ -489,8 +489,13 @@ def _carry_properties(doc, properties: dict[str, str], outline: list,
     itself chose.
     """
     if properties.get("title"):
-        doc.set_metadata({**(doc.metadata or {}),
-                          "title": properties["title"]})
+        # Only what is actually set: pymupdf writes every key it is handed,
+        # so passing its own read-back would put a null /Author, /Subject
+        # and /Trapped into a delivered file.
+        kept = {key: value for key, value in (doc.metadata or {}).items()
+                if isinstance(value, str) and value
+                and key not in ("format", "encryption")}
+        doc.set_metadata({**kept, "title": properties["title"]})
 
     catalog = doc.pdf_catalog()
 
@@ -609,8 +614,11 @@ def compose_dual(original_bytes: bytes, translated_bytes: bytes,
                  vocab: bool = True) -> bytes:
     """Build the requested dual variant; raises ComposeError on bad input.
 
-    `sidecar` is optional and changes nothing when absent — see the module
-    docstring for what a sidecar adds.
+    `sidecar` is optional — see the module docstring for what one adds. The
+    one thing its absence changes is a translated input LONGER than the
+    original: only its "artifact_layout" can say whether those pages are an
+    appended tail or vocab pages sitting between content pages, so without
+    it that build is refused ({@link _reconcile}) rather than mis-paired.
 
     `vocab=False` is the caller opting out of the «كلمات هذه الصفحة» layer
     for THIS download: the baked-in vocab is still taken back out exactly as

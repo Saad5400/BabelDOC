@@ -741,3 +741,15 @@ def test_the_arabic_text_layer_is_repaired_after_the_strips_and_before_saving(
     assert seen["pages"] == 4
     assert seen["strips"] is True          # after the strips were drawn
     assert "REPAIRRAN" in _page_text(resp, 0)  # and before the save
+
+
+def test_the_dual_carries_no_empty_info_entries(client):
+    # pymupdf writes every metadata key it is handed, so a careless
+    # carry-over puts a null /Author and /Trapped into a delivered file.
+    resp = _post(client, _declaring_pdf(2, title="عنوان"), _declaring_pdf(2),
+                 "side_by_side")
+    assert resp.status_code == 200
+    info = PdfReader(BytesIO(resp.content)).metadata
+    assert info["/Title"] == "عنوان"
+    assert all(value is not None and str(value) != ""
+               for value in info.values())
