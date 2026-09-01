@@ -2478,6 +2478,25 @@ def render_overlay(original_bytes: bytes, sidecar: Any,
 
         report["vocab_pages"] = vocab_added
 
+        # Every glyph in the gloss font claims to BE its contextual shape, so
+        # the Arabic drawn above the reader's lines extracts, copies and
+        # searches as presentation forms rather than as letters — Ctrl+F for a
+        # word that is visibly on the page finds nothing. The repair rewrites
+        # what each glyph claims to be; the save below persists it.
+        #
+        # Guarded like every other optional layer here, and for one concrete
+        # reason: it lands with the engine-text fix, so on a build without
+        # that fix an unguarded call would take the vocab layer and the
+        # compacting save down with it — trading a text layer for the page
+        # itself, which is what it cost the duals.
+        try:
+            from server import page_fonts
+
+            page_fonts.repair_arabic_text_layer(doc)
+        except Exception:  # noqa: BLE001 - a text layer is never worth a page
+            logger.exception("%s: repairing the Arabic text layer failed; "
+                             "returning the overlay as drawn", style)
+
         out = BytesIO()
         # garbage=4 is what collapses the one-font-copy-per-box the Story
         # engine leaves behind into a single embedded subset.

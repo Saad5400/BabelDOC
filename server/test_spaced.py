@@ -663,6 +663,66 @@ def test_a_page_number_in_the_margin_does_not_become_its_own_column():
 
 
 # --------------------------------------------------------------------------
+# the text layer under the gloss
+# --------------------------------------------------------------------------
+
+def test_the_arabic_text_layer_repair_never_costs_the_overlay():
+    """The repair lands with the engine-text fix; this file must not need it.
+
+    An unguarded call on a build without that fix took compose's whole
+    finishing pass down with it — every dual came back with no vocab strips
+    and none of the compacting save. A text layer is never worth the page it
+    is written on.
+    """
+    builder = _tight_list()
+
+    def explode(_doc):
+        raise RuntimeError("no repair on this build")
+
+    from server import page_fonts
+
+    before = getattr(page_fonts, "repair_arabic_text_layer", None)
+    page_fonts.repair_arabic_text_layer = explode
+
+    try:
+        pdf, report = _render(builder)
+    finally:
+        if before is None:
+            del page_fonts.repair_arabic_text_layer
+        else:
+            page_fonts.repair_arabic_text_layer = before
+
+    assert report["drawn"] == 5
+    assert len(_gloss_lines(pdf)) == 5
+
+
+def test_the_arabic_text_layer_repair_is_offered_the_finished_document():
+    builder = _tight_list()
+    seen = []
+
+    def record(doc):
+        seen.append(doc.page_count)
+
+        return 0
+
+    from server import page_fonts
+
+    before = getattr(page_fonts, "repair_arabic_text_layer", None)
+    page_fonts.repair_arabic_text_layer = record
+
+    try:
+        _render(builder)
+    finally:
+        if before is None:
+            del page_fonts.repair_arabic_text_layer
+        else:
+            page_fonts.repair_arabic_text_layer = before
+
+    # Called once, after the pages are built and before the save.
+    assert seen == [1]
+
+
+# --------------------------------------------------------------------------
 # pages this layout hands back untouched
 # --------------------------------------------------------------------------
 
