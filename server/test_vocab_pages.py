@@ -304,6 +304,22 @@ def test_attach_junk_vocab_touches_nothing():
     doc.close()
 
 
+def test_a_page_with_no_anchor_is_dropped_out_loud(caplog):
+    # A key past the end of the document — what a model that echoed a printed
+    # slide number produces — used to take a whole page of words with it in
+    # silence.
+    doc = _doc(pages=2)
+
+    with caplog.at_level("WARNING", logger="doctranslate.vocab_pages"):
+        added = vocab_pages.attach_vocab(
+            doc, {"0": _rows(2), "9": _rows(3)}, {0: 0, 1: 1})
+
+    assert set(added) == {0}
+    assert "9" in caplog.text
+    assert "3 word(s)" in caplog.text
+    doc.close()
+
+
 def test_the_strip_lives_at_negative_pdf_y():
     # The compose restore contract: the strip occupies exactly
     # [mediabox.y0, y0 + height) below the original zero line, so cropping
