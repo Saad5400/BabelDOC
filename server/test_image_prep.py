@@ -242,3 +242,42 @@ def _probe_ocr_words(page):
         single.save(probe_src)
         image_prep.prep_document(probe_src, probe_dst, f"{td}/r.json")
         return pymupdf.open(probe_dst)[0].get_text("words")
+
+
+# ---------------------------------------------------------------------------
+# legibility floor
+
+
+def _region_ops(size_px, px_per_pt=4.0):
+    """build_region_ops output for one synthetic OCR line of `size_px`."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=PAGE[0], height=PAGE[1])
+    font = pymupdf.Font("helv")
+    words = [_word(0, 0, 120, size_px, text="Definition")]
+    line = _line(words, x_size=size_px)
+    ops = image_prep.build_region_ops(
+        [line], pymupdf.Rect(100, 100, 400, 250), px_per_pt,
+        ~page.transformation_matrix, font)
+    doc.close()
+    return ops
+
+
+def test_build_region_ops_skips_sub_legible_lines():
+    # A diagram micro-label: recognised at 4 pt on the page. Replacing the
+    # crisp raster with 4 pt vector Arabic is a smear over the artwork, so
+    # the run is not injected and the source pixels stay.
+    assert _region_ops(size_px=4.0 * 4.0) == []
+
+
+def test_build_region_ops_keeps_legible_lines():
+    # The same label at 10 pt is real content and must still be injected.
+    ops = _region_ops(size_px=10.0 * 4.0)
+    assert len(ops) == 1
+    assert "Tf 3 Tr" in ops[0]          # still an invisible run
+    assert "(Definition) Tj" in ops[0]
+
+
+def test_build_region_ops_skips_zero_size_ocr_noise():
+    # Every 0.00 pt "line" in the real corpus is a mis-recognised diagram
+    # stroke ('=', '0+0=2'), never text.
+    assert _region_ops(size_px=0.0) == []
