@@ -328,3 +328,72 @@ def test_a_non_pdf_is_422(client):
 def test_missing_token_is_401(client):
     resp = _post(client, _pdf(), "bottom", token=None)
     assert resp.status_code == 401
+
+
+# --------------------------------------------------------------------------
+# the text layer of pages this endpoint widens but did not draw
+# --------------------------------------------------------------------------
+
+AR_BODY = "تغيير البرمجيات أمر لا مفر منه، وهو ما تفترضه هذه الصفحة"
+
+
+def _arabic_classes(pdf_bytes: bytes) -> tuple[int, int]:
+    """(base letters, presentation forms) in a PDF's extracted text."""
+    doc = pymupdf.open(stream=BytesIO(pdf_bytes), filetype="pdf")
+    try:
+        text = "".join(page.get_text() for page in doc)
+    finally:
+        doc.close()
+
+    base = sum(1 for ch in text if "ؠ" <= ch <= "ي" or "ٱ" <= ch <= "ۓ")
+    presentation = sum(1 for ch in text
+                       if "ﭐ" <= ch <= "﷿" or "ﹰ" <= ch <= "﻿")
+
+    return base, presentation
+
+
+def _mono_as_banked() -> bytes:
+    """An A4 page of Arabic drawn the way the pipeline draws it, saved with no
+    text-layer repair — the state of every run banked before the CMap fix."""
+    from server import page_fonts
+
+    fonts = page_fonts.PageFonts([AR_BODY])
+    doc = pymupdf.open()
+    page = doc.new_page(width=PAGE[0], height=PAGE[1])
+    page.insert_htmlbox(pymupdf.Rect(60, 60, PAGE[0] - 60, 400),
+                        f"<div>{AR_BODY}</div>",
+                        css=fonts.css, archive=fonts.archive)
+    out = BytesIO()
+    doc.save(out, garbage=4, deflate=True)
+    doc.close()
+
+    return out.getvalue()
+
+
+def test_ruled_margins_do_not_hand_back_an_unsearchable_copy(client):
+    """A printed study copy of an old run must still be a searchable file.
+
+    These pages were drawn by whichever engine translated them, so an already
+    banked run arrives carrying presentation forms. Ruled margins are for
+    reading alongside the text — handing back the one copy the reader cannot
+    search or paste from is exactly the wrong trade.
+    """
+    pdf = _mono_as_banked()
+    base_in, presentation_in = _arabic_classes(pdf)
+    assert presentation_in > 0
+    assert presentation_in > base_in
+
+    resp = _post(client, pdf, "right", size="md")
+
+    assert resp.status_code == 200
+    base_out, presentation_out = _arabic_classes(resp.content)
+    assert presentation_out == 0
+    assert base_out >= base_in + presentation_in
+
+    doc = pymupdf.open(stream=BytesIO(resp.content), filetype="pdf")
+    try:
+        # The band really was added, and the text really is findable.
+        assert doc[0].rect.width > PAGE[0]
+        assert doc[0].search_for("البرمجيات")
+    finally:
+        doc.close()

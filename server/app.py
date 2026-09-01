@@ -7,6 +7,7 @@ import dataclasses
 import functools
 import hmac
 import json
+import logging
 import subprocess
 from contextlib import asynccontextmanager
 from io import BytesIO
@@ -31,6 +32,7 @@ from server import convert
 from server import interlinear
 from server import jobs
 from server import notes_space
+from server import page_fonts
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
@@ -40,6 +42,9 @@ MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 # between any two real documents. MEASURED across the 14 production runs the
 # sweep collected: every correct (document, sidecar) pair agrees exactly.
 GEOMETRY_TOLERANCE = 1.0
+
+
+logger = logging.getLogger("doctranslate.app")
 
 
 def _blocking(func, /, *args, **kwargs):
@@ -518,6 +523,60 @@ async def create_job(
     return {"job_id": job["job_id"], "status": job["status"]}
 
 
+def _repair_stored_text_layer(pdf_bytes: bytes) -> bytes:
+    """Repair the Arabic text layer of a document this engine did not draw.
+
+    The other four call sites all sit where the Arabic is DRAWN — the mono at
+    creation, the dual at compose, the strips at the vocab insert, the glosses
+    at the overlay save. These two endpoints draw nothing: /v1/strip-vocab and
+    /v1/notes-space take a mono that was translated and banked at some point
+    in the past and hand back a variant of it, so whatever text layer that
+    stored file carries is the text layer the reader gets.
+
+    Which matters because of when the CMap fix landed, not because of any
+    defect here: every run banked before it stores presentation forms, and
+    those are exactly the runs a reader reaches for these two endpoints with
+    — they are on-demand variants of an ALREADY FINISHED translation. Without
+    this, a student downloading the plain or ruled copy of last month's
+    translation still gets a file that Ctrl+F cannot search and `pdftotext`
+    returns glyph soup for, and re-translating to fix it would cost the run
+    again. With it, the file is repaired on its next download, for free.
+
+    A document that needs nothing comes back BYTE-FOR-BYTE unchanged: the
+    repair reports how many fonts it rewrote, and on zero the input bytes are
+    returned rather than re-serialized. That keeps the no-op promise
+    {@link compose.strip_vocab} makes for a pre-vocab mono, and it means a
+    file translated by the current engine pays only the read.
+
+    Never raises, for the same reason the other four sites are guarded: a text
+    layer is not worth a download. On any failure the caller gets what it
+    passed in.
+    """
+    try:
+        repair = getattr(page_fonts, "repair_arabic_text_layer", None)
+
+        if repair is None:
+            return pdf_bytes
+
+        doc = pymupdf.open(stream=BytesIO(pdf_bytes), filetype="pdf")
+
+        try:
+            if not repair(doc):
+                return pdf_bytes
+
+            out = BytesIO()
+            doc.save(out, garbage=4, deflate=True)
+
+            return out.getvalue()
+        finally:
+            doc.close()
+    except Exception:  # noqa: BLE001 - a text layer is never worth a download
+        logger.exception("could not repair the stored Arabic text layer; "
+                         "delivering the document as it was banked")
+
+        return pdf_bytes
+
+
 def _pdf_attachment(filename: str | None, suffix: str = "") -> dict[str, str]:
     """The `Content-Disposition` for a PDF built out of `filename`.
 
@@ -766,8 +825,9 @@ async def strip_vocab(
     the sidecar's artifact_layout — baked bottom strips are physically
     redacted off and inserted fallback pages dropped (compose.strip_vocab, the
     same undo /v1/compose performs before pairing). A sidecar without a usable
-    layout means a pre-vocab mono: nothing to strip, the bytes come back
-    unchanged.
+    layout means a pre-vocab mono: nothing to strip, and the bytes come back
+    unchanged unless their Arabic text layer needed repairing on the way out
+    ({@link _repair_stored_text_layer}).
     """
     async with capacity.slot("strip-vocab"):
         translated_bytes = await translated.read()
@@ -795,6 +855,12 @@ async def strip_vocab(
                                      translated_bytes, sidecar_data)
         except compose.ComposeError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        # The mono handed back here was drawn by whichever engine translated
+        # it, which for every run banked before the CMap fix means an Arabic
+        # text layer of presentation forms. Repaired on the way out, so an old
+        # run becomes searchable on its next download instead of on a re-run.
+        result = await _blocking(_repair_stored_text_layer, result)
 
         return Response(content=result, media_type="application/pdf",
                         headers=_pdf_attachment(translated.filename))
@@ -838,6 +904,12 @@ async def add_notes_space(
                                      parsed_sides, size=size)
         except notes_space.NotesSpaceError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        # Same reason as /v1/strip-vocab: the pages this widens were drawn
+        # elsewhere, so the text layer arrives however it was banked. Ruled
+        # margins are for reading alongside the text — a copy the reader
+        # cannot search is exactly the wrong one to print.
+        result = await _blocking(_repair_stored_text_layer, result)
 
         return Response(content=result, media_type="application/pdf",
                         headers=_pdf_attachment(file.filename, "notes"))
