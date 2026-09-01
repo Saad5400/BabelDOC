@@ -68,6 +68,7 @@ MIN_W_PT = 50.0          # placements smaller than this are decorations
 MIN_H_PT = 30.0
 MERGE_OVERLAP = 0.5      # placements overlapping this much (of the smaller
                          # one) OCR as ONE region (stacked shadow + figure)
+MIN_LEGIBLE_PT = 5.5     # OCR lines smaller than this are left as pixels
 TEXT_OVERLAP_KILL = 0.25 # OCR-word area share covered by digital text => dup
 TEXT_PAD_PT = 1.0        # slack around digital spans for the overlap test
 FULL_PAGE_FRAC = 0.60    # region covering this much of the page gets the
@@ -509,6 +510,28 @@ def build_region_ops(lines, clip, px_per_pt, inv_ptm, font, visible=False):
                 # DOWN only (a correct hOCR baseline equals the ink bottom
                 # already, a floated all-caps one sits ~5pt above it)
                 baseline = max(baseline, max(w.y2 for w in ws))
+            if size_pt < MIN_LEGIBLE_PT:
+                # Below the legibility floor, translating this label makes
+                # the page WORSE. The original is a crisp raster label the
+                # reader can zoom into; what replaces it is vector Arabic at
+                # the same tiny size, which is a smear — and, because these
+                # micro-labels cluster inside diagrams, several of them
+                # overprint each other and the artwork underneath.
+                #
+                # Measured over the sweep corpus's 1,058 real image-OCR
+                # blocks: 8.4 % fall below 5.5 pt, and they are concentrated
+                # in exactly the two decks whose figures came out illegible
+                # (run14 44/100 blocks, run30 31/65) while the OCR lane's
+                # real earners are untouched (run59 1/328, run67 0/129,
+                # run38 0/71, run39 0/59, run8 0/49). The floor also
+                # collects the lane's pure noise: every 0.00 pt "line" in
+                # the corpus is a mis-recognised diagram stroke ('=',
+                # '0+0=2').
+                #
+                # Skipping the run leaves the source pixels showing, which
+                # is honest: we do not claim to have translated what we
+                # cannot draw legibly.
+                continue
             natural = font.text_length(text, fontsize=size_pt)
             if natural <= 0:
                 continue
