@@ -13,7 +13,7 @@ semaphore,semaphore,ar
 pipeline,pipeline,ar
 epoch,epoch,ar
 commit,commit,ar
-thread,thread,ar
+thread,خيط (thread),ar
 pitfalls,أخطاء شائعة,ar
 pitfall,خطأ شائع,ar
 regression,الانحدار,ar
@@ -37,10 +37,75 @@ algorithm,خوارزمية,ar
 data structures,هياكل البيانات,ar
 database,قاعدة بيانات,ar
 waterfall,نموذج الشلال (Waterfall),ar
-agile,Agile,ar
+agile,الرشيق (Agile),ar
 framework,إطار عمل,ar
 version control,التحكم بالإصدارات,ar
 repository,مستودع,ar
 unit testing,اختبار الوحدات,ar
 debugging,تصحيح الأخطاء,ar
 throughput,الإنتاجية,ar
+compile,ترجمة,ar
+compiler,مترجم,ar
+compilation,الترجمة,ar
+compiled,مترجم,ar
+interpreter,مفسر,ar
+assembly language,لغة التجميع,ar
+assembler,مجمع,ar
+bytecode,البايت كود (bytecode),ar
+byte-code,البايت كود (bytecode),ar
+Java,Java,ar
+Python,Python,ar
+JavaScript,JavaScript,ar
+JVM,JVM,ar
+Java Virtual Machine,آلة Java الافتراضية (JVM),ar
+JRE,JRE,ar
+Java Runtime Environment,بيئة تشغيل Java (JRE),ar
+JDK,JDK,ar
+Java Development Kit,حزمة تطوير Java (JDK),ar
+IDE,IDE,ar
+garbage collection,جمع المهملات,ar
+statement,عبارة,ar
+statements,عبارات,ar
+module,وحدة برمجية,ar
+modules,وحدات برمجية,ar
+parameter,معامل,ar
+parameters,معاملات,ar
+bit,بت,ar
+bits,بتات,ar
+byte,بايت,ar
+bytes,بايتات,ar
+bitwise,على مستوى البتات,ar
+two's complement,المتمم الثنائي,ar
+sign bit,بت الإشارة,ar
+most significant bit,البت الأعلى دلالة,ar
+least significant bit,البت الأدنى دلالة,ar
+register,مسجل,ar
+registers,المسجلات,ar
+propositional logic,منطق القضايا,ar
+proposition,قضية,ar
+propositions,قضايا,ar
+compound proposition,قضية مركبة,ar
+truth table,جدول الصواب,ar
+truth tables,جداول الصواب,ar
+truth value,قيمة الصواب,ar
+truth values,قيم الصواب,ar
+converse,العكس,ar
+inverse,النقيض,ar
+contrapositive,عكس النقيض,ar
+tautology,تحصيل حاصل,ar
+conjunction,الاقتران,ar
+disjunction,الفصل,ar
+implication,الاستلزام,ar
+biconditional,الشرط المزدوج,ar
+logical equivalence,التكافؤ المنطقي,ar
+discrete structures,التراكيب المتقطعة,ar
+storage area network,شبكة تخزين (SAN),ar
+storage-area network,شبكة تخزين (SAN),ar
+desktop,حاسب مكتبي,ar
+diode,صمام ثنائي (diode),ar
+diodes,صمامات ثنائية (diodes),ar
+significant figures,الأرقام المعنوية,ar
+compiling,ترجمة
+compiles,يترجم
+assemble,تجميع
+assembling,تجميع
