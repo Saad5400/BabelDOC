@@ -35,11 +35,18 @@ class _FakeClient:
             message=SimpleNamespace(content=reply))])
 
 
-def _sidecar(pages: dict[int, str]) -> dict:
+def _sidecar(pages: dict[int, str], targets: dict[int, str] | None = None
+             ) -> dict:
+    """A sidecar whose pages carry `pages` as source — and, where given, the
+    run's own Arabic for that page."""
+    targets = targets or {}
+
     return {"version": 1, "lang_in": "en", "lang_out": "ar",
             "total_pages": len(pages),
             "pages": [{"page_number": number, "mediabox": [0, 0, 595, 842],
-                       "blocks": [{"source": text}], "obstacles": []}
+                       "blocks": [{"source": text,
+                                   "target": targets.get(number, "")}],
+                       "obstacles": []}
                       for number, text in pages.items()]}
 
 
@@ -70,6 +77,14 @@ def test_parse_drops_junk_pages_and_junk_entries():
     }}))
 
     assert parsed == {0: [ENTRY]}
+
+
+def test_parse_says_out_loud_which_entries_a_bad_key_took_with_it(caplog):
+    with caplog.at_level("WARNING", logger="doctranslate.vocab"):
+        vocab.parse_response(json.dumps({"banana": [ENTRY, ENTRY]}))
+
+    assert "banana" in caplog.text
+    assert "2 item(s)" in caplog.text
 
 
 def test_parse_keeps_an_optional_note_and_strips_whitespace():
@@ -115,6 +130,73 @@ def test_the_prompts_own_worked_example_carries_no_tashkeel():
 
 
 # --------------------------------------------------------------------------
+# Placement: the page is DERIVED from the text, never the model's key
+# --------------------------------------------------------------------------
+
+def test_an_entry_lands_on_the_page_its_word_first_occurs_on():
+    # The run14 shape: slides that print their own number as the first text
+    # block, and a model that echoed the printed number instead of the marker.
+    client = _FakeClient([_reply({
+        "2": [{"w": "subtasks", "ar": "مهام فرعية"}],
+        "3": [{"w": "Parallelogram", "ar": "متوازي أضلاع"}],
+    })])
+
+    result = vocab.extract_vocab(_sidecar({
+        0: "1 | Title",
+        1: "2 | breaking a task into smaller subtasks",
+        2: "3 | The Parallelogram denotes input",
+    }), client=client)
+
+    assert result == {"1": [{"w": "subtasks", "ar": "مهام فرعية"}],
+                      "2": [{"w": "Parallelogram", "ar": "متوازي أضلاع"}]}
+
+
+def test_a_key_past_the_end_of_the_document_keeps_its_words():
+    # `vocab["41"]` on a 41-page document used to be dropped without a log.
+    client = _FakeClient([_reply({"3": [{"w": "postcondition", "ar": "شرط لاحق"}]})])
+
+    result = vocab.extract_vocab(
+        _sidecar({0: "one", 1: "two", 2: "a postcondition holds after"}),
+        client=client)
+
+    assert result == {"2": [{"w": "postcondition", "ar": "شرط لاحق"}]}
+
+
+def test_a_whole_word_elsewhere_beats_a_substring_earlier():
+    client = _FakeClient([_reply({"0": [{"w": "bug", "ar": "خلل"}]})])
+
+    result = vocab.extract_vocab(
+        _sidecar({0: "debugging the program", 1: "a bug in the code"}),
+        client=client)
+
+    assert result == {"1": [{"w": "bug", "ar": "خلل"}]}
+
+
+def test_a_word_that_occurs_nowhere_is_dropped_and_logged(caplog):
+    client = _FakeClient([_reply({"0": [ENTRY,
+                                        {"w": "violates", "ar": "ينتهك"}]})])
+
+    with caplog.at_level("INFO", logger="doctranslate.vocab"):
+        result = vocab.extract_vocab(_sidecar({0: "declared here"}),
+                                     client=client)
+
+    assert result == {"0": [ENTRY]}
+    assert "violates" in caplog.text
+
+
+def test_a_code_identifier_is_dropped():
+    client = _FakeClient([_reply({"0": [
+        {"w": "boolean_expression", "ar": "تعبير منطقي"},
+        {"w": "non-functional", "ar": "غير وظيفي"}]})])
+
+    result = vocab.extract_vocab(
+        _sidecar({0: "if boolean_expression: non-functional requirements"}),
+        client=client)
+
+    assert result == {"0": [{"w": "non-functional", "ar": "غير وظيفي"}]}
+
+
+# --------------------------------------------------------------------------
 # extract_vocab: selection rules
 # --------------------------------------------------------------------------
 
@@ -140,6 +222,19 @@ def test_a_word_repeated_on_a_later_page_keeps_its_first_occurrence_only():
     assert result == {"0": [ENTRY], "3": [{"w": "scope", "ar": "نطاق"}]}
 
 
+def test_one_word_family_is_explained_once():
+    # "emerging" on page 14 and "emerged" on page 24 are one word.
+    client = _FakeClient([_reply({
+        "0": [{"w": "emerging", "ar": "ناشئة"}],
+        "1": [{"w": "emerged", "ar": "ظهرت"}],
+    })])
+
+    result = vocab.extract_vocab(
+        _sidecar({0: "emerging fields", 1: "it emerged later"}), client=client)
+
+    assert result == {"0": [{"w": "emerging", "ar": "ناشئة"}]}
+
+
 def test_the_deep_glossary_terms_are_excluded_and_named_in_the_prompt():
     client = _FakeClient([_reply({"0": [
         {"w": "wrapping", "ar": "تغليف"}, ENTRY]})])
@@ -152,23 +247,24 @@ def test_the_deep_glossary_terms_are_excluded_and_named_in_the_prompt():
 
 
 def test_a_page_is_capped_at_twenty_words():
-    entries = [{"w": f"word{chr(97 + i // 26)}{chr(97 + i % 26)}", "ar": "معنى"}
-               for i in range(30)]
+    words = [f"word{chr(97 + i // 26)}{chr(97 + i % 26)}" for i in range(30)]
+    entries = [{"w": word, "ar": "معنى"} for word in words]
     client = _FakeClient([_reply({"0": entries})])
 
-    result = vocab.extract_vocab(_sidecar({0: "text"}), client=client)
+    result = vocab.extract_vocab(_sidecar({0: " ".join(words)}), client=client)
 
     assert len(result["0"]) == vocab.MAX_PER_PAGE == 20
     assert result["0"] == entries[:20]
 
 
 def test_the_document_is_capped_at_four_hundred_words():
-    pages = {n: [{"w": f"w{n}x{chr(97 + i)}", "ar": "معنى"}
-                 for i in range(20)] for n in range(25)}
+    words = {n: [f"w{n}x{chr(97 + i)}" for i in range(20)] for n in range(25)}
+    pages = {n: [{"w": word, "ar": "معنى"} for word in row]
+             for n, row in words.items()}
     client = _FakeClient([_reply({str(n): v for n, v in pages.items()})])
 
     result = vocab.extract_vocab(
-        _sidecar(dict.fromkeys(range(25), "text")), client=client)
+        _sidecar({n: " ".join(row) for n, row in words.items()}), client=client)
 
     assert sum(len(v) for v in result.values()) == vocab.MAX_TOTAL == 400
     # Ascending pages: the earliest words survive the cap.
@@ -183,6 +279,45 @@ def test_an_empty_document_makes_no_call():
 
 
 # --------------------------------------------------------------------------
+# The prompt: the page's own translation travels with its source
+# --------------------------------------------------------------------------
+
+def test_the_prompt_carries_the_runs_own_arabic_for_the_page():
+    # Without it the strip says «نمذجة البرمجيات» four centimetres under a
+    # body that says «النمطية».
+    client = _FakeClient([_reply({"0": [{"w": "Modularity", "ar": "النمطية"}]})])
+
+    vocab.extract_vocab(_sidecar({0: "Modularity is the process"},
+                                 {0: "النمطية (Modularity) هي عملية"}),
+                        client=client)
+
+    prompt = client.prompts[0]
+
+    assert "النمطية (Modularity) هي عملية" in prompt
+    assert "— الصفحة 0 —" in prompt
+
+
+def test_a_page_without_a_translation_still_travels():
+    client = _FakeClient([_reply({"0": [ENTRY]})])
+
+    vocab.extract_vocab(_sidecar({0: "declared once"}), client=client)
+
+    assert "declared once" in client.prompts[0]
+
+
+def test_two_words_sharing_a_meaning_without_a_note_are_logged(caplog):
+    client = _FakeClient([_reply({"0": [{"w": "implementing", "ar": "تنفيذ"},
+                                        {"w": "execute", "ar": "تنفيذ"}]})])
+
+    with caplog.at_level("WARNING", logger="doctranslate.vocab"):
+        result = vocab.extract_vocab(
+            _sidecar({0: "implementing and execute"}), client=client)
+
+    assert len(result["0"]) == 2
+    assert "تنفيذ" in caplog.text
+
+
+# --------------------------------------------------------------------------
 # extract_vocab: chunking
 # --------------------------------------------------------------------------
 
@@ -194,23 +329,34 @@ def test_a_long_document_is_chunked_and_later_chunks_know_the_earlier_words():
                       {"w": "evolved", "ar": "تطور"}]}),
     ])
 
-    result = vocab.extract_vocab(_sidecar({0: long_page, 1: long_page}),
-                                 client=client)
+    result = vocab.extract_vocab(
+        _sidecar({0: f"declared {long_page}", 1: f"evolved {long_page}"}),
+        client=client)
 
     assert len(client.prompts) == 2
     # The second call is told what the first introduced...
     assert "declared" in client.prompts[1]
-    assert "declared" not in client.prompts[0]
+    assert "declared" not in client.prompts[0].split("نص المستند:")[0]
     # ...and the dedupe holds even if the model repeats it anyway.
     assert result == {"0": [ENTRY], "1": [{"w": "evolved", "ar": "تطور"}]}
+
+
+def test_the_page_translations_count_against_the_chunk_budget():
+    half = "lorem " * 16_000  # under CHUNK_WORDS alone, over it with its twin
+    client = _FakeClient([_reply({}), _reply({})])
+
+    vocab.extract_vocab(_sidecar({0: half}, {0: half}), client=client)
+
+    assert len(vocab._chunks(vocab._page_texts(
+        _sidecar({0: half, 1: half}, {0: half, 1: half})))) == 2
 
 
 def test_a_failing_later_chunk_keeps_the_earlier_chunks_words():
     long_page = "lorem " * 20_000
     client = _FakeClient([_reply({"0": [ENTRY]}), RuntimeError("boom")])
 
-    result = vocab.extract_vocab(_sidecar({0: long_page, 1: long_page}),
-                                 client=client)
+    result = vocab.extract_vocab(
+        _sidecar({0: f"declared {long_page}", 1: long_page}), client=client)
 
     assert result == {"0": [ENTRY]}
 
