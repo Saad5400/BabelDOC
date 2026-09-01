@@ -720,7 +720,7 @@ class StylesAndFormulas:
     #
     # Two baselines alone do not make a stack — a superscript is two
     # baselines too. What makes it a stack is that the rows occupy the same
-    # COLUMN: they overlap horizontally. MEASURED over 14 real pages from 8
+    # COLUMN: they overlap horizontally. MEASURED over 14 real pages from 11
     # production documents, only 4 lines have more than one baseline band,
     # all 4 are fractions, and every one of them overlaps by 1.00 of the
     # narrower row; nothing else in the sample reaches 0.5.
