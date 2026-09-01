@@ -2105,6 +2105,73 @@ class Typesetting:
             )
         return anchors
 
+    # Layout classes that stand for a piece of GRAPHIC content, i.e. the
+    # regions that can speak for a raster placement's visible extent.
+    GRAPHIC_REGION_CLASSES = frozenset({"figure", "table"})
+    # How much of a region and a placement must coincide before the region
+    # is accepted as that placement's own frame.
+    GRAPHIC_REGION_MIN_IOU = 0.5
+
+    def _graphic_dx(self, page: il_version_1.Page, box, pivot: float) -> float:
+        """Mirror translation for a placed graphic.
+
+        A raster's PLACEMENT box is not what the reader sees: an image
+        whose alpha mask is empty down one side is placed wider than it
+        prints, and reflecting the placement therefore moves the visible
+        picture by the width of the padding. run14 p22, MEASURED: the
+        figure is placed at x[275.09,505.56] but its soft mask is empty
+        past column 550 of 602, so it prints to x[486.04] — 19.5 pt of
+        nothing on the right. Reflected as placed it printed from x=89.2,
+        which is 16.8 pt OUTSIDE the slide's own border at x=106.0, and its
+        opaque background painted over that border.
+
+        The layout regions were detected on the RENDERED page, so a
+        figure's region is its ink. Where one clearly corresponds to this
+        placement, reflect that instead; the placement rides the same
+        translation and lands where the picture belongs.
+        """
+        own = pivot - box.x - box.x2
+        best_iou = self.GRAPHIC_REGION_MIN_IOU
+        best = None
+        for layout in page.page_layout or []:
+            if layout.class_name not in self.GRAPHIC_REGION_CLASSES:
+                continue
+            region = layout.box
+            if region is None or None in (
+                region.x, region.y, region.x2, region.y2
+            ):
+                continue
+            iou = self._box_iou(box, region)
+            if iou > best_iou:
+                best_iou = iou
+                best = region
+        if best is None:
+            return own
+        return pivot - best.x - best.x2
+
+    @staticmethod
+    def _region_box(region: list[float]) -> il_version_1.Box:
+        return il_version_1.Box(
+            x=float(region[0]),
+            y=float(region[1]),
+            x2=float(region[2]),
+            y2=float(region[3]),
+        )
+
+    @staticmethod
+    def _box_iou(box, other) -> float:
+        overlap_x = min(box.x2, other.x2) - max(box.x, other.x)
+        overlap_y = min(box.y2, other.y2) - max(box.y, other.y)
+        if overlap_x <= 0 or overlap_y <= 0:
+            return 0.0
+        intersection = overlap_x * overlap_y
+        union = (
+            (box.x2 - box.x) * (box.y2 - box.y)
+            + (other.x2 - other.x) * (other.y2 - other.y)
+            - intersection
+        )
+        return intersection / union if union > 0 else 0.0
+
     @staticmethod
     def _box_coverage(
         box: tuple[float, float, float, float], container
@@ -2143,7 +2210,7 @@ class Typesetting:
                 # An image-OCR label rides its raster image: the image
                 # mirrors as a rigid translation (content never flips), so
                 # the label gets exactly the image's dx, not its own.
-                dx = pivot - region[0] - region[2]
+                dx = self._graphic_dx(page, self._region_box(region), pivot)
                 self._shift_raster_region(paragraph, dx)
             else:
                 dx = pivot - box.x - box.x2
@@ -2180,7 +2247,7 @@ class Typesetting:
                 continue
             dx = self._find_anchor_dx(paragraph_anchors, form.box)
             if dx is None:
-                dx = pivot - form.box.x - form.box.x2
+                dx = self._graphic_dx(page, form.box, pivot)
             if abs(dx) < 1e-6:
                 continue
             self._shift_box_x(form.box, dx)
@@ -2192,7 +2259,7 @@ class Typesetting:
             region = self._raster_region(rect)
             if region is not None:
                 # An image-OCR mask rides its raster image, like its label.
-                dx = pivot - region[0] - region[2]
+                dx = self._graphic_dx(page, self._region_box(region), pivot)
                 self._shift_raster_region(rect, dx)
             else:
                 dx = pivot - rect.box.x - rect.box.x2
@@ -2203,7 +2270,7 @@ class Typesetting:
             if not in_scope(getattr(figure, "xobj_id", None)):
                 continue
             if self._box_is_valid(figure.box):
-                dx = pivot - figure.box.x - figure.box.x2
+                dx = self._graphic_dx(page, figure.box, pivot)
                 if abs(dx) >= 1e-6:
                     self._shift_box_x(figure.box, dx)
 
