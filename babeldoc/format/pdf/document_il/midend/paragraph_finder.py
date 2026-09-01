@@ -1517,6 +1517,14 @@ class ParagraphFinder:
             xobj_id=model.xobj_id,
         )
 
+    # Regions that denote ONE piece of text, and may therefore vouch that
+    # a wide gap inside them is a word gap. `figure` and `table` are
+    # containers of many labels and are deliberately absent; so is
+    # `plain text`, which can span two columns of body text.
+    ONE_TEXT_REGION_CLASSES = frozenset(
+        {"figure_caption", "table_caption", "abandon", "title"}
+    )
+
     def _one_region_spans(self, page: Page | None, left, right) -> bool:
         """True when one detected region holds both sides of the gap.
 
@@ -1532,12 +1540,18 @@ class ParagraphFinder:
 
         A region the page was parsed into is the document's own statement
         that its contents belong together, so a gap inside one is a word
-        gap. Two labels on a row are two regions, or none.
+        gap — but only for the regions that denote ONE piece of text. A
+        `figure` region is a container: run67 p6's diagram region holds
+        nine separate cell labels, and letting it vouch for their gaps
+        welded 'Application Software' and '|>"hello' into
+        'Application |>"hello Software', which then came back
+        untranslated. A caption, a heading or a running footer is one
+        line, and that is what may be joined.
         """
         if page is None:
             return False
         for layout in page.page_layout or []:
-            if layout.class_name == "fallback_line":
+            if layout.class_name not in self.ONE_TEXT_REGION_CLASSES:
                 continue
             box = layout.box
             if box is None or None in (box.x, box.y, box.x2, box.y2):

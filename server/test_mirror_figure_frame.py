@@ -46,14 +46,17 @@ def _page(*regions):
 
 
 PIVOT = 595.2755737304688
+PIVOT_LANDSCAPE = 841.8897705078125
 # run14 p22, at its real coordinates (IL space, y up).
 PLACEMENT = _box(275.0871887, 165.4133911, 505.5621948, 303.1165161)
 FIGURE_REGION = ("figure", _box(271.0, 164.0, 486.0, 305.0))
 SLIDE_REGION = ("figure", _box(102.0, 94.0, 490.0, 381.0))
 
 
-def _dx(page, box):
-    return Typesetting._graphic_dx(Typesetting.__new__(Typesetting), page, box, PIVOT)
+def _dx(page, box, pivot=PIVOT):
+    return Typesetting._graphic_dx(
+        Typesetting.__new__(Typesetting), page, box, pivot
+    )
 
 
 def test_a_padded_raster_is_mirrored_about_its_ink_not_its_placement():
@@ -63,11 +66,34 @@ def test_a_padded_raster_is_mirrored_about_its_ink_not_its_placement():
     assert round(PLACEMENT.x + dx, 2) == 113.36
 
 
-def test_a_placement_with_no_matching_region_keeps_its_own_reflection():
+def test_a_region_covering_a_fraction_of_the_placement_is_not_its_ink():
     # run67 p5's full-page background raster: its only figure region
     # covers a third of it, which is not that placement's frame.
     page = _page(("figure", _box(146.0, 81.0, 681.0, 324.0)))
     box = _box(0.0, 60.86, 841.89, 534.42)
+    assert _dx(page, box, PIVOT_LANDSCAPE) == (
+        PIVOT_LANDSCAPE - box.x - box.x2
+    )
+
+
+def test_a_region_reaching_outside_the_placement_is_not_its_ink():
+    # run67 p6: the figure region is drawn around the diagram raster AND
+    # the column of labels beside it, so it reaches 74.8 pt past the
+    # raster on the right. Reflecting the raster about it dragged the
+    # picture 41 pt away from labels that had stayed put, and the Arabic
+    # ended up printed across the diagram.
+    page = _page(("figure", _box(520.0, 68.0, 761.0, 458.0)))
+    box = _box(553.75, 96.27, 686.16, 455.75)
+    assert _dx(page, box, PIVOT_LANDSCAPE) == (
+        PIVOT_LANDSCAPE - box.x - box.x2
+    )
+
+
+def test_a_correction_the_size_of_detector_noise_is_not_applied():
+    # A region tight around a placement with no padding to correct: a
+    # point or two of model imprecision must not move the picture.
+    box = _box(200.0, 100.0, 400.0, 300.0)
+    page = _page(("figure", _box(201.0, 101.0, 399.0, 299.0)))
     assert _dx(page, box) == PIVOT - box.x - box.x2
 
 

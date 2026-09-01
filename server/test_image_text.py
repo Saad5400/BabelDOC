@@ -453,3 +453,19 @@ def test_a_region_covering_only_one_side_of_the_gap_does_not_join_it():
     paragraphs = _finder({0: [FOOTER_REGION]})._extract_image_text_paragraphs(page)
 
     assert len(paragraphs) == 3
+
+
+def test_a_figure_region_is_a_container_and_may_not_join_its_labels():
+    # run67 p6: the diagram's figure region holds nine separate cell
+    # labels. Letting it vouch for the gaps between them welded
+    # 'Application Software' and '|>"hello' into one label reading
+    # 'Application |>"hello Software'.
+    page = _page_with_regions(
+        _word_chars("Application", 566.3, 424.3, size=6.8, step=5.3)
+        + _word_chars('|>"hello', 634.9, 424.3, size=6.8, step=4.5),
+        [("figure", 0.85, (520.0, 68.0, 761.0, 458.0))],
+    )
+    region = (520.0, 68.0, 761.0, 458.0)
+    paragraphs = _finder({0: [region]})._extract_image_text_paragraphs(page)
+
+    assert sorted(p.unicode for p in paragraphs) == ['Application', '|>"hello']
