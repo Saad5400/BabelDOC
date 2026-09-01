@@ -252,7 +252,9 @@ def restore_source_fidelity(source_text: str, translated_text: str) -> str:
     return translated_text
 
 
-def dedupe_latin_gloss_parentheticals(text: str, seen: set[str]) -> str:
+def dedupe_latin_gloss_parentheticals(
+    text: str, seen: set[str], source_text: str = ""
+) -> str:
     """Drop «(English)» glosses whose English term was already glossed this run.
 
     The style rule asks for the English original on the FIRST occurrence of a
@@ -261,14 +263,24 @@ def dedupe_latin_gloss_parentheticals(text: str, seen: set[str]) -> str:
     document. ``seen`` is the run-scoped memory that makes the rule real. It is
     only updated when the result is actually used, so a refused strip does not
     silently consume a term's one allowed gloss.
+
+    A parenthetical the SOURCE itself printed is never touched — `Java Runtime
+    Environment (JRE)` is the author's text, not the model's gloss, and
+    dropping it on the second slide would delete content.
     """
     if not text:
         return text
+    source_parentheticals = {
+        re.sub(r"\s+", " ", m.group(1)).strip().lower()
+        for m in _LATIN_GLOSS_CAPTURE_RE.finditer(source_text or "")
+    }
     local_seen = set(seen)
     newly_seen: set[str] = set()
 
     def repl(match: "re.Match[str]") -> str:
         key = re.sub(r"\s+", " ", match.group(1)).strip().lower()
+        if key in source_parentheticals:
+            return match.group(0)
         if key in local_seen:
             return ""
         local_seen.add(key)
@@ -1464,7 +1476,7 @@ class ILTranslator:
             elif _is_arabic_lang(self.translation_config.lang_out):
                 with self.translation_memo_lock:
                     translated_text = dedupe_latin_gloss_parentheticals(
-                        translated_text, self.seen_latin_glosses
+                        translated_text, self.seen_latin_glosses, source_text
                     )
         tracker.set_output(translated_text)
         if translated_text == source_text:

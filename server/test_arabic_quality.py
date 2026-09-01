@@ -442,3 +442,27 @@ def test_glossary_has_no_duplicate_sources(cs_glossary):
 )
 def test_style_addendum_carries_each_rule(phrase):
     assert phrase in ARABIC_STYLE_ADDENDUM
+
+
+def test_gloss_dedup_never_deletes_a_parenthetical_the_source_printed():
+    """run38 p29/p30 both print `Java Runtime Environment (JRE)`.
+
+    «(JRE)» there is the author's own text. Treating it as the model's gloss
+    and dropping it on the second slide would delete source content.
+    """
+    seen: set[str] = set()
+    source = "Java Runtime Environment (JRE)"
+    first = dedupe_latin_gloss_parentheticals("بيئة تشغيل Java (JRE)", seen, source)
+    second = dedupe_latin_gloss_parentheticals("بيئة تشغيل Java (JRE)", seen, source)
+    assert first == second == "بيئة تشغيل Java (JRE)"
+
+
+def test_gloss_dedup_still_strips_a_gloss_the_model_invented():
+    seen: set[str] = set()
+    source = "Bytecodes are portable"
+    assert "(bytecode)" in dedupe_latin_gloss_parentheticals(
+        "البايت كود (bytecode) قابل للنقل", seen, source
+    )
+    assert "(bytecode)" not in dedupe_latin_gloss_parentheticals(
+        "البايت كود (bytecode) مستقل عن المنصة", seen, source
+    )
