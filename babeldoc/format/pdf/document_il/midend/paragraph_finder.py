@@ -666,11 +666,12 @@ class ParagraphFinder:
         """
         if len(paragraphs) < 2:
             return
+        column_starts = self._page_column_starts(paragraphs)
         i = 0
         while i < len(paragraphs) - 1:
             a = paragraphs[i]
             b = paragraphs[i + 1]
-            if self._should_merge_line_fragments(a, b):
+            if self._should_merge_line_fragments(a, b, column_starts):
                 self._merge_fragment_paragraph(a, b)
                 del paragraphs[i + 1]
                 # stay on i: allows chains like "The" + <title body> + ")"
@@ -685,8 +686,45 @@ class ParagraphFinder:
             if comp.pdf_line
         ]
 
+    # A justified line's inter-word gaps are WIDER than the gutter between
+    # two table columns (measured on run9 p8: ~21 pt word gaps at a 15 pt
+    # font, against a 14 pt column gutter), so no gap threshold can tell
+    # them apart. What does tell them apart is that a column starts in the
+    # same place on many lines, while a stretched word gap starts nowhere
+    # in particular.
+    COLUMN_BIN_PT = 2.0        # x positions this close are the same column
+    COLUMN_MIN_LINES = 3       # distinct baselines needed to call it a column
+    # A fragment gap may run to this multiple of the line height when it
+    # does not begin a column.
+    FRAGMENT_GAP_LINES = 2.0
+
+    def _page_column_starts(self, paragraphs: list[PdfParagraph]) -> list[float]:
+        """Left edges at which enough separate lines start to be a column.
+
+        Counted over distinct BASELINES from distinct PARAGRAPHS: one
+        wrapped paragraph's lines all start at the same x, and on its own
+        that is a left margin, not a column boundary.
+        """
+        by_bin: dict[int, set[tuple[int, int]]] = {}
+        for index, paragraph in enumerate(paragraphs):
+            for line in self._paragraph_lines(paragraph):
+                if line.box is None:
+                    continue
+                key = int(line.box.x / self.COLUMN_BIN_PT)
+                by_bin.setdefault(key, set()).add((index, int(line.box.y / 2.0)))
+        return [
+            key * self.COLUMN_BIN_PT
+            for key, seen in by_bin.items()
+            if len(seen) >= self.COLUMN_MIN_LINES
+            and len({index for index, _ in seen}) >= 2
+        ]
+
+    def _starts_a_column(self, x: float, column_starts: list[float]) -> bool:
+        return any(abs(x - start) <= self.COLUMN_BIN_PT for start in column_starts)
+
     def _should_merge_line_fragments(
-        self, a: PdfParagraph, b: PdfParagraph
+        self, a: PdfParagraph, b: PdfParagraph,
+        column_starts: list[float] | None = None,
     ) -> bool:
         if not a.pdf_paragraph_composition or not b.pdf_paragraph_composition:
             return False
@@ -718,7 +756,18 @@ class ParagraphFinder:
             last_a.box.y2 - last_a.box.y, first_b.box.y2 - first_b.box.y
         )
         gap = first_b.box.x - last_a.box.x2
-        return -2.0 <= gap <= max(2.0, line_height * 0.6)
+        if gap < -2.0:
+            return False
+        if gap <= max(2.0, line_height * 0.6):
+            return True
+        # A wider gap is a justified line's stretched word space — unless
+        # the second fragment begins one of the page's columns, in which
+        # case the gap is a gutter and the two are unrelated cells.
+        if gap > max(2.0, line_height * self.FRAGMENT_GAP_LINES):
+            return False
+        if column_starts is None:
+            return False
+        return not self._starts_a_column(first_b.box.x, column_starts)
 
     def _merge_fragment_paragraph(self, a: PdfParagraph, b: PdfParagraph):
         """Merge paragraph b into a; b's first line joins a's last line."""
