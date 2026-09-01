@@ -93,21 +93,26 @@ def _split(original: PdfReader,
     return list(translated_pages[:count]), list(translated_pages[count:])
 
 
-def _reconcile(original: PdfReader, translated_pages: list[PageObject],
+def _reconcile(original: PdfReader, translated: PdfReader,
                positions: list[int] | None) -> None:
     """Refuse a pairing that cannot be justified, instead of guessing one.
 
+    Runs on the translated INPUT, before any trimming — trimming is one of
+    the guesses this is here to stop.
+
     {@link _split} pairs positionally: translated page i is original page
-    i's twin, and anything past the original is a tail. That holds only
-    when the translated input is content pages and nothing else. A mono
-    whose «كلمات هذه الصفحة» pages were INSERTED between content pages —
-    server/vocab_pages.attach_vocab falls back to draw_vocab_pages whenever
-    a page is rotated, too narrow, or its rows too tall — is longer than
-    its original for a completely different reason, and pairing it
-    positionally drifts from the first inserted page onward and never
-    recovers. Measured on a 25-page production run rebuilt that way: 2 of
-    25 units paired, and 11 units showed a vocab page where the reader's
-    translation belongs.
+    i's twin, and anything past the original is a tail to append. That
+    holds only when the translated input is content pages and nothing else.
+    A mono whose «كلمات هذه الصفحة» pages were INSERTED between content
+    pages — server/vocab_pages.attach_vocab falls back to draw_vocab_pages
+    whenever a page is rotated, too narrow, or its rows too tall — is
+    longer than its original for a completely different reason, and pairing
+    it positionally drifts from the first inserted page onward and never
+    recovers. Trimming to the sidecar's `total_pages` does not save it
+    either: that drops pages off the END, and the pages in the way are in
+    the MIDDLE. Measured on a 25-page production run rebuilt in that shape,
+    composed with a sidecar that had no layout: 2 of 25 units paired, and
+    11 units showed a vocab page where the reader's translation belongs.
 
     The sidecar's "artifact_layout" is the only thing that tells an
     inserted page from a tail page, so a longer translated input without
@@ -116,15 +121,15 @@ def _reconcile(original: PdfReader, translated_pages: list[PageObject],
     banks the mono with a note. A layout the reader does not get is much
     cheaper than one whose pages lie about each other.
     """
-    if positions is not None or len(translated_pages) <= len(original.pages):
+    if positions is not None or len(translated.pages) <= len(original.pages):
         return
 
     raise ComposeError(
-        f"translated has {len(translated_pages)} pages against "
+        f"translated has {len(translated.pages)} pages against "
         f"{len(original.pages)} original pages, and the sidecar does not "
         "record which of them are content pages (artifact_layout): the "
-        "extra pages cannot be told from inserted vocab pages, so the "
-        "pairing is refused rather than guessed")
+        "extra pages cannot be told from vocab pages inserted between "
+        "content pages, so the pairing is refused rather than guessed")
 
 
 def _alternating(original: PdfReader,
@@ -159,10 +164,16 @@ def _upright(page: PageObject) -> PageObject:
     unrotated art whose mediabox is what the reader sees. A page with no
     /Rotate is untouched.
     """
-    if page.rotation % 360:
-        page.transfer_rotation_to_content()
+    if not page.rotation % 360:
+        return page
 
-    return page
+    # Baking rewrites the page's content stream, so it happens on a COPY
+    # attached to a writer of its own: pypdf rewrites an unattached page
+    # unreliably (and says so), and the reader's page belongs to the caller.
+    attached = PdfWriter().add_page(page)
+    attached.transfer_rotation_to_content()
+
+    return attached
 
 
 def _merge_into_half(target: PageObject, source: PageObject,
@@ -628,6 +639,8 @@ def compose_dual(original_bytes: bytes, translated_bytes: bytes,
                              "keeping the baked layout")
             vocab_ok = False
 
+    _reconcile(original, translated, positions)
+
     translated_pages = list(translated.pages)
 
     if positions is not None:
@@ -642,8 +655,6 @@ def compose_dual(original_bytes: bytes, translated_bytes: bytes,
             # Drop the mono result's baked-in appendix tail; whatever the
             # sidecar carries for those pages is rendered fresh below.
             translated_pages = translated_pages[:content]
-
-    _reconcile(original, translated_pages, positions)
 
     properties = _document_properties(translated, original)
     outline = _outline_of(original_bytes)
