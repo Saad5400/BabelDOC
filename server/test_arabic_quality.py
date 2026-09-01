@@ -186,10 +186,24 @@ def test_faithful_mathematics_is_not_rejected(source, translated):
 
 
 @pytest.mark.parametrize(
-    "label", ["disk", "Mass", "Time", "byte", "and", "one", "file", "CONTENTS"]
+    "label",
+    ["disk", "Mass", "Time", "and", "one", "file", "done", "idle", "CONTENTS"],
 )
 def test_plain_english_labels_are_not_code(label):
     assert is_code_shaped_input(label) is False
+
+
+@pytest.mark.parametrize("word", ["byte", "class", "int", "public", "while"])
+def test_reserved_words_keep_the_benefit_of_the_doubt(word):
+    """A deliberate trade, not an oversight.
+
+    `byte` is both a Java keyword and a diagram label. run14/run38 each carry a
+    keyword-table slide of ~50 such blocks; «بايت» there would be a worse and
+    far more visible defect than one untranslated label, and leaving it Latin is
+    what already ships. The prompt still asks for a translation on attempt 1 —
+    this only decides whether an ECHO is worth paying to retry.
+    """
+    assert is_code_shaped_input(word) is True
 
 
 @pytest.mark.parametrize(
@@ -207,6 +221,10 @@ def test_plain_english_labels_are_not_code(label):
         "x = y + 1",
         "Ian Sommerville",
         "Sun Microsystems",
+        "p",
+        "p ∧ ¬q",
+        "→r",
+        "kg",
     ],
 )
 def test_real_code_may_legitimately_echo(code):

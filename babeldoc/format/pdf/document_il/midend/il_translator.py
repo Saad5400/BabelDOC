@@ -301,6 +301,10 @@ def strip_latin_gloss_parentheticals(text: str) -> str:
 # distributive-law slide turned `(p∧r)` into «(p ∨ r)».
 _MATH_OPERATORS = "∧∨¬⊕↔⇒⟹≡≠≤≥⊂⊆∈∉∀∃∑∏√±×÷"
 _DECIMAL_RE = re.compile(r"\d+\.\d+")
+# Wider set, used only to recognise "this fragment is a formula, do not
+# retry it". Arrows are deliberately NOT in _MATH_OPERATORS above: an RTL
+# line may legitimately mirror → to ←, which is not a fidelity failure.
+_MATH_GLYPHS = _MATH_OPERATORS + "→←↑↓⇐∴∵∪∩⊗≈∞∥⊢⊨"
 
 
 def arabic_math_fidelity_error(source_text: str, translated_text: str) -> str | None:
@@ -359,7 +363,7 @@ def is_code_shaped_input(text: str) -> bool:
     if not any(ch.isalpha() for ch in text):
         # Pure digits and symbols: there is nothing to translate.
         return True
-    if any(ch in _MATH_OPERATORS for ch in text):
+    if any(ch in _MATH_GLYPHS for ch in text):
         # A logic or maths fragment («p ∧ ¬q», «→r»). Retrying one of these is
         # how `A a i n N` became «أ ي ن» on a shipped slide.
         return True
@@ -372,6 +376,11 @@ def is_code_shaped_input(text: str) -> bool:
         if any(ch in _CODE_TOKEN_MAGNETS for ch in core):
             return True
         if any(ch.isdigit() for ch in core):
+            return True
+        if len(core) == 1:
+            # A lone letter is a variable («p», «q», «n»), not a word.
+            return True
+        if core.lower() in _PROGRAMMING_KEYWORDS or core in _UNIT_SYMBOLS:
             return True
         if core.isupper():
             # Acronym: API, JVM, CPU. A LONG all-caps word is a shouted header
