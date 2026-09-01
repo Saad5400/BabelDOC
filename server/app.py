@@ -252,8 +252,18 @@ def _require_a_sidecar(sidecar) -> None:
 
     The pairing is checked the only way the data allows: the run's page count
     and every page's size have to be the document's own. That is not a proof
-    of identity, but no two real documents have survived it, and a mismatch is
-    conclusive.
+    of identity, but a mismatch is conclusive, and MEASURED across the 14
+    production runs the sweep collected, every correct pair agrees exactly
+    and every mismatched pair is caught.
+
+    The gap it cannot close, said plainly: at strip-vocab, a sidecar that is
+    a strict PREFIX of this document and whose pages are the same size. A
+    baked mono is content pages plus vocabulary pages plus an appendix tail,
+    so pages the layout does not name are EXPECTED — "fewer pages than the
+    file" is a normal reading of a correct sidecar, and nothing in either
+    artifact says which run it came from. Closing it needs a run identifier
+    written into both; that is a change to what the pipeline emits, not
+    something this boundary can derive.
     """
     if not isinstance(sidecar, dict):
         raise HTTPException(status_code=422,
@@ -501,6 +511,11 @@ async def compose_dual(
             raise HTTPException(status_code=413, detail=f"{name} too large")
         if not pdf_bytes.startswith(b"%PDF-"):
             raise HTTPException(status_code=422, detail=f"{name} is not a PDF")
+        # compose reached 422 for a locked PDF only because pymupdf happened
+        # to throw later, with "File has not been decrypted" — true, and no
+        # use to a reader deciding what to do about it. Opened here for the
+        # same reason and in the same words as everywhere else.
+        _open_pdf(pdf_bytes, name).close()
 
     sidecar_data = None
     if sidecar is not None:
