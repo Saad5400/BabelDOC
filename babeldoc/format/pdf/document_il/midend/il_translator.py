@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import re
 import threading
@@ -51,17 +52,21 @@ logger = logging.getLogger(__name__)
 
 ARABIC_STYLE_ADDENDUM = """
 ### Arabic Style Rules (target = Arabic)
+- CONSISTENCY IS THE FIRST PRIORITY. Within one document a given English term MUST map to exactly ONE Arabic rendering. If a term appears in the Context block or the Glossary, reuse that exact wording character-for-character; never re-word, re-order, or re-inflect a heading, running title, footer, chapter label or citation you have already seen.
 - Write clear, modern technical Arabic (فصحى معاصرة) in the register of a good university textbook: direct and natural, never bureaucratic, archaic, or stiffly literal.
 - ABSOLUTELY NO tashkeel/diacritics (فتحة، ضمة، كسرة، سكون، شدة، تنوين) unless the source text itself is diacritized. Write «أنظمة التشغيل - امتحان نهائي», NEVER «أَنْظِمَةُ التَّشْغِيلِ - اِمْتِحَانٌ نِهَائِيٌّ». This applies to titles, headers, and short labels too.
 - For EVERY technical term, apply this decision procedure (the word examples below are illustrations of the procedure, not an enumeration):
   (a) If a widely-used, natural Arabic term exists, use it (e.g. algorithm → «خوارزمية», array → «مصفوفة», variable → «متغير»).
-  (b) If the best Arabic rendering would be unnatural, ambiguous, or would change the meaning, TRANSLITERATE the English term into Arabic script following how Arabic-speaking practitioners of the field actually say it (e.g. method → «ميثود», plural «ميثودات»; class → «كلاس»; object → «أوبجكت»; constructor → «كونستركتور»). NEVER force a semantically wrong Arabic word just to avoid transliteration (e.g. «أساليب» for methods is WRONG; «ميثود» is right). On the FIRST occurrence of a transliterated term, you may add the English original in parentheses: «ميثود (method)».
-  (c) Keep Latin script ONLY for: acronyms (API, SGD, CI/CD), code identifiers and version strings, and product/tool/proper names (Git, GitHub, Docker, DevOps). Do not transliterate names — write Git, never «جيت»; write DevOps, never «ديف أوبس». Transliteration under (b) is for common-noun jargon used inside Arabic sentences, not for names.
+  (b) If the best Arabic rendering would be unnatural, ambiguous, or would change the meaning, TRANSLITERATE the English term into Arabic script following how Arabic-speaking practitioners of the field actually say it (e.g. method → «ميثود», plural «ميثودات»; class → «كلاس»; object → «أوبجكت»; constructor → «كونستركتور»). NEVER force a semantically wrong Arabic word just to avoid transliteration (e.g. «أساليب» for a Java method is WRONG; «ميثود» is right). These transliterations apply ONLY when the word carries its programming sense — a Java method, an OOP object, a class definition. When the SAME English word carries its ordinary sense, translate it normally: research «methods» → «مناهج/أساليب», physical «objects» in a simulation → «أجسام/عناصر», a school «class» → «صف», a data «abstraction» → «تجريد للبيانات» (never «بياني», which means graphical). Read the sentence before deciding.
+  (c) Keep Latin script ONLY for: acronyms (API, SGD, CI/CD), code identifiers and version strings, and product/tool/proper names (Git, GitHub, Docker, DevOps). Names are NEVER transliterated and NEVER translated: person names (Ian Sommerville, Silberschatz, Zelle), publisher and company names (ELSEVIER, MIT Press, Sun Microsystems), product/tool/language names (Java, Python, Git, Docker, Blackboard), and the TITLES of cited books, papers and courses. A bibliography or reference-list entry keeps its author, title, publisher and edition exactly as printed — the reader must be able to search for it. Write «Java», never «جافا»; «Git», never «جيت»; «DevOps», never «ديف أوبس»; «Java Virtual Machine» or «آلة Java الافتراضية», never «جافا فيرتشوال ماشين» and never «بيئة تشغيل Java» (that is the JRE, not the JVM). Transliteration under (b) is for common-noun jargon used inside Arabic sentences, not for names.
 - When the source sentence introduces or defines a term that stays in Latin script under (c), let the surrounding Arabic explanation carry the meaning, e.g. «الـ API هو الواجهة التي تتخاطب عبرها البرامج».
-- Translate short standalone headers and labels into Arabic (CONTENTS → المحتويات, TOOL → الأداة, JOB → المهمة, VS → مقابل); do not leave small English UI-style labels untranslated unless they are proper nouns, code, or established technical terms as above.
-- Keep one space on each side of inline symbols like = + → < > when they connect words: write «التعلم = تحسين الأداء», never «التعلم=تحسين الأداء».
-- Prefer natural technical wording over dictionary-literal calques: pitfalls → «أخطاء شائعة» (not «مآزق»), overview → «نظرة عامة», best practices → «أفضل الممارسات».
+- The detached «الـ X» form (definite article + tatweel + space) is ONLY correct before a LATIN-script word: «الـ API», «الـ JVM», «الـ CPU». Before an ARABIC word the article is ATTACHED with no space and no tatweel: write «الخوارزمية», «البرنامج», «الكلاس», «المخرجات» — NEVER «الـ خوارزمية». The same holds for the prefixes بـ / لـ / كـ / فـ / وـ: write «بالبنية», «لترجمة», «للقضايا» — never «بـ البنية», «لـ ترجمة».
+- Translate short standalone headers and labels into Arabic (CONTENTS → المحتويات, TOOL → الأداة, JOB → المهمة, VS → مقابل); do not leave small English UI-style labels untranslated unless they are proper nouns, code, or established technical terms as above. A single ordinary English word on a diagram or in a table cell is still content and MUST be translated: "and" → «و», "one" → «واحد», "more" → «المزيد», "file" → «ملف», "disk" → «قرص», "done" → «تم», "user" → «مستخدم», "idle" → «خامل», "Mass" → «الكتلة», "Time" → «الزمن», "code" → «شيفرة». Returning the input unchanged is only for genuine code: identifiers with dots/underscores/parentheses/camelCase, language keywords, file names, and acronyms.
+- Inside ARABIC PROSE, keep one space on each side of an inline symbol that connects Arabic words: write «التعلم = تحسين الأداء», never «التعلم=تحسين الأداء». This rule NEVER applies inside a URL, a file path, a code fragment, an identifier, or a mathematical expression: leave `?from_search=16`, `boolean_expression`, `aload_0`, `String[] args`, `SET>java`, `~calvanese` and `[-(2^(N-1)-1)]` character-for-character unchanged. A URL is copied verbatim — never localise its path (`…-misses-the-point.en.html` stays `.en.html`).
+- Prefer natural technical wording over dictionary-literal calques: pitfalls → «أخطاء شائعة» (not «مآزق»), overview → «نظرة عامة», best practices → «أفضل الممارسات», garbage collection → «جمع المهملات» (not «جمع القمامة»).
 - Numbers, code, identifiers, and version strings stay exactly as in the source.
+- Mathematical and scientific notation is COPIED, never re-typeset. Reproduce it byte-for-byte: numbers and their decimal points (5.98 stays «5.98», never «5. 98»), signs bound to their operand (-5 stays «-5», never «- 5»), exponents and subscripts, unit SYMBOLS (m, cm, kg, ns, m/s, km/h stay Latin — do NOT write «م/سم/كجم»; the unit NAME in running prose may be translated, "one metre" → «متر واحد»), variable letters (p, q, r, A, a, i, n, N stay Latin — never render them as «أ ي ن»), logical and mathematical operators (∧ ∨ ¬ ⊕ → ↔ ⟹ Σ × ÷ ± stay exactly as written — never swap ∧ for ∨), and slide or page fractions such as (5/23), which keep their original digit order and are NEVER reversed to (23/5). If a formula in the source is garbled, OCR-damaged or unreadable, COPY IT UNCHANGED — do not guess what it was meant to be.
+- Add the English original in parentheses at most ONCE per paragraph, and only for a term the paragraph itself introduces or defines: «ميثود (method)». Do not re-gloss a term you have already glossed; the English is available to the reader in the side-by-side and interlinear layouts.
 - The output may contain ONLY Arabic script, Latin script, digits, and standard punctuation. NEVER emit Chinese/CJK or any other script.
 """
 
@@ -122,6 +127,159 @@ def _fix_arabic_operator_spacing(text: str) -> str:
 # label — the label box is the drawn shape it sits in, and the suffix can
 # triple its width.
 _LATIN_GLOSS_RE = re.compile(r"\s*[(（]\s*[A-Za-z][A-Za-z0-9 .&/'’-]*\s*[)）]")
+# Same shape, capturing the English inside, for the run-scoped de-duplicator.
+_LATIN_GLOSS_CAPTURE_RE = re.compile(
+    r"\s*[(（]\s*([A-Za-z][A-Za-z0-9 .&/'’-]*?)\s*[)）]"
+)
+
+# «الـ خوارزمية» -> «الخوارزمية». The tatweel-detached article/prefix form is
+# correct ONLY before a Latin word («الـ API»), which the Arabic-letter
+# lookahead excludes by construction. The captured group is the single letter
+# carrying the tatweel: the ل of «الـ», or a bare بـ/لـ/كـ/فـ/وـ prefix.
+_DETACHED_ARABIC_PREFIX_RE = re.compile(
+    "([الوفبك])ـ[ \t\u00a0]+"
+    "(?=[ء-غف-ي])"
+)
+
+# Characters that attract stray whitespace when the model re-typesets an
+# identifier, URL, decimal or signed number as if it were Arabic prose.
+_SPACING_MAGNETS = set("=_~<>[](){}/\\|+-.,:;*^&#!?'\"@$%")
+_URL_RE = re.compile(r"(?:https?://|www\.)[^\s<>\"'()؀-ۿ]+")
+_BRACKET_FRACTION_RE = re.compile(r"\((\d+)/(\d+)\)")
+
+
+def _fix_arabic_detached_prefix(text: str) -> str:
+    """Re-attach «الـ / بـ / لـ / كـ / فـ / وـ» to a following ARABIC word.
+
+    62 blocks in the shipped corpus read «الـ خوارزمية» / «بـ البنية» — a
+    spelling error, and the single most visible one on a rendered page. The
+    Latin form («الـ API») is untouched: the lookahead requires an Arabic
+    letter.
+    """
+    return _DETACHED_ARABIC_PREFIX_RE.sub(r"\1", text)
+
+
+def _protected_source_tokens(source_text: str) -> list[str]:
+    """Whitespace-separated source tokens that must survive character-for-character.
+
+    A token qualifies when it mixes alphanumerics with at least one character
+    that attracts stray spacing (``_ . - = ~ [] > /``): decimals (``5.98``),
+    signed numbers (``-6``), identifiers (``boolean_expression``, ``aload_0``),
+    query strings (``?from_search=16``) and shell fragments (``SET>java``).
+    """
+    tokens = []
+    for token in source_text.split():
+        if len(token) < 2:
+            continue
+        if not any(ch.isalnum() for ch in token):
+            continue
+        if not any(ch in _SPACING_MAGNETS for ch in token):
+            continue
+        tokens.append(token)
+    # Longest first: restoring «boolean_expression» before «_expression»
+    # avoids a partial repair leaving the rest mangled.
+    return sorted(set(tokens), key=len, reverse=True)
+
+
+def _spaced_variant_pattern(token: str) -> "re.Pattern[str] | None":
+    """Regex matching ``token`` with optional whitespace injected at its seams.
+
+    Whitespace is allowed only BETWEEN characters and only where one side is a
+    spacing magnet, so the pattern can never eat the space that follows a list
+    marker like ``1.``.
+    """
+    parts = []
+    for i, ch in enumerate(token):
+        parts.append(re.escape(ch))
+        if i + 1 < len(token) and (
+            ch in _SPACING_MAGNETS or token[i + 1] in _SPACING_MAGNETS
+        ):
+            parts.append("[ \t\u00a0]*")
+    if "[ \t\u00a0]*" not in parts:
+        return None
+    try:
+        return re.compile("".join(parts))
+    except re.error:  # pragma: no cover - defensive
+        return None
+
+
+def restore_source_fidelity(source_text: str, translated_text: str) -> str:
+    """Undo re-typesetting of things the model was supposed to copy verbatim.
+
+    Three shipped defect classes, all fixable without asking the model again:
+
+    * ``5.98`` -> «5. 98», ``-6`` -> «- 6», ``?from_search=16`` ->
+      «?from _ search =16», ``String[] args`` -> «String [] args»: the source
+      token is restored wherever a whitespace-injected variant of it appears.
+    * ``(5/23)`` -> «(23/5)»: a bracketed slide fraction whose digits were
+      swapped is put back in the source's order.
+    * a URL whose path was *localised* (``…-misses-the-point.en.html`` ->
+      ``.ar.html``) is replaced by the URL as printed in the source.
+    """
+    if not source_text or not translated_text:
+        return translated_text
+
+    for token in _protected_source_tokens(source_text):
+        if token in translated_text:
+            continue
+        pattern = _spaced_variant_pattern(token)
+        if pattern is None:
+            continue
+        translated_text = pattern.sub(lambda _m, t=token: t, translated_text)
+
+    for match in _BRACKET_FRACTION_RE.finditer(source_text):
+        original = match.group(0)
+        if original in translated_text:
+            continue
+        reversed_form = f"({match.group(2)}/{match.group(1)})"
+        if reversed_form != original and reversed_form in translated_text:
+            translated_text = translated_text.replace(reversed_form, original, 1)
+
+    source_urls = _URL_RE.findall(source_text)
+    if source_urls:
+        for target_url in _URL_RE.findall(translated_text):
+            if target_url in source_urls:
+                continue
+            best = max(
+                source_urls,
+                key=lambda candidate: len(
+                    os.path.commonprefix([candidate, target_url])
+                ),
+            )
+            if len(os.path.commonprefix([best, target_url])) >= 12:
+                translated_text = translated_text.replace(target_url, best, 1)
+
+    return translated_text
+
+
+def dedupe_latin_gloss_parentheticals(text: str, seen: set[str]) -> str:
+    """Drop «(English)» glosses whose English term was already glossed this run.
+
+    The style rule asks for the English original on the FIRST occurrence of a
+    term, but paragraphs are translated independently so "first" is unknowable
+    to the model: «متمم الاثنين (two's complement)» shipped 15 times in one
+    document. ``seen`` is the run-scoped memory that makes the rule real. It is
+    only updated when the result is actually used, so a refused strip does not
+    silently consume a term's one allowed gloss.
+    """
+    if not text:
+        return text
+    local_seen = set(seen)
+    newly_seen: set[str] = set()
+
+    def repl(match: "re.Match[str]") -> str:
+        key = re.sub(r"\s+", " ", match.group(1)).strip().lower()
+        if key in local_seen:
+            return ""
+        local_seen.add(key)
+        newly_seen.add(key)
+        return match.group(0)
+
+    stripped = re.sub(r"\s{2,}", " ", _LATIN_GLOSS_CAPTURE_RE.sub(repl, text)).strip()
+    if stripped and any(_is_arabic_char(ch) for ch in stripped):
+        seen |= newly_seen
+        return stripped
+    return text
 
 
 def strip_latin_gloss_parentheticals(text: str) -> str:
@@ -138,20 +296,122 @@ def strip_latin_gloss_parentheticals(text: str) -> str:
     return text
 
 
+# Operators whose count must survive translation. Getting one of these wrong
+# does not read as a clumsy sentence, it prints a false law: a shipped
+# distributive-law slide turned `(p∧r)` into «(p ∨ r)».
+_MATH_OPERATORS = "∧∨¬⊕↔⇒⟹≡≠≤≥⊂⊆∈∉∀∃∑∏√±×÷"
+_DECIMAL_RE = re.compile(r"\d+\.\d+")
+
+
+def arabic_math_fidelity_error(source_text: str, translated_text: str) -> str | None:
+    """Reason to reject a translation that altered its source's mathematics.
+
+    Checked AFTER :func:`restore_source_fidelity` has had its chance, so this
+    only fires on damage no deterministic repair can undo — an operator the
+    model resolved to the wrong one, or digits it actually rewrote. Returns
+    None when the translation is faithful.
+    """
+    if not source_text or not translated_text:
+        return None
+    for operator in _MATH_OPERATORS:
+        expected = source_text.count(operator)
+        if expected and source_text.count(operator) != translated_text.count(operator):
+            return (
+                f"math operator '{operator}' count changed "
+                f"{expected} -> {translated_text.count(operator)}"
+            )
+    for decimal in set(_DECIMAL_RE.findall(source_text)):
+        if decimal not in translated_text:
+            return f"decimal number '{decimal}' lost or rewritten"
+    for match in _BRACKET_FRACTION_RE.finditer(source_text):
+        if match.group(0) not in translated_text:
+            return f"fraction '{match.group(0)}' lost or reordered"
+    return None
+
+
+# Characters that make a token look like code rather than prose.
+_CODE_TOKEN_MAGNETS = set("._()[]{}<>/\\=;:#$@&|*+-%\"'`")
+# Reserved words: a keyword slide is a table of these, and «عام» for `public`
+# would be a worse defect than leaving them in Latin.
+_PROGRAMMING_KEYWORDS = frozenset(
+    """abstract assert boolean break byte case catch char class const continue
+    default do double elif else enum except extends final finally float for from
+    goto if implements import instanceof int interface lambda long native new
+    none nonlocal null package pass print private protected public raise return
+    self short static strictfp super switch synchronized this throw throws
+    transient true false try var void volatile while with yield""".split()
+)
+# Unit symbols: `kg` is not the English word "kg" waiting to be translated.
+_UNIT_SYMBOLS = frozenset(
+    """m cm mm km nm kg mg s ms ns h min mol rad deg Hz kHz MHz GHz
+    J W V K L mL Pa N C F""".split()
+)
+
+
+def is_code_shaped_input(text: str) -> bool:
+    """True when the model echoing `text` back unchanged is a legitimate result.
+
+    `Hello.java`, `aload_0`, `String[] args`, `JVM` and `camelCase` are code:
+    an identical output is correct. A bare `disk`, `Mass`, `byte` or `and` on a
+    diagram is not — those shipped untranslated 80 times because the echo guard
+    accepted ANY input of <= 10 tokens without a retry.
+    """
+    if not any(ch.isalpha() for ch in text):
+        # Pure digits and symbols: there is nothing to translate.
+        return True
+    if any(ch in _MATH_OPERATORS for ch in text):
+        # A logic or maths fragment («p ∧ ¬q», «→r»). Retrying one of these is
+        # how `A a i n N` became «أ ي ن» on a shipped slide.
+        return True
+    cores = [token.strip("،,;:.!?«»…") for token in text.split()]
+    cores = [core for core in cores if core]
+    if not cores:
+        return True
+
+    def _is_code_token(core: str) -> bool:
+        if any(ch in _CODE_TOKEN_MAGNETS for ch in core):
+            return True
+        if any(ch.isdigit() for ch in core):
+            return True
+        if core.isupper():
+            # Acronym: API, JVM, CPU. A LONG all-caps word is a shouted header
+            # («CONTENTS»), which the style rules say to translate.
+            return len(core) <= 6
+        if core != core.lower() and core != core.capitalize():
+            # camelCase / PascalCase with an inner capital.
+            return True
+        return False
+
+    if any(_is_code_token(core) for core in cores):
+        return True
+    if len(cores) > 1 and all(core[:1].isupper() for core in cores):
+        # A run of capitalised words is a proper name («Ian Sommerville»,
+        # «Sun Microsystems»), which rule (c) keeps in Latin.
+        return True
+    # A plain English word. Echoing it back is a surrender, not a decision.
+    return False
+
+
 def postprocess_arabic_translation(source_text: str, translated_text: str) -> str:
     """Deterministic safety net for Arabic output quality.
 
     - Strips tashkeel unless the source itself was diacritized.
+    - Re-attaches a detached «الـ / بـ / لـ» to a following Arabic word.
     - Normalizes spacing around inline operators touching Arabic letters.
     - Removes literal HTML tags (<code>, <p>, <b>, ...) occasionally emitted
       by the model as visible text; placeholder shapes are preserved.
+    - Restores numbers, identifiers, URLs and slide fractions the model
+      re-typeset instead of copying (runs last, so it also undoes any damage
+      the operator re-spacer above could have done).
     """
     if not translated_text:
         return translated_text
     if not _has_arabic_diacritics(source_text):
         translated_text = _ARABIC_DIACRITICS_RE.sub("", translated_text)
+    translated_text = _fix_arabic_detached_prefix(translated_text)
     translated_text = _fix_arabic_operator_spacing(translated_text)
     translated_text = _STRAY_HTML_TAG_RE.sub("", translated_text)
+    translated_text = restore_source_fidelity(source_text, translated_text)
     return translated_text
 
 
@@ -481,6 +741,21 @@ class ILTranslator:
         # keyed by 0-based page number.
         self.untranslated_by_page: dict[int, int] = {}
         self.untranslated_lock = threading.Lock()
+
+        # Run-scoped consistency memo. babeldoc's own TranslationCache is keyed
+        # on the WHOLE prompt (context block, glossary block and all), so the
+        # same header on two pages is a cache miss and gets translated twice —
+        # 30% of source strings that repeat inside a document came back with
+        # more than one Arabic rendering, and one real handout printed the same
+        # slide header as «(23/5)» and «(5/23)» side by side. This memo is keyed
+        # on the exact source text instead, so a repeat is byte-identical to its
+        # first occurrence and, on the fallback path, free.
+        self.translation_memo: dict[tuple[str, bool], str] = {}
+        self.translation_memo_hits = 0
+        self.translation_memo_lock = threading.Lock()
+        # Run-scoped memory of «(English)» glosses already emitted, so the
+        # style rule's "on the FIRST occurrence" is enforceable at all.
+        self.seen_latin_glosses: set[str] = set()
 
         # Pre-compile patterns for placeholder-like tokens that may be hallucinated by LLM.
         # We only consider the same shapes as our own formula & rich-text placeholders.
@@ -1113,6 +1388,37 @@ class ILTranslator:
             return None, None
         return text, translate_input
 
+    @staticmethod
+    def _source_text_of(translate_input) -> str:
+        """The exact text that was sent for translation, whatever wraps it."""
+        if isinstance(translate_input, str):
+            return translate_input
+        return getattr(translate_input, "unicode", "") or ""
+
+    def lookup_translation_memo(
+        self, source_text: str, is_raster: bool = False
+    ) -> str | None:
+        """The translation this run already accepted for this exact source.
+
+        Callers may consult this BEFORE spending an LLM call: a repeated
+        header, footer or citation is answered for free and, more importantly,
+        identically.
+        """
+        if not source_text:
+            return None
+        with self.translation_memo_lock:
+            return self.translation_memo.get((source_text, bool(is_raster)))
+
+    def _store_translation_memo(
+        self, source_text: str, is_raster: bool, translated_text: str
+    ) -> None:
+        if not source_text or not translated_text:
+            return
+        with self.translation_memo_lock:
+            self.translation_memo.setdefault(
+                (source_text, bool(is_raster)), translated_text
+            )
+
     def post_translate_paragraph(
         self,
         paragraph: PdfParagraph,
@@ -1120,19 +1426,43 @@ class ILTranslator:
         translate_input,
         translated_text: str,
     ):
-        """Post-translation processing: update paragraph with translated text."""
-        if _is_arabic_lang(self.translation_config.lang_out):
-            translated_text = postprocess_arabic_translation(
-                translate_input if isinstance(translate_input, str) else "",
-                translated_text,
-            )
-        if getattr(paragraph, "raster_region", None):
-            translated_text = strip_latin_gloss_parentheticals(translated_text)
+        """Post-translation processing: update paragraph with translated text.
+
+        The source text is read off the TranslateInput. It used to be read as
+        ``translate_input if isinstance(translate_input, str) else ""`` — but
+        every caller passes a TranslateInput, so the Arabic post-processor was
+        always handed an empty source and the echo check below compared a str
+        against an object and could never be true.
+        """
+        source_text = self._source_text_of(translate_input)
+        is_raster = bool(getattr(paragraph, "raster_region", None))
+
+        memoized = self.lookup_translation_memo(source_text, is_raster)
+        if memoized is not None:
+            # This exact source has already been translated in this run. Reuse
+            # that wording verbatim so the document says one thing once.
+            translated_text = memoized
+            with self.translation_memo_lock:
+                self.translation_memo_hits += 1
+        else:
+            if _is_arabic_lang(self.translation_config.lang_out):
+                translated_text = postprocess_arabic_translation(
+                    source_text,
+                    translated_text,
+                )
+            if is_raster:
+                translated_text = strip_latin_gloss_parentheticals(translated_text)
+            elif _is_arabic_lang(self.translation_config.lang_out):
+                with self.translation_memo_lock:
+                    translated_text = dedupe_latin_gloss_parentheticals(
+                        translated_text, self.seen_latin_glosses
+                    )
         tracker.set_output(translated_text)
-        if translated_text == translate_input:
+        if translated_text == source_text:
             if llm_translate_tracker := tracker.last_llm_translate_tracker():
                 llm_translate_tracker.set_placeholder_full_match()
             return False
+        self._store_translation_memo(source_text, is_raster, translated_text)
         paragraph.unicode = translated_text
         paragraph.pdf_paragraph_composition = self.parse_translate_output(
             translate_input,
@@ -1360,6 +1690,9 @@ class ILTranslator:
             script_rule = (
                 " The output may contain only Arabic script, Latin script, "
                 "digits, and punctuation - never Chinese/CJK characters."
+                " Keep person, product and publisher names, code identifiers,"
+                " URLs, numbers and mathematical notation in Latin script,"
+                " exactly as written - never transliterate or re-space them."
             )
         return (
             f"Translate the following text into {self.translation_config.lang_out}. "
@@ -1424,7 +1757,16 @@ class ILTranslator:
                 if text is None:
                     return
 
-                input_token_count = self.calc_token_count(text)
+                # Consistency memo: this exact source was already translated in
+                # this run. Reuse it — free, and identical by construction.
+                memo_hit = self.lookup_translation_memo(
+                    text, bool(getattr(paragraph, "raster_region", None))
+                )
+                if memo_hit is not None and self.post_translate_paragraph(
+                    paragraph, tracker, translate_input, memo_hit
+                ):
+                    return
+
                 last_error: str | None = None
 
                 for attempt in range(self.max_translate_attempts):
@@ -1483,20 +1825,46 @@ class ILTranslator:
                             )
                             continue
 
+                        # Mathematics guard: a translation that resolved an
+                        # operator to the wrong one, or rewrote a number, is
+                        # not a clumsy sentence — it prints a false law. Reject
+                        # it while there is still a tier left to try. Checked
+                        # against the deterministically repaired text so the
+                        # repairable damage (split decimals, reversed slide
+                        # fractions) does not burn a retry.
+                        if (
+                            _is_arabic_lang(self.translation_config.lang_out)
+                            and attempt < self.max_translate_attempts - 1
+                        ):
+                            math_error = arabic_math_fidelity_error(
+                                text,
+                                postprocess_arabic_translation(text, translated_text),
+                            )
+                            if math_error:
+                                last_error = math_error
+                                llm_translate_tracker.set_error_message(last_error)
+                                logger.warning(
+                                    f"Fallback translation attempt {attempt + 1}/"
+                                    f"{self.max_translate_attempts}: {math_error} "
+                                    f"for paragraph {paragraph.debug_id}, retrying."
+                                )
+                                continue
+
                         # Post-translation processing
                         applied = self.post_translate_paragraph(
                             paragraph, tracker, translate_input, translated_text
                         )
                         if applied:
                             return
-                        # Model echoed the source back. For short/code-like
-                        # inputs an identical output can be legitimate, so
-                        # only treat it as a failure worth retrying for
-                        # meaningful inputs (mirrors the batch-path check).
-                        if (
-                            input_token_count <= 10
-                            or self.translation_config.disable_same_text_fallback
-                        ):
+                        # Model echoed the source back. That is a legitimate
+                        # result only when the input really is code — an
+                        # identifier, a keyword, an acronym, a file name. A
+                        # bare `disk` or `Mass` on a diagram is a surrender,
+                        # and used to be accepted because ANY input of <= 10
+                        # tokens skipped the retry.
+                        if is_code_shaped_input(
+                            text
+                        ) or self.translation_config.disable_same_text_fallback:
                             return
                         last_error = "translation result identical to input"
                         llm_translate_tracker.set_error_message(last_error)
