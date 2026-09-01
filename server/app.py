@@ -122,9 +122,19 @@ def _scrub_surrogates(value):
 def _parse_sidecar(raw: bytes, part: str = "sidecar"):
     """The sidecar part as data: JSON, then scrubbed of lone surrogates.
 
-    The scrub walks the whole structure, so it is skipped unless the raw
-    bytes carry a `\\uD…` escape at all — the only way a surrogate can reach
-    `json.loads`, and something no ordinary sidecar contains.
+    The scrub walks the whole structure (MEASURED: 7 ms on run30's 158 KB
+    sidecar, 11 ms on run20's 322 KB), so it is skipped unless the raw bytes
+    could possibly carry a surrogate. There are exactly two ways one reaches
+    `json.loads`, and each leaves its own fingerprint in the bytes:
+
+    * a `\\uD…` escape — the ensure_ascii spelling;
+    * a 0xED lead byte — `json.loads` decodes a BYTES argument with
+      `surrogatepass`, so the three-byte form sails straight through and
+      comes back out as a lone surrogate. That is the one that bites: it does
+      not look like an encoding error to anything upstream.
+
+    Neither fingerprint occurs in any of the 14 production sidecars the sweep
+    collected, so in practice this costs one substring scan.
     """
     try:
         parsed = json.loads(raw)
@@ -132,9 +142,10 @@ def _parse_sidecar(raw: bytes, part: str = "sidecar"):
         raise HTTPException(status_code=422,
                             detail=f"{part} is not valid JSON: {exc}") from exc
 
-    lowered = raw.lower()
+    if b"\\ud" in raw.lower() or b"\xed" in raw:
+        return _scrub_surrogates(parsed)
 
-    return _scrub_surrogates(parsed) if b"\\ud" in lowered else parsed
+    return parsed
 
 
 def _sidecar_page_count(sidecar: dict) -> int | None:
@@ -745,6 +756,15 @@ def get_job(job_id: str):
         body["usage"] = job["usage"]
     if job["status"] == "failed":
         body["error"] = job["error"]
+    # The source-language analysis, when the run has got far enough to have
+    # one. This body is an explicit allowlist rather than the job record, so
+    # a field the pipeline starts recording is invisible to the caller until
+    # it is named here — and this one is the difference between a reader
+    # being told their Arabic document was already Arabic and their being
+    # charged for a degraded Arabic-to-Arabic copy of it. Conditional because
+    # a job from before the analysis existed simply has none.
+    if job.get("language") is not None:
+        body["language"] = job["language"]
     return body
 
 
