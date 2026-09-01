@@ -549,7 +549,408 @@ def reproduce_cmap(doc):
             logger.error(f"Error in getting page fonts: {e}")
     for font in font_set:
         reproduce_one_font(doc, font[0])
+    normalize_arabic_text_layer(doc)
     return doc
+
+
+# --- The Arabic text layer ---------------------------------------------------
+#
+# Arabic is DRAWN as presentation forms: the typesetter substitutes each letter
+# with its contextual shape (U+FEDF for an initial lam, U+FEFB for the lam-alef
+# ligature) so the per-character renderer can place one glyph at a time. That is
+# a rendering decision, and it must not leak into the text layer — but it does,
+# because the ToUnicode CMap the viewer builds is a reverse of the font's cmap,
+# and the font's cmap is what we looked the shape up in. The delivered file then
+# LOOKS right and IS unsearchable: Ctrl+F for a normally typed word matches
+# nothing, a copy-paste pastes shapes that will not re-shape anywhere else, a
+# screen reader gets glyph soup, and `pdftotext` — which is what indexes these
+# documents downstream — sees the same.
+#
+# So after the pages are drawn we walk every ToUnicode CMap and put the letters
+# back: each presentation form becomes the letter(s) a human would type, which
+# for a ligature means TWO characters out of one glyph (U+FEFB -> "لا"). Nothing
+# about the drawing changes; only what the glyph claims to be.
+#
+# The second half is glyphs the CMap never mentioned at all. A shaper reaches
+# them through GSUB, and GSUB output has no cmap entry to be reversed from — so
+# the viewer falls back to using the glyph id as if it were a codepoint, and a
+# lam extracts as "Ʌ". Those we recover from the font program: the substitution
+# tables say which glyph a glyph came FROM, and the letter travels along that
+# edge.
+
+# Arabic Presentation Forms-A and -B. U+FEFD..U+FEFF are excluded on purpose:
+# FEFF is the byte-order mark, not a letter shape.
+_ARABIC_PRESENTATION_RANGES = ((0xFB50, 0xFDFF), (0xFE70, 0xFEFC))
+
+# A CMap destination is UTF-16BE hex; a range's destination may also be an array
+# of them, one per code in the range.
+_CMAP_TOKEN_RE = re.compile(rb"<([0-9A-Fa-f]*)>|(\[)|(\])")
+_BFCHAR_RE = re.compile(rb"beginbfchar(.*?)endbfchar", re.DOTALL)
+_BFRANGE_RE = re.compile(rb"beginbfrange(.*?)endbfrange", re.DOTALL)
+_CMAP_BODY_RE = re.compile(
+    rb"(endcodespacerange)(.*?)(endcmap)",
+    re.DOTALL,
+)
+
+# Filling CMap gaps from the font program only makes sense for a real subset.
+# A retain-gids subset of a 64k-glyph face carries every glyph the face ever
+# had, and blindly naming all of them would add tens of thousands of entries
+# for glyphs the page never draws.
+_MAX_SUBSET_GLYPHS_FOR_GAP_FILL = 8192
+
+
+def is_arabic_presentation_form(code: int) -> bool:
+    return any(low <= code <= high for low, high in _ARABIC_PRESENTATION_RANGES)
+
+
+def arabic_base_letters(code: int) -> str:
+    """The letter(s) a human types for the presentation form `code`.
+
+    One glyph may be two characters: U+FEFB (lam-alef) is "لا". The marks in
+    U+FE70..U+FE7F decompose to a space plus the mark — the space is the
+    placeholder the shape is drawn on, not text, so it goes.
+    """
+    char = chr(code)
+    folded = unicodedata.normalize("NFKC", char)
+    if folded.startswith(" ") and len(folded) > 1:
+        folded = folded[1:]
+    return folded or char
+
+
+def normalize_arabic_presentation_forms(text: str) -> str:
+    """`text` with every Arabic presentation form replaced by its letters."""
+    if not any(is_arabic_presentation_form(ord(char)) for char in text):
+        return text
+    return "".join(
+        arabic_base_letters(ord(char)) if is_arabic_presentation_form(ord(char))
+        else char
+        for char in text
+    )
+
+
+def _cmap_tokens(section: bytes):
+    """`(kind, value)` for each `<hex>` / `[` / `]` in a CMap section."""
+    for match in _CMAP_TOKEN_RE.finditer(section):
+        if match.group(1) is not None:
+            yield "hex", match.group(1).decode("ascii").lower()
+        elif match.group(2) is not None:
+            yield "[", None
+        else:
+            yield "]", None
+
+
+def _hex_to_text(raw: str) -> str | None:
+    """A CMap destination as a string, or None if it is not readable as one.
+
+    Whole 16-bit units are UTF-16BE, which is what the spec asks for. Anything
+    else is a writer that put the scalar codepoint in directly (MuPDF emits
+    `<10780>` for U+10780); read it that way rather than refusing the font.
+    """
+    if not raw:
+        return None
+    try:
+        if len(raw) % 4 == 0:
+            return bytes.fromhex(raw).decode("utf-16-be")
+        code = int(raw, 16)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if code > 0x10FFFF or 0xD800 <= code <= 0xDFFF:
+        return None
+    return chr(code)
+
+
+def parse_tounicode_map(data: bytes) -> tuple[dict[int, tuple[str, str]], int] | None:
+    """`(code -> (text, destination hex), code width)`, or None if unreadable.
+
+    Deliberately all-or-nothing. A CMap we only half understand is one we must
+    not rewrite, because rewriting it would drop whatever we failed to parse.
+    The raw destination is carried along so an entry we do not change can be
+    written back exactly as it was found.
+    """
+    mapping: dict[int, tuple[str, str]] = {}
+    nibbles = 4
+
+    def record(code: int, dst: str) -> bool:
+        text = _hex_to_text(dst)
+        if text is None:
+            return False
+        mapping[code] = (text, dst)
+        return True
+
+    for match in _BFCHAR_RE.finditer(data):
+        tokens = list(_cmap_tokens(match.group(1)))
+        if len(tokens) % 2 or any(kind != "hex" for kind, _ in tokens):
+            return None
+        for (_, src), (_, dst) in batched(tokens, 2):
+            nibbles = max(nibbles, len(src))
+            if not record(int(src, 16), dst):
+                return None
+
+    for match in _BFRANGE_RE.finditer(data):
+        tokens = list(_cmap_tokens(match.group(1)))
+        index = 0
+        while index < len(tokens):
+            if len(tokens) - index < 3:
+                return None
+            (lo_kind, lo), (hi_kind, hi) = tokens[index], tokens[index + 1]
+            if lo_kind != "hex" or hi_kind != "hex":
+                return None
+            low, high = int(lo, 16), int(hi, 16)
+            if high < low or high - low > 0xFFFF:
+                return None
+            nibbles = max(nibbles, len(lo), len(hi))
+            index += 2
+            kind, value = tokens[index]
+            if kind == "hex":
+                # A range counts its destination up with the code: the last
+                # unit increments, which for a hex string is the whole number.
+                start = int(value, 16)
+                for code in range(low, high + 1):
+                    if not record(code, f"{start + code - low:0{len(value)}x}"):
+                        return None
+                index += 1
+            elif kind == "[":
+                index += 1
+                code = low
+                while index < len(tokens) and tokens[index][0] == "hex":
+                    if code <= high and not record(code, tokens[index][1]):
+                        return None
+                    code += 1
+                    index += 1
+                if index >= len(tokens) or tokens[index][0] != "]":
+                    return None
+                index += 1
+            else:
+                return None
+
+    return mapping, nibbles
+
+
+def _tounicode_runs(mapping: dict[int, tuple[str, str]]):
+    """`mapping` split into `(code, destination)` singles and countable runs.
+
+    A CMap that spelled a whole font out one entry at a time would be several
+    times the size of the one we read, and most of a font's map is Latin or
+    CJK that still counts up perfectly — it is only the Arabic that stops
+    doing so, because many shapes collapse onto the same letter. So keep the
+    ranges where they still hold. Per the spec only the LAST byte of a
+    destination counts up, so a run never crosses a 256 boundary.
+    """
+    items = sorted(mapping.items())
+    index = 0
+    while index < len(items):
+        code, (text, dst) = items[index]
+        length = 1
+        if len(text) == 1 and ord(text) < 0x10000:
+            start = int(dst, 16)
+            limit = 0xFF - (start & 0xFF)
+            while (index + length < len(items)
+                   and length <= limit
+                   and items[index + length][0] == code + length
+                   and len(items[index + length][1][0]) == 1
+                   and int(items[index + length][1][1], 16) == start + length
+                   and len(items[index + length][1][1]) == len(dst)):
+                length += 1
+        yield code, dst, length
+        index += length
+
+
+def render_tounicode_body(mapping: dict[int, tuple[str, str]], nibbles: int) -> str:
+    """`mapping` as CMap sections — the body between codespace and endcmap."""
+    singles, ranges = [], []
+    for code, dst, length in _tounicode_runs(mapping):
+        if length > 1:
+            ranges.append(
+                f"<{code:0{nibbles}x}><{code + length - 1:0{nibbles}x}><{dst}>"
+                .upper())
+        else:
+            singles.append(f"<{code:0{nibbles}x}><{dst}>".upper())
+
+    lines = []
+    for keyword, entries in (("bfchar", singles), ("bfrange", ranges)):
+        for block in batched(entries, 100):
+            lines.append(f"{len(block)} begin{keyword}")
+            lines.extend(block)
+            lines.append(f"end{keyword}")
+    return "\n".join(lines)
+
+
+def _glyph_unicode_from_font_program(data: bytes) -> dict[int, str]:
+    """`glyph id -> the text it stands for`, read out of an embedded font.
+
+    Two passes, in the order a viewer would want them. The cmap gives the
+    codepoint each glyph is reached by directly (the highest one, which is how
+    the reverse map a viewer builds resolves a tie). Then the substitution
+    tables carry that text along every single-substitution and ligature edge,
+    which is the only way to name a glyph a shaper produced — those have no
+    cmap entry at all, and are exactly the glyphs that extract as mojibake.
+    """
+    from fontTools.ttLib import TTFont
+
+    font = TTFont(io.BytesIO(data), lazy=True, fontNumber=0)
+    try:
+        order = font.getGlyphOrder()
+        by_name: dict[str, str] = {}
+        if "cmap" in font:
+            highest: dict[str, int] = {}
+            for code, name in font.getBestCmap().items():
+                if highest.get(name, -1) < code:
+                    highest[name] = code
+            by_name = {
+                name: normalize_arabic_presentation_forms(chr(code))
+                for name, code in highest.items()
+            }
+
+        singles, ligatures = [], []
+        if "GSUB" in font and font["GSUB"].table.LookupList:
+            for lookup in font["GSUB"].table.LookupList.Lookup:
+                for subtable in lookup.SubTable or ():
+                    kind = lookup.LookupType
+                    if kind == 7:  # extension: the real subtable is inside
+                        kind = subtable.ExtensionLookupType
+                        subtable = subtable.ExtSubTable
+                    if kind == 1 and getattr(subtable, "mapping", None):
+                        singles.append(subtable.mapping)
+                    elif kind == 4 and getattr(subtable, "ligatures", None):
+                        ligatures.append(subtable.ligatures)
+
+        # A substitution chain can be several hops long (isolated -> initial ->
+        # a stylistic alternate), so run to a fixpoint rather than once.
+        for _ in range(8):
+            changed = False
+            for mapping in singles:
+                for source, target in mapping.items():
+                    if target not in by_name and source in by_name:
+                        by_name[target] = by_name[source]
+                        changed = True
+            for ligature_sets in ligatures:
+                for first, records in ligature_sets.items():
+                    if first not in by_name:
+                        continue
+                    for record in records:
+                        parts = [by_name[first]]
+                        parts.extend(
+                            by_name.get(component, "")
+                            for component in record.Component
+                        )
+                        if record.LigGlyph not in by_name and all(parts):
+                            by_name[record.LigGlyph] = "".join(parts)
+                            changed = True
+            if not changed:
+                break
+
+        return {
+            gid: by_name[name]
+            for gid, name in enumerate(order)
+            if name in by_name and by_name[name]
+        }
+    finally:
+        font.close()
+
+
+def _font_program_bytes(doc, font_xref: int) -> bytes | None:
+    """The TrueType program behind a Type0 font, if it is embedded plainly."""
+    descendants = doc.xref_get_key(font_xref, "DescendantFonts")
+    if descendants[0] != "array":
+        return None
+    try:
+        descendant = to_int(descendants[1])
+        # A CIDToGIDMap stream means the code in the stream is not the glyph
+        # id, and every gap we filled would land on the wrong glyph.
+        cid_to_gid = doc.xref_get_key(descendant, "CIDToGIDMap")
+        if cid_to_gid[0] not in ("null", "name") or (
+            cid_to_gid[0] == "name" and cid_to_gid[1] != "/Identity"
+        ):
+            return None
+        font_file = doc.xref_get_key(descendant, "FontDescriptor/FontFile2")
+        if font_file[0] != "xref":
+            return None
+        return doc.xref_stream(to_int(font_file[1]))
+    except Exception:  # noqa: BLE001 - an unreadable font is simply skipped
+        return None
+
+
+def _normalize_one_font(doc, font_xref: int) -> bool:
+    """Put the letters back in one font's ToUnicode. True if it changed."""
+    to_unicode = doc.xref_get_key(font_xref, "ToUnicode")
+    if to_unicode[0] != "xref":
+        return False
+    stream_xref = to_int(to_unicode[1])
+    data = doc.xref_stream(stream_xref)
+    if not data:
+        return False
+
+    parsed = parse_tounicode_map(data)
+    if parsed is None:
+        logger.debug("cmap: font %s has a ToUnicode we cannot rewrite", font_xref)
+        return False
+    mapping, nibbles = parsed
+
+    # The pass exists for Arabic. A CMap with no presentation form in it is
+    # left byte-identical, which is what keeps this safe to run over the
+    # original document's own fonts.
+    if not any(
+        is_arabic_presentation_form(ord(char))
+        for text, _ in mapping.values()
+        for char in text
+    ):
+        return False
+
+    updated: dict[int, tuple[str, str]] = {}
+    for code, (text, dst) in mapping.items():
+        folded = normalize_arabic_presentation_forms(text)
+        updated[code] = (
+            (text, dst) if folded == text
+            else (folded, folded.encode("utf-16-be").hex())
+        )
+
+    program = _font_program_bytes(doc, font_xref)
+    if program:
+        try:
+            glyphs = _glyph_unicode_from_font_program(program)
+        except Exception:  # noqa: BLE001 - a font we cannot read is not fatal
+            logger.debug("cmap: font %s program is unreadable", font_xref,
+                         exc_info=True)
+            glyphs = {}
+        # Only a genuine subset: see _MAX_SUBSET_GLYPHS_FOR_GAP_FILL.
+        if glyphs and len(glyphs) <= _MAX_SUBSET_GLYPHS_FOR_GAP_FILL:
+            for gid, text in glyphs.items():
+                if gid not in updated:
+                    updated[gid] = (text, text.encode("utf-16-be").hex())
+
+    if updated == mapping:
+        return False
+
+    body = render_tounicode_body(updated, nibbles)
+    replaced, count = _CMAP_BODY_RE.subn(
+        lambda match: match.group(1) + b"\n" + body.encode("ascii") + b"\n"
+        + match.group(3),
+        data,
+        count=1,
+    )
+    if not count:
+        return False
+    doc.update_stream(stream_xref, replaced)
+    return True
+
+
+def normalize_arabic_text_layer(doc) -> int:
+    """Rewrite every ToUnicode CMap in `doc` so Arabic extracts as letters.
+
+    Returns how many fonts were rewritten. A document with no Arabic
+    presentation forms in any CMap comes out untouched.
+    """
+    repaired = 0
+    for xref in range(1, doc.xref_length()):
+        try:
+            if doc.xref_get_key(xref, "Type")[1] != "/Font":
+                continue
+            repaired += _normalize_one_font(doc, xref)
+        except Exception:  # noqa: BLE001 - never lose a document over its text layer
+            logger.debug("cmap: could not normalize font %s", xref, exc_info=True)
+    if repaired:
+        logger.debug("cmap: rewrote %d Arabic ToUnicode map(s)", repaired)
+    return repaired
 
 
 def _subset_fonts_process(pdf_path, output_path):
