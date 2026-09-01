@@ -1322,6 +1322,21 @@ _ROW_GAP = 5.0
 _MIN_COLUMN_HEIGHT = 72.0
 _MIN_COLUMN_MARKS = 2
 _MIN_COLUMN_SHARE = 0.05
+# A corridor is read off the marks' x spans alone, which is how a page with no
+# columns at all acquires one: run8 p10 is a single full-page diagram with a
+# caption across the top (x 58.9-363.9) and a copyright line at the bottom
+# right (x 371.8-470.7). The two never coexist vertically, but between them
+# they leave a clear x range, so the page was split at x = 367.8, the two
+# leaves grew by different amounts, and the diagram that spans both was sliced
+# — its box outline two mismatched halves 30 pt apart, the word "Partial"
+# broken into "P" and "artial". The image itself is a backdrop, so the
+# splitter could not see the thing it was cutting.
+#
+# So the two sides of a corridor have to actually EXIST at the same heights
+# before it is believed to be one. Deliberately low: a real two-column page
+# measures 40-60% here (the air between its own lines is counted against it),
+# and the coincidences measure under 2%.
+_MIN_COLUMN_COEXIST = 0.15
 _MAX_REGION_DEPTH = 4
 
 # A single band may not open wider than this share of the original page. Only
@@ -1666,6 +1681,23 @@ def _substantial(runs: list[tuple[float, float]],
     return kept
 
 
+def _coexist(edge: float, marks: list[pymupdf.Rect],
+             rect: pymupdf.Rect) -> float:
+    """How much of `rect`'s height has marks on BOTH sides of `edge`.
+
+    The evidence a candidate corridor is a corridor: two flows running beside
+    each other, rather than two things that happen to sit at opposite corners
+    of the page. See {@link _MIN_COLUMN_COEXIST}.
+    """
+    left = _merge_spans([(mark.y0, mark.y1) for mark in marks
+                         if mark.x1 <= edge], 0.0)
+    right = _merge_spans([(mark.y0, mark.y1) for mark in marks
+                          if mark.x0 >= edge], 0.0)
+
+    return sum(max(0.0, min(low, high) - max(start, top))
+               for start, low in left for top, high in right)
+
+
 def _split_region(rect: pymupdf.Rect, blockers: list[pymupdf.Rect], depth: int,
                   column: pymupdf.Rect) -> _Region:
     """`rect` divided into the parts of it that can be opened independently."""
@@ -1682,7 +1714,9 @@ def _split_region(rect: pymupdf.Rect, blockers: list[pymupdf.Rect], depth: int,
             runs = _substantial(
                 _merge_spans([(mark.x0, mark.x1) for mark in inside], _COL_GAP),
                 inside)
-            edges = _cut_lines(runs, rect.x0, rect.x1)
+            edges = [edge for edge in _cut_lines(runs, rect.x0, rect.x1)
+                     if _coexist(edge, inside, rect)
+                     >= _MIN_COLUMN_COEXIST * rect.height]
 
             if edges:
                 bounds = [rect.x0, *edges, rect.x1]

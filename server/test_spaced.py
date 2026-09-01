@@ -614,6 +614,57 @@ def test_a_rotated_label_does_not_blow_the_page_open():
     assert _page_size(pdf)[1] - PAGE[1] < 160
 
 
+def test_a_caption_and_a_footnote_at_opposite_corners_are_not_a_column():
+    """run8 p10: one full-page diagram, split in half and torn.
+
+    The page is a single figure with a caption across the top
+    (x 58.9-363.9) and a copyright line at the bottom right
+    (x 371.8-470.7). The two never coexist vertically, but between them they
+    leave a clear x range — so the page was read as two columns and split at
+    x = 367.8. The two leaves then grew by different amounts and the diagram
+    that spans both was sliced: its outline two mismatched halves 30 pt apart,
+    the word "Partial" broken into "P" and "artial". The figure is a backdrop,
+    so the splitter could not see the thing it was cutting.
+    """
+    rect = pymupdf.Rect(0, 0, 842, 595)
+    caption = pymupdf.Rect(59, 30, 364, 44)
+    footnote = pymupdf.Rect(372, 560, 471, 572)
+
+    # Opposite corners: no height at all has marks on both sides.
+    assert interlinear._coexist(368.0, [caption, footnote], rect) < 1.0
+
+    # Two real columns running beside each other: most of the height does.
+    left = pymupdf.Rect(59, 60, 364, 540)
+    right = pymupdf.Rect(400, 60, 780, 540)
+
+    assert (interlinear._coexist(382.0, [left, right], rect)
+            > interlinear._MIN_COLUMN_COEXIST * rect.height)
+
+
+def test_the_splitter_refuses_the_imagined_corridor():
+    """The same page at the splitter: one region, so nothing can shear.
+
+    Two leaves open their bands at different places, and whatever spans them
+    is left in two halves at two heights — which on run8 p10 is the whole
+    figure.
+    """
+    rect = pymupdf.Rect(0, 0, 842, 595)
+    caption = pymupdf.Rect(59, 30, 364, 44)
+    footnote = pymupdf.Rect(372, 560, 471, 572)
+
+    imagined = interlinear._split_region(rect, [caption, footnote], 0, rect)
+
+    assert imagined.axis != "columns", "the page was split at a coincidence"
+
+    # And a page that really does have two columns is still split into them.
+    columns = interlinear._split_region(
+        rect, [pymupdf.Rect(59, 60, 364, 540),
+               pymupdf.Rect(400, 60, 780, 540)], 0, rect)
+
+    assert columns.axis == "columns"
+    assert len(columns.children) == 2
+
+
 def test_a_filled_panel_is_opened_up_rather_than_stepped_around():
     """A cut through the middle of a solid box reopens as more of the box."""
     builder = _Builder()
