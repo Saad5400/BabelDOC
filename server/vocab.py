@@ -16,6 +16,11 @@ never comes back on page 7 — and the caller may pass an exclusion list of
 terms already explained elsewhere (a sidecar's deep-terms "glossary", when one
 exists), so no word is ever explained twice.
 
+Arabic comes back undiacritised — the document body carries no tashkeel, and
+the same `postprocess_arabic_translation` every translated paragraph goes
+through is applied to every meaning here, so the prompt's request is backed by
+a guarantee.
+
 One JSON-mode chat call covers the whole document; a document whose source text
 exceeds {@link CHUNK_WORDS} words is split into page-aligned chunks, each call
 carrying the words already introduced so far so later chunks keep the
@@ -71,12 +76,13 @@ _SYSTEM_PROMPT = """\
 
 لكل كلمة:
 - w: الكلمة أو العبارة كما وردت في النص.
-- ar: معناها بالعربية في كلمة إلى خمس كلمات.
+- ar: معناها بالعربية في كلمة إلى خمس كلمات، بلا تشكيل — اكتب «يصرح عنه» \
+لا «يُصرَّح عنه».
 - note (اختياري): عبارة توضيحية قصيرة واحدة بالعربية — مثلًا لتمييز المعنى \
 المقصود هنا عن المعنى الشائع.
 
 أرجع JSON فقط بهذا الشكل، ومفاتيح الصفحات هي الأرقام المعطاة في النص حرفيًا:
-{"vocab": {"3": [{"w": "declared", "ar": "يُصرَّح عنه",
+{"vocab": {"3": [{"w": "declared", "ar": "يصرح عنه",
                   "note": "في البرمجة: تعريف المتغير قبل استخدامه"}]}}
 """
 
@@ -157,19 +163,39 @@ def build_prompt(chunk: list[tuple[int, str]], introduced: list[str]) -> str:
     return "\n\n".join(parts)
 
 
+def _undiacritise(text: str) -> str:
+    """`text` through the body translation's own Arabic post-processor.
+
+    The document body carries no tashkeel — babeldoc strips it from every
+    translated paragraph — so a strip that does carries it alone. This is the
+    same function, not a second rule: the prompt asks, this guarantees.
+    """
+    try:
+        from babeldoc.format.pdf.document_il.midend.il_translator import (
+            postprocess_arabic_translation)
+    except Exception:  # noqa: BLE001 - a gloss with tashkeel beats no gloss
+        logger.exception("vocab: the Arabic post-processor is unavailable; "
+                         "meanings ship as the model wrote them")
+        return text
+
+    # The source is English, so it never carries diacritics: the strip is
+    # unconditional, exactly as it is for a body paragraph.
+    return postprocess_arabic_translation("", text)
+
+
 def _clean_entry(item: Any) -> dict | None:
     """One model item as a stored entry, or None when it is not usable."""
     if not isinstance(item, dict):
         return None
 
     word = str(item.get("w") or "").strip()
-    arabic = str(item.get("ar") or "").strip()
+    arabic = _undiacritise(str(item.get("ar") or "").strip()).strip()
 
     if not word or not arabic:
         return None
 
     entry = {"w": word, "ar": arabic}
-    note = str(item.get("note") or "").strip()
+    note = _undiacritise(str(item.get("note") or "").strip()).strip()
 
     if note:
         entry["note"] = note

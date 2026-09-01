@@ -47,7 +47,7 @@ def _reply(pages: dict) -> str:
     return json.dumps({"vocab": pages}, ensure_ascii=False)
 
 
-ENTRY = {"w": "declared", "ar": "يُصرَّح عنه"}
+ENTRY = {"w": "declared", "ar": "يصرح عنه"}
 
 
 # --------------------------------------------------------------------------
@@ -87,6 +87,31 @@ def test_parse_keeps_an_optional_note_and_strips_whitespace():
 def test_parse_refuses_a_non_object_reply():
     with pytest.raises(ValueError, match="no vocab"):
         vocab.parse_response(json.dumps([ENTRY]))
+
+
+# --------------------------------------------------------------------------
+# The Arabic: no tashkeel, ever
+# --------------------------------------------------------------------------
+
+def test_tashkeel_is_stripped_from_the_meaning_and_the_note():
+    # The body of every translation is undiacritised by babeldoc's own
+    # post-processor; a strip that carries tashkeel carries it alone.
+    parsed = vocab.parse_response(json.dumps({"0": [
+        {"w": "declared", "ar": "يُصرَّح عنه",
+         "note": "تعريف المتغيِّر قبل استخدامه"}]}, ensure_ascii=False))
+
+    assert parsed == {0: [{"w": "declared", "ar": "يصرح عنه",
+                           "note": "تعريف المتغير قبل استخدامه"}]}
+
+
+def test_the_prompts_own_worked_example_carries_no_tashkeel():
+    # The example is the strongest instruction in the prompt: a diacritised
+    # one is why 10% of the delivered rows came back diacritised.
+    diacritics = set("ًٌٍَُِّْٰ")
+    example = vocab._SYSTEM_PROMPT.split('{"vocab"')[-1]
+
+    assert '"ar": "يصرح عنه"' in example
+    assert not diacritics & set(example)
 
 
 # --------------------------------------------------------------------------
@@ -166,7 +191,7 @@ def test_a_long_document_is_chunked_and_later_chunks_know_the_earlier_words():
     client = _FakeClient([
         _reply({"0": [ENTRY]}),
         _reply({"1": [{"w": "declared", "ar": "آخر"},
-                      {"w": "evolved", "ar": "تطوَّر"}]}),
+                      {"w": "evolved", "ar": "تطور"}]}),
     ])
 
     result = vocab.extract_vocab(_sidecar({0: long_page, 1: long_page}),
@@ -177,7 +202,7 @@ def test_a_long_document_is_chunked_and_later_chunks_know_the_earlier_words():
     assert "declared" in client.prompts[1]
     assert "declared" not in client.prompts[0]
     # ...and the dedupe holds even if the model repeats it anyway.
-    assert result == {"0": [ENTRY], "1": [{"w": "evolved", "ar": "تطوَّر"}]}
+    assert result == {"0": [ENTRY], "1": [{"w": "evolved", "ar": "تطور"}]}
 
 
 def test_a_failing_later_chunk_keeps_the_earlier_chunks_words():
