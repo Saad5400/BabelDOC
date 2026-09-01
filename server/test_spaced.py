@@ -569,6 +569,51 @@ def test_a_deck_whose_decoration_is_forty_shapes_still_gets_line_glosses():
         ceiling = line.y1
 
 
+def test_a_missing_font_size_is_guessed_from_the_line_not_the_box():
+    """`font_size` is null on 431 corpus blocks, 243 of them taller than wide.
+
+    The box HEIGHT used to stand in — and for a ROTATED block that is not the
+    type size, it is the length of the line. run67 p6's vertical label
+    "focus of this course" has a 94.5 pt tall box, so its gloss was asked for
+    at 0.78 x 94.5 = 73.7 pt and clamped to the 28 pt ceiling.
+    """
+    rotated = pymupdf.Rect(500, 240, 513, 334)
+    block = {"box": [500, 240, 513, 334], "lines": [[500, 240, 513, 334]],
+             "target": AR_ONE, "font_size": None}
+
+    # A line of type is as thick as its size whichever way round it is drawn.
+    assert interlinear._source_size(block, rotated, 11.0) == pytest.approx(13.0)
+    # The page's own body size is the ceiling on a guess, not a suggestion.
+    assert interlinear._source_size(block, rotated, 5.0) == pytest.approx(10.0)
+    # A recorded size is always believed, however odd the box.
+    assert interlinear._source_size({**block, "font_size": 40.0}, rotated,
+                                    11.0) == pytest.approx(40.0)
+    # And the median is taken from what the page actually recorded.
+    assert interlinear._typical_size(
+        [{"font_size": 9.0}, {"font_size": 11.0}, {"font_size": 40.0},
+         {"font_size": None}]) == pytest.approx(11.0)
+
+
+def test_a_rotated_label_does_not_blow_the_page_open():
+    """The same fault end to end: what the bad guess cost the page."""
+    builder = _Builder()
+
+    for index in range(3):
+        builder.text(60, 100 + index * 20, "Body text on the slide", 11.0,
+                     gloss=AR_ONE)
+
+    label = pymupdf.Rect(500, 240, 513, 334)
+    builder.blocks.append({"box": label, "lines": [label], "target": AR_TWO,
+                           "font_size": None, "source": "focus of this course"})
+
+    pdf, report = _render(builder)
+
+    assert report["drawn"] == 4
+    # Sized from the label, the page opens by ~116 pt; sized from the rotated
+    # box it opened by 239.
+    assert _page_size(pdf)[1] - PAGE[1] < 160
+
+
 def test_a_filled_panel_is_opened_up_rather_than_stepped_around():
     """A cut through the middle of a solid box reopens as more of the box."""
     builder = _Builder()

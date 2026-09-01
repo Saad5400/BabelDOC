@@ -932,6 +932,7 @@ def _render_raster(page: pymupdf.Page, blocks: list[dict], layout: _Layout,
     """
     options = layout.options
     plate_rgb = _hex_rgb(options.plate_color)
+    typical = _typical_size(blocks)
     masks: dict[tuple[float, float, float, float], _RegionInk] = {}
     taken: list[pymupdf.Rect] = []
     drawn = skipped = 0
@@ -954,7 +955,7 @@ def _render_raster(page: pymupdf.Page, blocks: list[dict], layout: _Layout,
         if key not in masks:
             masks[key] = _RegionInk(page, region)
 
-        source_size = float(block.get("font_size") or 0) or anchor.height
+        source_size = _source_size(block, anchor, typical)
         found = _raster_placement(layout, block["target"].strip(), anchor,
                                   region, source_size, masks[key], taken)
 
@@ -974,6 +975,59 @@ def _render_raster(page: pymupdf.Page, blocks: list[dict], layout: _Layout,
         drawn += 1
 
     return drawn, skipped
+
+
+def _typical_size(blocks: list[dict]) -> float:
+    """The median font size this page actually recorded, or 0 if none did.
+
+    The backstop for {@link _source_size} when a block carries no size of its
+    own: whatever the rest of the page is set in is a far better guess than
+    anything the missing block's own geometry can offer.
+    """
+    sizes = sorted(float(block["font_size"]) for block in blocks
+                   if block.get("font_size"))
+
+    return sizes[len(sizes) // 2] if sizes else 0.0
+
+
+def _source_size(block: dict, anchor: pymupdf.Rect, typical: float) -> float:
+    """The type size this block's gloss is proportioned against.
+
+    `font_size` when the run recorded one, which is almost always. When it did
+    not, the box's HEIGHT used to stand in — and for a ROTATED block that is
+    not the type size, it is the length of the line: run67 p6's vertical label
+    "focus of this course" has a 94.5 pt tall box, so its gloss was requested
+    at 0.78 x 94.5 = 73.7 pt, clamped to the 28 pt ceiling, and a 28 pt gloss
+    of the extractor's letter-soup (`rse f this cou focus o`) demanded a band
+    tall enough to hold it. The slide's title panel grew from 65 pt to 318 pt
+    to provide one. 431 blocks corpus-wide carry no size, 243 of them taller
+    than wide.
+
+    So the guess comes from the block's own LINES where it has them, from its
+    shorter dimension where it does not — a line of type is as thick as its
+    size whichever way round it is drawn — and is held to what the rest of the
+    page is set in, which is the one measurement that is never a guess.
+    """
+    size = float(block.get("font_size") or 0)
+
+    if size > 0:
+        return size
+
+    lines = [line for line in (block.get("lines") or []) if line]
+
+    if lines:
+        heights = sorted(min(abs(line[3] - line[1]), abs(line[2] - line[0]))
+                         for line in lines)
+        size = heights[len(heights) // 2]
+    else:
+        size = min(anchor.width, anchor.height)
+
+    if typical > 0:
+        # Twice the page's own body size is already a heading; anything past
+        # that is the geometry lying, not a bigger heading.
+        size = min(size, 2 * typical)
+
+    return size or anchor.height
 
 
 def _says_nothing(block: dict) -> bool:
@@ -1043,10 +1097,11 @@ def _render_page(page: pymupdf.Page, page_data: dict,
         # the obstacle set — _spread has to be able to tell a paragraph's own
         # box apart from every other rect in there. Each is grown to cover the
         # glyphs the sidecar's box falls short of.
+        typical = _typical_size(blocks + raster)
         anchors = [
             _cover_ink(_to_display(block["box"], matrix),
-                       float(block.get("font_size") or 0)
-                       or _to_display(block["box"], matrix).height, ink)
+                       _source_size(block, _to_display(block["box"], matrix),
+                                    typical), ink)
             for block in blocks
         ]
         # The page's own ink joins the obstacle set: it is the truthful account
@@ -1070,7 +1125,7 @@ def _render_page(page: pymupdf.Page, page_data: dict,
 
         for block, anchor in zip(blocks, anchors, strict=False):
             text = block["target"].strip()
-            source_size = float(block.get("font_size") or 0) or anchor.height
+            source_size = _source_size(block, anchor, typical)
             lines = [_cover_ink(_to_display(line, matrix), source_size, ink)
                      for line in (block.get("lines") or [])]
 
@@ -1742,11 +1797,11 @@ def _ink_bounds(box: pymupdf.Rect, ink: list[pymupdf.Rect],
                         bounds.x1, min(bounds.y1, box.y1 + reach))
 
 
-def _spaced_units(block: dict, matrix: pymupdf.Matrix,
-                  ink: list[pymupdf.Rect]) -> tuple[pymupdf.Rect, list, float]:
+def _spaced_units(block: dict, matrix: pymupdf.Matrix, ink: list[pymupdf.Rect],
+                  typical: float = 0.0) -> tuple[pymupdf.Rect, list, float]:
     """One paragraph as `(anchor, [(line, chunk)], source_size)`."""
     anchor = _to_display(block["box"], matrix)
-    source_size = float(block.get("font_size") or 0) or anchor.height
+    source_size = _source_size(block, anchor, typical)
     text = block["target"].strip()
     # A line of the paragraph's own type is the slack a mark may claim, for
     # the anchor as much as for one line: the anchor's job is to say where the
@@ -2090,8 +2145,10 @@ def _spaced_page(target: pymupdf.Document, source: pymupdf.Document, index: int,
     fallbacks: list[tuple[pymupdf.Rect, str, float]] = []
     drawn = skipped = 0
 
+    typical = _typical_size(blocks + raster)
+
     for block in blocks:
-        anchor, units, source_size = _spaced_units(block, matrix, ink)
+        anchor, units, source_size = _spaced_units(block, matrix, ink, typical)
         text = block["target"].strip()
         anchors.append(anchor)
         limit = max(2.0, _CUT_LOOKUP * source_size)
