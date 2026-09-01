@@ -4,12 +4,15 @@ Run: uvicorn server.app:app --host 0.0.0.0 --port 8000
 """
 
 import dataclasses
+import functools
 import hmac
 import json
 import subprocess
 from contextlib import asynccontextmanager
+from io import BytesIO
 
 import anyio.to_thread
+import pymupdf
 from fastapi import Depends
 from fastapi import FastAPI
 from fastapi import File
@@ -29,6 +32,336 @@ from server import jobs
 from server import notes_space
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+
+# How far a page may differ from the size the sidecar recorded for it and
+# still count as the same page. A point of slack absorbs the round trip
+# through JSON and PDF number formatting; it is far tighter than the gap
+# between any two real documents. MEASURED across the 14 production runs the
+# sweep collected: every correct (document, sidecar) pair agrees exactly.
+GEOMETRY_TOLERANCE = 1.0
+
+
+def _blocking(func, /, *args, **kwargs):
+    """Run a CPU-bound builder off the event loop.
+
+    Every stateless builder here is synchronous and spends seconds to a minute
+    inside pymupdf. Called directly from an `async def` handler it owns the
+    event loop for that whole time: no other request is even READ, so a free
+    layout download stalls every job poll and every health check in the
+    process — and an orchestrator that gets no answer from /healthz restarts
+    the container, which fails whatever paid translation was running
+    (server/jobs.py marks it "server restarted while job was running").
+
+    server/convert.py's docstring diagnosed exactly this for /v1/convert and
+    fixed it there; this is the same fix for the other four. The handlers stay
+    `async def` because each has to `await` its uploads first, so they cannot
+    take Starlette's threadpool for free the way a plain `def` endpoint does —
+    they hand the CPU work over explicitly instead.
+    """
+    return anyio.to_thread.run_sync(functools.partial(func, *args, **kwargs))
+
+
+def _open_pdf(data: bytes, part: str) -> pymupdf.Document:
+    """The uploaded bytes as a document, or a 422 saying why not.
+
+    One place, so every endpoint refuses an unreadable upload the same way.
+    Two things go wrong here and only one of them raises: a file pymupdf
+    cannot parse throws at open, while a PASSWORD-PROTECTED one opens
+    happily — `page_count` is even correct — and only explodes on the first
+    page access, deep inside a builder, as a 500. `needs_pass` is the missing
+    half, and a password-protected upload is the ordinary case: a student
+    hands over the locked PDF the university published.
+
+    The caller owns the returned document and must close it.
+    """
+    try:
+        doc = pymupdf.open(stream=BytesIO(data), filetype="pdf")
+    except Exception as exc:  # noqa: BLE001 - pymupdf raises many error types
+        raise HTTPException(
+            status_code=422,
+            detail=f"{part} is not a readable PDF: {exc}") from exc
+
+    if doc.needs_pass:
+        doc.close()
+        raise HTTPException(
+            status_code=422,
+            detail=f"{part} is password-protected; it has to be unlocked first")
+
+    if doc.page_count == 0:
+        doc.close()
+        raise HTTPException(status_code=422, detail=f"{part} has no pages")
+
+    return doc
+
+
+def _scrub_surrogates(value):
+    """A parsed sidecar with its unpaired surrogates dropped.
+
+    A sidecar's `target` strings are LLM output that was serialised to JSON
+    and stored. An LLM that emits half an emoji puts a lone `\\ud83d` in
+    there, `json.loads` accepts it without complaint (it pairs well-formed
+    surrogates into real characters and leaves the odd one alone), and then
+    the first `.encode("utf-8")` anywhere downstream raises — so ONE bad
+    character means every future free rebuild of that run is a 500, for ever,
+    with no way back short of paying for the translation again.
+
+    Dropped rather than replaced: what is left is exactly the text minus a
+    character that was never a character.
+    """
+    if isinstance(value, str):
+        return "".join(char for char in value
+                       if not 0xD800 <= ord(char) <= 0xDFFF)
+    if isinstance(value, list):
+        return [_scrub_surrogates(item) for item in value]
+    if isinstance(value, dict):
+        return {_scrub_surrogates(key): _scrub_surrogates(item)
+                for key, item in value.items()}
+    return value
+
+
+def _parse_sidecar(raw: bytes, part: str = "sidecar"):
+    """The sidecar part as data: JSON, then scrubbed of lone surrogates.
+
+    The scrub walks the whole structure (MEASURED: 7 ms on run30's 158 KB
+    sidecar, 11 ms on run20's 322 KB), so it is skipped unless the raw bytes
+    could possibly carry a surrogate. There are exactly two ways one reaches
+    `json.loads`, and each leaves its own fingerprint in the bytes:
+
+    * a `\\uD…` escape — the ensure_ascii spelling;
+    * a 0xED lead byte — `json.loads` decodes a BYTES argument with
+      `surrogatepass`, so the three-byte form sails straight through and
+      comes back out as a lone surrogate. That is the one that bites: it does
+      not look like an encoding error to anything upstream.
+
+    Neither fingerprint occurs in any of the 14 production sidecars the sweep
+    collected, so in practice this costs one substring scan.
+    """
+    try:
+        parsed = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=422,
+                            detail=f"{part} is not valid JSON: {exc}") from exc
+
+    if b"\\ud" in raw.lower() or b"\xed" in raw:
+        return _scrub_surrogates(parsed)
+
+    return parsed
+
+
+def _sidecar_page_count(sidecar: dict) -> int | None:
+    """How many pages the run had, per the sidecar's own record of itself."""
+    count = sidecar.get("total_pages")
+
+    if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+        return count
+
+    pages = sidecar.get("pages")
+
+    return len(pages) if isinstance(pages, list) and pages else None
+
+
+def _sidecar_page_sizes(sidecar: dict) -> dict[int, tuple[float, float]]:
+    """(width, height) per page number, for the entries that record a box.
+
+    Uploader-supplied, so an entry that is not a four-number mediabox is
+    simply not a size we can check against — dropped, not fatal.
+    """
+    sizes: dict[int, tuple[float, float]] = {}
+
+    for entry in sidecar.get("pages") or ():
+        if not isinstance(entry, dict):
+            continue
+
+        number = entry.get("page_number")
+        box = entry.get("mediabox")
+
+        if not isinstance(number, int) or isinstance(number, bool):
+            continue
+        if not isinstance(box, list) or len(box) != 4:
+            continue
+
+        try:
+            x0, y0, x1, y1 = (float(value) for value in box)
+        except (TypeError, ValueError):
+            continue
+
+        sizes[number] = (abs(x1 - x0), abs(y1 - y0))
+
+    return sizes
+
+
+def _content_positions(sidecar: dict) -> list[int] | None:
+    """The baked mono's content-page positions, or None for "not recorded".
+
+    Reads `artifact_layout.content_pages` by exactly the rule compose.py
+    reads it by (strictly increasing non-negative ints, else the layout is
+    junk and the mono is treated as pre-vocab), so the identity check below
+    and the strip that follows it agree on what the sidecar says.
+    """
+    layout = sidecar.get("artifact_layout")
+    positions = layout.get("content_pages") if isinstance(layout, dict) else None
+
+    if not isinstance(positions, list) or not positions:
+        return None
+
+    for index, position in enumerate(positions):
+        if not isinstance(position, int) or isinstance(position, bool):
+            return None
+        if position < 0 or (index and position <= positions[index - 1]):
+            return None
+
+    return positions
+
+
+def _strip_heights(sidecar: dict) -> dict[int, float]:
+    """Per-content-page baked vocab strip heights, read compose.py's way."""
+    layout = sidecar.get("artifact_layout")
+    strips = layout.get("vocab_strips") if isinstance(layout, dict) else None
+    out: dict[int, float] = {}
+
+    if not isinstance(strips, dict):
+        return out
+
+    for key, value in strips.items():
+        try:
+            index, height = int(key), float(value)
+        except (TypeError, ValueError):
+            continue
+
+        if index >= 0 and 0 < height <= 14400:  # NaN fails both comparisons
+            out[index] = height
+
+    return out
+
+
+def _reject_foreign_sidecar(detail: str):
+    raise HTTPException(
+        status_code=422,
+        detail=f"{detail} — the sidecar and the PDF are not from the same run")
+
+
+def _require_a_sidecar(sidecar) -> None:
+    """Refuse a sidecar that is not demonstrably FOR this document.
+
+    A sidecar and a PDF arrive as two independent uploads, and nothing in
+    either one says which run it came from. Get the pairing wrong and the
+    builders do not fail — they succeed on the wrong document: a foreign
+    sidecar strips a 25-page translation down to four cropped pages, or draws
+    another course's glosses over this one, and answers 200 with a
+    plausible-looking PDF that the caller then caches as the user's download.
+
+    The pairing is checked the only way the data allows: the run's page count
+    and every page's size have to be the document's own. That is not a proof
+    of identity, but a mismatch is conclusive, and MEASURED across the 14
+    production runs the sweep collected, every correct pair agrees exactly
+    and every mismatched pair is caught.
+
+    The gap it cannot close, said plainly: at strip-vocab, a sidecar that is
+    a strict PREFIX of this document and whose pages are the same size. A
+    baked mono is content pages plus vocabulary pages plus an appendix tail,
+    so pages the layout does not name are EXPECTED — "fewer pages than the
+    file" is a normal reading of a correct sidecar, and nothing in either
+    artifact says which run it came from. Closing it needs a run identifier
+    written into both; that is a change to what the pipeline emits, not
+    something this boundary can derive.
+    """
+    if not isinstance(sidecar, dict):
+        raise HTTPException(status_code=422,
+                            detail="sidecar is not a translation sidecar")
+
+    if _sidecar_page_count(sidecar) is None:
+        raise HTTPException(
+            status_code=422,
+            detail="sidecar records no pages, so it cannot be checked "
+                   "against the PDF it was sent with")
+
+
+def _require_sidecar_matches_original(sidecar, doc: pymupdf.Document) -> dict:
+    """The overlay's check: the sidecar describes THIS original, page for page.
+
+    interlinear.py already refuses a sidecar that names a page the original
+    does not have, but that guard is one-sided: a SHORTER sidecar from another
+    run names only pages that exist, so it sails through and its paragraphs
+    are drawn onto a document they have nothing to do with.
+    """
+    _require_a_sidecar(sidecar)
+    declared = _sidecar_page_count(sidecar)
+
+    if declared != doc.page_count:
+        _reject_foreign_sidecar(
+            f"the sidecar is for a {declared}-page document and the original "
+            f"has {doc.page_count}")
+
+    for number, (width, height) in _sidecar_page_sizes(sidecar).items():
+        if not 0 <= number < doc.page_count:
+            continue  # interlinear reports this one, in its own words
+
+        box = doc[number].mediabox
+
+        if (abs(box.width - width) > GEOMETRY_TOLERANCE
+                or abs(box.height - height) > GEOMETRY_TOLERANCE):
+            _reject_foreign_sidecar(
+                f"the sidecar's page {number + 1} is {width:.0f}x{height:.0f} "
+                f"and the original's is {box.width:.0f}x{box.height:.0f}")
+
+    return sidecar
+
+
+def _require_sidecar_matches_mono(sidecar, doc: pymupdf.Document) -> dict:
+    """The strip's check: the sidecar's layout describes THIS baked mono.
+
+    strip-vocab acts on positions the sidecar hands it — keep these pages,
+    crop this many points off those. Against the wrong document those are
+    instructions to delete and crop a stranger, carried out silently: 25 pages
+    in, four cropped ones out, HTTP 200.
+
+    Two shapes to check. A mono with a recorded `artifact_layout` says where
+    its content pages sit and how tall a vocab strip each carries, so each of
+    those pages must be its sidecar page's size PLUS its strip. A pre-vocab
+    mono records no layout, and is simply the translation page for page,
+    possibly with a baked appendix tail after it.
+    """
+    _require_a_sidecar(sidecar)
+    declared = _sidecar_page_count(sidecar)
+    positions = _content_positions(sidecar)
+    strips: dict[int, float] = {}
+
+    if positions is None:
+        if declared > doc.page_count:
+            _reject_foreign_sidecar(
+                f"the sidecar is for a {declared}-page translation and the "
+                f"file has {doc.page_count} pages")
+        positions = list(range(declared))
+    else:
+        if len(positions) != declared:
+            _reject_foreign_sidecar(
+                f"the sidecar's layout names {len(positions)} content pages "
+                f"for a {declared}-page translation")
+        if positions[-1] >= doc.page_count:
+            _reject_foreign_sidecar(
+                f"the sidecar's layout puts content on page "
+                f"{positions[-1] + 1} and the file has {doc.page_count} pages")
+        strips = _strip_heights(sidecar)
+
+    sizes = _sidecar_page_sizes(sidecar)
+
+    for index, position in enumerate(positions):
+        size = sizes.get(index)
+
+        if size is None:
+            continue
+
+        width, height = size
+        box = doc[position].mediabox
+        expected = height + strips.get(index, 0.0)
+
+        if (abs(box.width - width) > GEOMETRY_TOLERANCE
+                or abs(box.height - expected) > GEOMETRY_TOLERANCE):
+            _reject_foreign_sidecar(
+                f"the sidecar's page {index + 1} is {width:.0f}x{expected:.0f} "
+                f"and the file's is {box.width:.0f}x{box.height:.0f}")
+
+    return sidecar
 
 
 def _parse_flag(value: str, name: str) -> bool:
@@ -178,22 +511,24 @@ async def compose_dual(
             raise HTTPException(status_code=413, detail=f"{name} too large")
         if not pdf_bytes.startswith(b"%PDF-"):
             raise HTTPException(status_code=422, detail=f"{name} is not a PDF")
+        # compose reached 422 for a locked PDF only because pymupdf happened
+        # to throw later, with "File has not been decrypted" — true, and no
+        # use to a reader deciding what to do about it. Opened here for the
+        # same reason and in the same words as everywhere else.
+        _open_pdf(pdf_bytes, name).close()
 
     sidecar_data = None
     if sidecar is not None:
         sidecar_bytes = await sidecar.read()
         if len(sidecar_bytes) > MAX_UPLOAD_BYTES:
             raise HTTPException(status_code=413, detail="sidecar too large")
-        try:
-            sidecar_data = json.loads(sidecar_bytes)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise HTTPException(status_code=422,
-                                detail=f"sidecar is not valid JSON: {exc}") from exc
+        sidecar_data = _parse_sidecar(sidecar_bytes)
 
     try:
-        result = compose.compose_dual(parts["original"], parts["translated"],
-                                      format, sidecar=sidecar_data,
-                                      vocab=want_vocab)
+        result = await _blocking(compose.compose_dual,
+                                 parts["original"], parts["translated"],
+                                 format, sidecar=sidecar_data,
+                                 vocab=want_vocab)
     except compose.ComposeError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -246,11 +581,18 @@ async def overlay(
     if not original_bytes.startswith(b"%PDF-"):
         raise HTTPException(status_code=422, detail="original is not a PDF")
 
+    parsed = _parse_sidecar(sidecar_bytes)
+
+    # Opened HERE, once, rather than inside whichever style was asked for:
+    # the two styles open it independently and only one of them guarded the
+    # call, so the same unopenable upload was a clean 422 through
+    # interlinear_compact and a 500 through interlinear. Refusing it at the
+    # door also gives the identity check below the page sizes it needs.
+    source = _open_pdf(original_bytes, "original")
     try:
-        parsed = json.loads(sidecar_bytes)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=422,
-                            detail=f"sidecar is not valid JSON: {exc}") from exc
+        _require_sidecar_matches_original(parsed, source)
+    finally:
+        source.close()
 
     try:
         options = dataclasses.replace(
@@ -263,9 +605,9 @@ async def overlay(
                 ("plate_opacity", plate_opacity),
                 ("plate_padding", plate_padding))
                if value is not None})
-        result, report = interlinear.render_overlay(original_bytes, parsed,
-                                                    style=style, options=options,
-                                                    vocab=want_vocab)
+        result, report = await _blocking(interlinear.render_overlay,
+                                         original_bytes, parsed, style=style,
+                                         options=options, vocab=want_vocab)
     except interlinear.OverlayError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -356,14 +698,17 @@ async def strip_vocab(
     if not translated_bytes.startswith(b"%PDF-"):
         raise HTTPException(status_code=422, detail="translated is not a PDF")
 
+    sidecar_data = _parse_sidecar(sidecar_bytes)
+
+    mono = _open_pdf(translated_bytes, "translated")
     try:
-        sidecar_data = json.loads(sidecar_bytes)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=422,
-                            detail=f"sidecar is not valid JSON: {exc}") from exc
+        _require_sidecar_matches_mono(sidecar_data, mono)
+    finally:
+        mono.close()
 
     try:
-        result = compose.strip_vocab(translated_bytes, sidecar_data)
+        result = await _blocking(compose.strip_vocab,
+                                 translated_bytes, sidecar_data)
     except compose.ComposeError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -396,8 +741,8 @@ async def add_notes_space(
         raise HTTPException(status_code=422, detail="file is not a PDF")
 
     try:
-        result = notes_space.add_notes_space(data, notes_space.parse_sides(sides),
-                                             size=size)
+        result = await _blocking(notes_space.add_notes_space, data,
+                                 notes_space.parse_sides(sides), size=size)
     except notes_space.NotesSpaceError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -426,6 +771,15 @@ def get_job(job_id: str):
         body["usage"] = job["usage"]
     if job["status"] == "failed":
         body["error"] = job["error"]
+    # The source-language analysis, when the run has got far enough to have
+    # one. This body is an explicit allowlist rather than the job record, so
+    # a field the pipeline starts recording is invisible to the caller until
+    # it is named here — and this one is the difference between a reader
+    # being told their Arabic document was already Arabic and their being
+    # charged for a degraded Arabic-to-Arabic copy of it. Conditional because
+    # a job from before the analysis existed simply has none.
+    if job.get("language") is not None:
+        body["language"] = job["language"]
     return body
 
 
