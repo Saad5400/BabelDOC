@@ -466,17 +466,65 @@ def _ceiling(band_x0: float, band_x1: float, floor_y: float,
     return ceiling
 
 
-def _split_proportionally(text: str, weights: list[float]) -> list[str]:
+# What a list item starts with: a bullet, or a short label closed by a dot or
+# a bracket — `a)`, `(1)`, `2.`, and the Arabic abjad's `أ)` `ب)` `هـ)`. Kept
+# tight on purpose: one or two characters and a closer, at a token start, so
+# ordinary prose and a parenthesised Latin term do not look like a list.
+_LIST_MARKER = re.compile(
+    r"(?:^|(?<=\s))"
+    r"(?:[•▪◦‣∙]"
+    r"|\(?[0-9]{1,2}[.)]"
+    r"|\(?[A-Za-z][.)]"
+    r"|\(?[؀-ۿ]{1,2}[.)])"
+)
+
+
+def _split_at_markers(text: str, count: int) -> list[str] | None:
+    """`text` cut at its own list markers into exactly `count` chunks, or None.
+
+    BabelDOC merges a run of same-styled bullets into one paragraph, so a
+    numbered list arrives as a single block whose translation still carries
+    the markers the source printed. Cutting that by line-width weights puts
+    the tail of each item and the head of the next into one gloss — run44 p3's
+    item a) is glossed «أ) القمر مصنوع من الجبن الأخضر. ب) مكة هى» and item e)
+    with the fragment «0 = 2». The markers say exactly where the cuts belong.
+    """
+    starts = [match.start() for match in _LIST_MARKER.finditer(text)]
+
+    if len(starts) != count:
+        return None
+
+    chunks = [text[start:end].strip() for start, end
+              in zip(starts, [*starts[1:], len(text)], strict=True)]
+    # Anything before the first marker introduces the list and belongs with it.
+    chunks[0] = (text[:starts[0]].strip() + " " + chunks[0]).strip()
+
+    return chunks if all(chunks) else None
+
+
+def _split_proportionally(text: str, weights: list[float],
+                          source: str | None = None) -> list[str]:
     """`text` cut into len(weights) chunks, each roughly its share of the whole.
 
     Word boundaries only, and every chunk is non-empty when there are enough
     words — a blank chunk would leave a source line silently unglossed.
+
+    `source` is the paragraph this translates, and is what allows the split to
+    stop being proportional: when both sides carry the same number of list
+    markers as there are lines, the paragraph IS a list and its own markers
+    say where the cuts go ({@link _split_at_markers}).
     """
     words = text.split()
     count = len(weights)
 
     if count <= 1 or len(words) < count:
         return [text]
+
+    if source and len(_LIST_MARKER.findall(source)) == count:
+        marked = _split_at_markers(text, count)
+
+        if marked is not None:
+            return marked
 
     total = sum(weights) or float(count)
     chunks: list[str] = []
@@ -1922,7 +1970,8 @@ def _spaced_units(block: dict, matrix: pymupdf.Matrix, ink: list[pymupdf.Rect],
     if not lines:
         return anchor, [(anchor, text)], source_size
 
-    chunks = _split_proportionally(text, [line.width for line in lines])
+    chunks = _split_proportionally(text, [line.width for line in lines],
+                                   block.get("source"))
 
     if len(chunks) < len(lines):
         # Too few words to go round: one gloss for the paragraph.

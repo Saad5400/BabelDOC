@@ -363,6 +363,50 @@ def test_a_page_of_nothing_but_repeated_sources_is_carried_through_whole():
     assert not _arabic(pdf)
 
 
+def test_a_merged_list_is_split_at_its_own_markers():
+    """run44 p3: each item glossed with the wrong item's translation.
+
+    BabelDOC merges a run of same-styled bullets into one paragraph, so a
+    numbered list arrives as a single block. Cut by line-width weights, every
+    gloss carried the tail of the previous item and the head of the next, and
+    the last was the fragment «0 = 2».
+    """
+    source = ("a) The Moon is made of green cheese. b) Makkah is the Holy "
+              "City of Islam. c) Madina is the capital of Saudi Arabia. "
+              "d) 1+ 0= 1 e) 0+ 0= 2")
+    target = ("أ) القمر مصنوع من الجبن الأخضر. ب) مكة هي المدينة المقدسة في "
+              "الإسلام. ج) المدينة المنورة هي عاصمة المملكة العربية السعودية. "
+              "د) 1 + 0 = 1 هـ) 0 + 0 = 2")
+
+    chunks = interlinear._split_proportionally(target, [1.0] * 5, source)
+
+    assert len(chunks) == 5
+    assert chunks[0] == "أ) القمر مصنوع من الجبن الأخضر."
+    assert chunks[4] == "هـ) 0 + 0 = 2"
+
+    for marker, chunk in zip("أ ب ج د".split() + ["هـ"], chunks, strict=True):
+        assert chunk.startswith(f"{marker})")
+
+
+def test_prose_is_still_split_by_weight():
+    """The split is proportional wherever the paragraph is not a list.
+
+    One flowing sentence has no word that belongs to a particular source line,
+    and nothing in it looks like a marker — so nothing changes for it.
+    """
+    chunks = interlinear._split_proportionally(
+        "one two three four five six", [1.0, 1.0],
+        "a flowing sentence with no markers in it at all")
+
+    assert chunks == ["one two three", "four five six"]
+
+    # A parenthesised term is not a list marker.
+    assert interlinear._split_proportionally(
+        "alpha beta gamma delta", [1.0, 1.0],
+        "the (proposition) is a statement (either) true or false") == [
+            "alpha beta", "gamma delta"]
+
+
 # --------------------------------------------------------------------------
 # what a cut may not damage
 # --------------------------------------------------------------------------
