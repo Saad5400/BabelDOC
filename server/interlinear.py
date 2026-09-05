@@ -93,6 +93,7 @@ import numpy
 import pymupdf
 
 from server import config
+from server import raster_gate
 
 logger = logging.getLogger("doctranslate.interlinear")
 
@@ -1004,6 +1005,83 @@ def _raster_placement(layout: _Layout, text: str, anchor: pymupdf.Rect,
     return None
 
 
+def _gate_raster_blocks(blocks: list[dict], matrix: pymupdf.Matrix,
+                        page_rect: pymupdf.Rect,
+                        remap: Callable[[pymupdf.Rect, pymupdf.Rect],
+                                        tuple[pymupdf.Rect, pymupdf.Rect]] | None,
+                        ) -> tuple[list[tuple[dict, pymupdf.Rect, pymupdf.Rect]], int]:
+    """The blocks of one page worth plating, with their display geometry.
+
+    Same decision as the mono lane's, made by the same function — see
+    {@link server.raster_gate}. The engine applies it in image_prep, where the
+    OCR confidence and the image's own pixels are still in hand; here it is
+    applied again to what a SIDECAR says, because a sidecar written before the
+    gate existed is still downloadable and must not put `أولا _ كولا` over a
+    university's wordmark on its way out. What it cannot re-derive (per-word
+    confidence, image sharpness) is simply not offered, which makes those
+    rules stand down rather than guess.
+
+    Every block in an image is offered to the gate, including the ones whose
+    gloss would only repeat their source — inside a screenshot those ARE the
+    evidence. Only the blocks that would actually have been drawn come back,
+    and only those are counted.
+
+    Returns `(kept, refused)`; every refused block is one the caller counts as
+    skipped, exactly like a label with nowhere quiet to go.
+    """
+    per_region: dict[tuple[float, float, float, float],
+                     list[tuple[dict, pymupdf.Rect]]] = {}
+    refused = 0
+
+    for block in blocks:
+        anchor = _to_display(block["box"], matrix)
+        region = _to_display(block["region"], matrix).normalize()
+
+        if remap is not None:
+            anchor, region = remap(anchor, region)
+
+        region = (region & page_rect).normalize()
+
+        if region.is_empty or not region.is_valid:
+            if not _says_nothing(block):
+                refused += 1
+            continue
+
+        per_region.setdefault(tuple(region), []).append((block, anchor))
+
+    kept: list[tuple[dict, pymupdf.Rect, pymupdf.Rect]] = []
+
+    for key, members in per_region.items():
+        region = pymupdf.Rect(key)
+        glossable = sum(1 for block, _a in members if not _says_nothing(block))
+        plan = raster_gate.gloss_plan(
+            # `source` may be absent or null — the sidecar records it that way
+            # for a block whose source text it could not recover. None means
+            # "unknown" to the gate, which stands its text rules down rather
+            # than reading a missing string as an empty one.
+            [raster_gate.RasterText(text=block.get("source"),
+                                    box=tuple(anchor), payload=(block, anchor))
+             for block, anchor in members],
+            region=key, page=tuple(page_rect),
+        )
+
+        if plan.reason is not None:
+            logger.debug("raster region %s left as pixels (%s)", key, plan.reason)
+
+        drawable = 0
+
+        for item in plan.keep:
+            block, anchor = item.payload
+            if _says_nothing(block):
+                continue
+            kept.append((block, anchor, region))
+            drawable += 1
+
+        refused += glossable - drawable
+
+    return kept, refused
+
+
 def _render_raster(page: pymupdf.Page, blocks: list[dict], layout: _Layout,
                    matrix: pymupdf.Matrix, page_rect: pymupdf.Rect,
                    remap: Callable[[pymupdf.Rect, pymupdf.Rect],
@@ -1027,34 +1105,28 @@ def _render_raster(page: pymupdf.Page, blocks: list[dict], layout: _Layout,
     masks: dict[tuple[float, float, float, float], _RegionInk] = {}
     taken: list[pymupdf.Rect] = []
     placed: list[tuple[dict, pymupdf.Rect, pymupdf.Rect, float]] = []
-    # Every label on the page, which is the one thing a crowded plate may
-    # still never cover — a gloss that hides the word it glosses, or its
-    # neighbour, has taken more than it gave.
-    labels: list[pymupdf.Rect] = []
     drawn = skipped = 0
 
-    for block in blocks:
-        anchor = _to_display(block["box"], matrix)
-        region = _to_display(block["region"], matrix).normalize()
+    blocks, refused = _gate_raster_blocks(blocks, matrix, page_rect, remap)
+    skipped += refused
 
-        if remap is not None:
-            anchor, region = remap(anchor, region)
+    # Every label on the page, which is the one thing a plate may never cover
+    # — a gloss that hides the word it glosses, or its neighbour, has taken
+    # more than it gave. Collected BEFORE any placement, so the first pass is
+    # held to it too and not only the crowded retry.
+    labels: list[pymupdf.Rect] = [anchor for _b, anchor, _r in blocks]
 
-        region = (region & page_rect).normalize()
-
-        if region.is_empty or not region.is_valid:
-            skipped += 1
-            continue
-
+    for block, anchor, region in blocks:
         key = tuple(region)
 
         if key not in masks:
             masks[key] = _RegionInk(page, region)
 
-        labels.append(anchor)
         source_size = _source_size(block, anchor, typical)
+        others = [label for label in labels if label != anchor]
         found = _raster_placement(layout, block["target"].strip(), anchor,
-                                  region, source_size, masks[key], taken)
+                                  region, source_size, masks[key],
+                                  taken + others)
 
         if found is None:
             # Nowhere quiet. Held back rather than skipped: the crowded retry
@@ -1104,9 +1176,14 @@ def _typical_size(blocks: list[dict]) -> float:
     The backstop for {@link _source_size} when a block carries no size of its
     own: whatever the rest of the page is set in is a far better guess than
     anything the missing block's own geometry can offer.
+
+    A block whose gloss would only repeat its source is not part of "the rest
+    of the page": nothing of it is ever set. The normal lane never offers
+    those; the raster lane does, because the gate reads them as evidence
+    ({@link _gloss_blocks}), and they must not move this median.
     """
     sizes = sorted(float(block["font_size"]) for block in blocks
-                   if block.get("font_size"))
+                   if block.get("font_size") and not _says_nothing(block))
 
     return sizes[len(sizes) // 2] if sizes else 0.0
 
@@ -1181,11 +1258,16 @@ def _gloss_blocks(page_data: dict) -> tuple[list[dict], list[dict]]:
     saw: an old sidecar renders exactly what it always did.
     """
     blocks = [block for block in (page_data.get("blocks") or [])
-              if block.get("box") and (block.get("target") or "").strip()
-              and not _says_nothing(block)]
+              if block.get("box") and (block.get("target") or "").strip()]
 
+    # A block whose gloss would repeat its source is dropped here for the
+    # NORMAL lane, and only at draw time for the raster one: inside an image
+    # those blocks are the evidence the gate reads. A code screenshot's
+    # `print(5*text)` comes back as itself, so filtering it out first left the
+    # gate looking at one English caption and calling the screenshot prose.
     return ([block for block in blocks
-             if not (block.get("on_raster") and block.get("region"))],
+             if not (block.get("on_raster") and block.get("region"))
+             and not _says_nothing(block)],
             [block for block in blocks
              if block.get("on_raster") and block.get("region")])
 

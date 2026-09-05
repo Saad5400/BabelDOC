@@ -263,6 +263,42 @@ def test_prep_document_never_duplicates_digital_text(tmp_path):
     assert out_words.count("SHARED") == 1     # the digital one only
 
 
+@needs_tesseract
+def test_prep_document_leaves_a_corner_wordmark_as_pixels(tmp_path):
+    """The gate, end to end: a small emblem in a page corner injects nothing.
+
+    Job 136's Umm Al-Qura logo is a 1.5 %-of-slide raster in the top-right
+    corner; it OCR'd as `ll` / `ola_cola` / `ol UMM AL-QURA UNIVERSITY`, was
+    "translated" into `أولا _ كولا` and plated over the logo on 36 of that
+    deck's 38 pages. Nothing must reach the text layer.
+    """
+    src, dst = tmp_path / "in.pdf", tmp_path / "out.pdf"
+    # 60 x 60 pt of a 600 x 400 pt page (1.5 %), wholly in the top-right
+    # corner band, exactly like the real placement.
+    src.write_bytes(_pdf_with_images([((510, 20, 570, 80), "Logo")]))
+
+    regions = image_prep.prep_document(str(src), str(dst),
+                                       str(tmp_path / "regions.json"))
+
+    assert regions["pages"] == {}
+    assert pymupdf.open(dst)[0].get_text("words") == []
+
+
+@needs_tesseract
+def test_prep_document_still_injects_a_readable_diagram_label(tmp_path):
+    """The other half of the gate: the same emblem-sized raster in the middle
+    of the page, carrying a real word, is still the lane's whole point."""
+    src, dst = tmp_path / "in.pdf", tmp_path / "out.pdf"
+    src.write_bytes(_pdf_with_images([((100, 100, 400, 250), "Requirements")]))
+
+    regions = image_prep.prep_document(str(src), str(dst),
+                                       str(tmp_path / "regions.json"))
+
+    assert list(regions["pages"]) == ["0"]
+    words = [w[4].lower() for w in pymupdf.open(dst)[0].get_text("words")]
+    assert "requirements" in words
+
+
 def _probe_ocr_words(page):
     """Where the raster text of a synthetic page OCRs to, via a plain
     image_prep run against a copy — keeps the duplication test honest."""
@@ -289,9 +325,10 @@ def _region_ops(size_px, px_per_pt=4.0):
     font = pymupdf.Font("helv")
     words = [_word(0, 0, 120, size_px, text="Definition")]
     line = _line(words, x_size=size_px)
+    clip = pymupdf.Rect(100, 100, 400, 250)
+    segments = image_prep.region_segments([line], clip, px_per_pt)
     ops = image_prep.build_region_ops(
-        [line], pymupdf.Rect(100, 100, 400, 250), px_per_pt,
-        ~page.transformation_matrix, font)
+        segments, clip, px_per_pt, ~page.transformation_matrix, font)
     doc.close()
     return ops
 

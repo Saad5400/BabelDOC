@@ -2478,13 +2478,66 @@ class Typesetting:
             )
 
             # 如果有单元无法直接传递，则进行重排版
+            original_composition = paragraph.pdf_paragraph_composition
             paragraph.pdf_paragraph_composition = []
             self.retypeset_with_precomputed_scale(
                 paragraph, page, typesetting_units, precomputed_scale
             )
+            if not paragraph.pdf_paragraph_composition:
+                # Nothing was laid out: a paragraph with no box to lay out in,
+                # or a layout that raised at every scale down to the floor.
+                # The composition was already cleared for the rebuild, so
+                # leaving it empty is not "the paragraph moved" -- it is the
+                # paragraph DELETED from the page, and a deletion is never an
+                # acceptable answer to "this will not fit". Draw whatever
+                # glyphs the paragraph still carries where their author put
+                # them: source text in place beats a hole in the page.
+                salvaged = self._drawable_composition(original_composition)
+                logger.warning(
+                    "Typesetting produced no layout for paragraph %s on page "
+                    "%s; %s.",
+                    getattr(paragraph, "debug_id", None),
+                    page.page_number,
+                    "keeping its source glyphs in place"
+                    if salvaged
+                    else "it carries no glyphs to fall back on",
+                )
+                paragraph.scale = 1.0
+                paragraph.pdf_paragraph_composition = salvaged
 
             # 重排版后，重新设置段落各字符的 render order
             self._update_paragraph_render_order(paragraph)
+
+    @staticmethod
+    def _drawable_composition(
+        compositions: list[PdfParagraphComposition] | None,
+    ) -> list[PdfParagraphComposition]:
+        """The part of a composition the PDF backend can actually draw.
+
+        The backend renders characters and formulas; every other composition
+        kind is an intermediate the typesetter was supposed to turn into
+        characters. Flattening the source kinds back to characters is what
+        makes "keep the paragraph as it was" a real fallback rather than a
+        composition the backend logs and skips.
+        """
+        drawable: list[PdfParagraphComposition] = []
+        for composition in compositions or ():
+            if composition is None:
+                continue
+            if composition.pdf_character or composition.pdf_formula:
+                drawable.append(composition)
+            elif composition.pdf_line:
+                drawable.extend(
+                    PdfParagraphComposition(pdf_character=char)
+                    for char in composition.pdf_line.pdf_character or ()
+                )
+            elif composition.pdf_same_style_characters:
+                drawable.extend(
+                    PdfParagraphComposition(pdf_character=char)
+                    for char in
+                    composition.pdf_same_style_characters.pdf_character or ()
+                )
+        return drawable
 
     def _get_width_before_next_break_point(
         self, typesetting_units: list[TypesettingUnit], scale: float

@@ -700,6 +700,55 @@ def test_a_label_with_no_quiet_pixels_is_skipped_and_counted():
     assert not _plates(pdf)
 
 
+def test_a_gibberish_reading_is_never_plated_onto_the_artwork():
+    """The gate, from the sidecar side (server/raster_gate.py).
+
+    An old sidecar can carry a wordmark OCR'd as `ll`, translated into
+    Arabic and marked on_raster. The engine now refuses those upstream, but
+    the artifact is still downloadable, so the renderer refuses them too —
+    and counts the refusal like any other label it could not place.
+    """
+    sidecar = _sidecar([{"box": LABEL, "source": "ll", "target": AR_ONE,
+                         "font_size": 10.0, "region": IMAGE}])
+
+    pdf, report = _render(_raster_pdf(), sidecar)
+
+    assert report["raster_drawn"] == 0
+    assert report["raster_skipped"] == 1
+    assert not _plates(pdf)
+    assert not [rect for rect, text in _drawn_spans(pdf) if _is_arabic(text)]
+
+
+def test_a_readable_reading_from_the_same_sidecar_is_still_plated():
+    """The gate is not a blanket refusal of sidecars that record a source."""
+    sidecar = _sidecar([{"box": LABEL, "source": "Requirements engineering",
+                         "target": AR_ONE, "font_size": 10.0, "region": IMAGE}])
+
+    _pdf, report = _render(_raster_pdf(), sidecar)
+
+    assert report["raster_drawn"] == 1
+
+
+def test_no_plate_is_drawn_over_another_labels_own_box():
+    """A gloss that hides the word it glosses, or its neighbour, has taken
+    more than it gave — and the first placement pass is held to that too,
+    not only the crowded retry."""
+    other = (200.0, 242.0, 300.0, 254.0)
+    original = _raster_pdf(busy=[(IMAGE[0], IMAGE[1], IMAGE[2], LABEL[1])])
+    sidecar = _sidecar([
+        {"box": LABEL, "target": AR_ONE, "font_size": 10.0, "region": IMAGE},
+        {"box": other, "target": AR_TWO, "font_size": 10.0, "region": IMAGE},
+    ])
+
+    pdf, _report = _render(original, sidecar)
+
+    for plate in _plates(pdf):
+        for label in (pymupdf.Rect(LABEL), pymupdf.Rect(other)):
+            overlap = plate & label
+            assert not overlap.is_valid or overlap.is_empty, (
+                f"plate {plate} covers label {label}")
+
+
 def test_two_raster_glosses_competing_for_one_band_do_not_overlap():
     """The one collision the pixels cannot see: another plate.
 

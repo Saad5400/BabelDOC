@@ -47,6 +47,38 @@ GEOMETRY_TOLERANCE = 1.0
 logger = logging.getLogger("doctranslate.app")
 
 
+#: Third-party loggers whose INFO stream is per-request or per-glyph noise.
+_QUIET_LOGGERS = ("httpx", "httpcore", "openai", "urllib3", "asyncio",
+                  "PIL", "fontTools", "pdfminer", "pymupdf", "peewee")
+
+
+def _configure_logging() -> None:
+    """Give the root logger a handler, once, at process start.
+
+    uvicorn configures its OWN loggers and leaves the root logger alone, so in
+    production every `logger.info` in the engine went to logging's lastResort
+    handler — which drops anything below WARNING. That is why the run summary
+    ("Translation completed. Total: ..., Untranslated: ...") appears in local
+    runs and has never once appeared in a production log, while the
+    UNTRANSLATED warnings beside it do. The line that says how much of the
+    document was actually translated is the one line per run worth having.
+    """
+    root = logging.getLogger()
+    level = getattr(logging, config.LOG_LEVEL, logging.INFO)
+    if not root.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        root.addHandler(handler)
+    root.setLevel(level)
+    for name in _QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(max(level, logging.WARNING))
+
+
+_configure_logging()
+
+
 def _blocking(func, /, *args, **kwargs):
     """Run a CPU-bound builder off the event loop.
 
@@ -933,9 +965,17 @@ def get_job(job_id: str):
         "format": job["format"],
     }
     if job["status"] == "done":
+        # `usage` carries the run's spend AND its paragraph coverage
+        # (paragraphs_total / _translated / _untranslated), so the caller can
+        # see what it is charging for as well as what it cost.
         body["usage"] = job["usage"]
     if job["status"] == "failed":
         body["error"] = job["error"]
+        # How far the run got before it was refused. A failed job carries no
+        # `usage` — that is the charge signal — but "0 of 412 paragraphs" is
+        # exactly what makes a key-limit failure legible without the logs.
+        if job.get("coverage") is not None:
+            body["coverage"] = job["coverage"]
     # The source-language analysis, when the run has got far enough to have
     # one. This body is an explicit allowlist rather than the job record, so
     # a field the pipeline starts recording is invisible to the caller until

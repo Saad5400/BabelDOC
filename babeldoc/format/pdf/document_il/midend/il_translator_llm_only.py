@@ -22,6 +22,15 @@ from babeldoc.format.pdf.document_il.midend.il_translator import (
     DocumentTranslateTracker,
 )
 from babeldoc.format.pdf.document_il.midend.il_translator import ILTranslator
+from babeldoc.format.pdf.document_il.midend.il_translator import (
+    count_translation_coverage,
+)
+from babeldoc.format.pdf.document_il.midend.il_translator import (
+    is_code_shaped_input,
+)
+from babeldoc.format.pdf.document_il.midend.il_translator import (
+    is_untranslated_prose,
+)
 from babeldoc.format.pdf.document_il.midend.il_translator import PageTranslateTracker
 from babeldoc.format.pdf.document_il.midend.il_translator import (
     ParagraphTranslateTracker,
@@ -99,6 +108,28 @@ $glossary_tables_block
 
 $json_input_str"""
 )
+
+
+
+def _warn_if_prose_is_skipped(translation_config, paragraph, reason: str) -> None:
+    """Log a paragraph dropped before translation when it reads as prose.
+
+    Every filter this guards is legitimate for what it was written for (a
+    formula, a page number, a CID-broken run) and catastrophic when it catches
+    a sentence: the paragraph keeps its source text, no retry is attempted, and
+    no counter moves. One line per lost paragraph is the difference between a
+    defect a reader finds and one the log does.
+    """
+    text = getattr(paragraph, "unicode", None)
+    if not is_untranslated_prose(text or "", translation_config.lang_out):
+        return
+
+    logger.warning(
+        "SKIPPED-PROSE reason=%s paragraph=%s: %r",
+        reason,
+        getattr(paragraph, "debug_id", None),
+        text[:120],
+    )
 
 
 class BatchParagraph:
@@ -259,10 +290,28 @@ class ILTranslatorLLMOnly:
             with Path(path).open("w", encoding="utf-8") as f:
                 f.write(tracker.to_json())
         untranslated_total = self.il_translator.report_untranslated()
+        # The banked numbers come from the finished DOCUMENT, not from the
+        # stage's own bookkeeping: a paragraph that was silently skipped (its
+        # text having become formula placeholders upstream) is invisible to
+        # every counter here and is exactly the loss the caller must see.
+        census_total, census_untranslated = count_translation_coverage(
+            docs,
+            self.translation_config.lang_out,
+            self.il_translator.untranslated_debug_ids,
+        )
+        self.translation_config.record_translation_coverage(
+            census_total, census_untranslated
+        )
         logger.info(
             f"Translation completed. Total: {self.total_count}, Successful: {self.ok_count}, "
             f"Fallback: {self.fallback_count}, Untranslated: {untranslated_total}"
         )
+        if census_untranslated:
+            logger.warning(
+                f"Coverage census: {census_untranslated} of {census_total} "
+                f"paragraphs are still in the source language "
+                f"({census_untranslated / max(census_total, 1):.1%})"
+            )
 
     def _is_body_text_paragraph(self, paragraph: PdfParagraph) -> bool:
         """判断正文段落（当前仅 layout_label == 'text'）。
@@ -568,22 +617,26 @@ class ILTranslatorLLMOnly:
             if is_cid_paragraph(paragraph):
                 if pbar:
                     pbar.advance(1)
+                _warn_if_prose_is_skipped(self.translation_config, paragraph, "cid")
                 continue
 
             # Check minimum length - advance progress bar if filtered out
             if len(paragraph.unicode) < self.translation_config.min_text_length:
                 if pbar:
                     pbar.advance(1)
+                _warn_if_prose_is_skipped(self.translation_config, paragraph, "min-length")
                 continue
 
             if is_pure_numeric_paragraph(paragraph):
                 if pbar:
                     pbar.advance(1)
+                _warn_if_prose_is_skipped(self.translation_config, paragraph, "pure-numeric")
                 continue
 
             if is_placeholder_only_paragraph(paragraph):
                 if pbar:
                     pbar.advance(1)
+                _warn_if_prose_is_skipped(self.translation_config, paragraph, "placeholder-only")
                 continue
 
             # self.translate_paragraph(paragraph, pbar,tracker.new_paragraph(), page_font_map, page_xobj_font_map)
@@ -657,6 +710,14 @@ class ILTranslatorLLMOnly:
                     paragraph, tracker, page_font_map, xobj_font_map
                 )
                 if text is None:
+                    # Nothing to send. That is ordinary for a formula or a
+                    # page number and a silent loss for a sentence: on deck
+                    # 156 THIRTY-EIGHT English paragraphs left the run here,
+                    # because an upstream stage had turned their text into
+                    # formula placeholders, and nothing said so.
+                    _warn_if_prose_is_skipped(
+                        self.translation_config, paragraph, "nothing to translate"
+                    )
                     pbar.advance(1)
                     continue
 
@@ -746,6 +807,11 @@ class ILTranslatorLLMOnly:
 
             for id_, output in translation_results.items():
                 should_fallback = True
+                # Whether this paragraph is being retried because the model
+                # echoed the source, so the retry prompt can say so instead of
+                # burning its first attempt on the prompt that just echoed.
+                echo_fallback = False
+                echo_is_acceptable = False
                 try:
                     if not isinstance(output, str):
                         logger.warning(
@@ -783,11 +849,17 @@ class ILTranslatorLLMOnly:
                     output_token_count = self.calc_token_count(output_unicode)
 
                     same_as_input = trimed_input == output_unicode
-                    if (
-                        same_as_input
-                        and input_token_count > 10
-                        and not self.translation_config.disable_same_text_fallback
-                    ):
+                    # An echo is a legitimate result only when the input really
+                    # IS code (an identifier, a URL, a keyword table). It used
+                    # to be waved through for anything of <= 10 tokens, so
+                    # every short English sentence the model handed back
+                    # unchanged shipped as-is and was counted as translated.
+                    echo_is_acceptable = (
+                        is_code_shaped_input(trimed_input)
+                        or self.translation_config.disable_same_text_fallback
+                    )
+                    if same_as_input and not echo_is_acceptable:
+                        echo_fallback = True
                         llm_translate_tracker.set_error_message(
                             "Translation result is the same as input, fallback."
                         )
@@ -820,13 +892,28 @@ class ILTranslatorLLMOnly:
                             )
                             llm_translate_tracker.set_placeholder_full_match()
                             continue
-                    # Apply the translation to the paragraph
-                    self.il_translator.post_translate_paragraph(
+                    # Apply the translation to the paragraph. It returns False
+                    # when the result is identical to the source AFTER the
+                    # Arabic post-processing — i.e. another echo, reached by a
+                    # route the check above cannot see. That return value used
+                    # to be discarded, which marked the paragraph translated.
+                    applied = self.il_translator.post_translate_paragraph(
                         inputs[id_][2],
                         inputs[id_][3],
                         translate_input,
                         translated_text,
                     )
+                    if not applied and not echo_is_acceptable:
+                        echo_fallback = True
+                        llm_translate_tracker.set_error_message(
+                            "Translation result is the same as input after "
+                            "post-processing, fallback."
+                        )
+                        logger.warning(
+                            "Translation result is the same as input after "
+                            "post-processing, fallback."
+                        )
+                        continue
                     should_fallback = False
                     if pbar:
                         pbar.advance(1)
@@ -862,6 +949,7 @@ class ILTranslatorLLMOnly:
                             paragraph_token_count=paragraph_token_count,
                             title_paragraph=title_paragraph,
                             local_title_paragraph=local_title_paragraph,
+                            previous_output_echoed=echo_fallback,
                         )
                     else:
                         self.ok_count += 1

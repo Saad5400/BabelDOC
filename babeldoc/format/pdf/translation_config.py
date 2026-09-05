@@ -342,6 +342,12 @@ class TranslationConfig:
             initial_user_glossaries
         )
 
+        # How much of the document the IL translator actually translated,
+        # filled in by `record_translation_coverage` at the end of its stage.
+        # A split part is a `copy.copy` of this config, so every part shares
+        # this one dict and the numbers add up across the whole document.
+        self.translation_coverage: dict[str, int] = {"total": 0, "untranslated": 0}
+
         # Initialize split-related attributes
         self.split_strategy = split_strategy
 
@@ -552,6 +558,17 @@ class TranslationConfig:
     def cancel_translation(self):
         if self.progress_monitor is not None:
             self.progress_monitor.cancel()
+
+    def record_translation_coverage(self, total: int, untranslated: int):
+        """Bank one translation stage's paragraph counts.
+
+        The numbers the IL translator already logs ("Translation completed.
+        Total: ..., Untranslated: ...") are only useful to a caller if they
+        outlive the log line: a run that left every paragraph in English is
+        indistinguishable, from the outside, from one that succeeded.
+        """
+        self.translation_coverage["total"] += int(total or 0)
+        self.translation_coverage["untranslated"] += int(untranslated or 0)
 
     def get_term_extraction_translator(self) -> BaseTranslator:
         """Return the translator to use for automatic term extraction."""

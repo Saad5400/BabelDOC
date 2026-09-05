@@ -36,6 +36,9 @@ from babeldoc.format.pdf.document_il.utils.layout_helper import (
 from babeldoc.format.pdf.document_il.utils.layout_helper import (
     is_curve_overlapping_with_paragraphs,
 )
+from babeldoc.format.pdf.document_il.utils.layout_helper import (
+    is_ocr_sandwich_page,
+)
 from babeldoc.format.pdf.document_il.utils.layout_helper import is_same_style
 from babeldoc.format.pdf.document_il.utils.spatial_analyzer import (
     is_element_contained_in_formula,
@@ -103,6 +106,27 @@ def looks_like_prose(text: str) -> bool:
 
 # Ignore tiny paragraphs (page numbers etc.) to avoid noise.
 CODE_PARAGRAPH_MIN_CHARS = 4
+
+
+def is_code_block_text(text: str) -> bool:
+    """The shared prose/code judgement, asked of a whole block of text.
+
+    `il_translator.is_code_shaped_input` is the ONE place that decides
+    whether a run of text is code or prose; it is built on
+    `looks_like_prose` above and weighs a paragraph as a whole instead of
+    convicting it on a single hyphen, digit or bracket. Every rule in this
+    module that would preserve a block verbatim -- and so never send it to
+    the translator -- asks that same question, so there is one answer per
+    text and not one per rule.
+
+    Imported lazily because il_translator imports THIS module for
+    `looks_like_prose`: a module-level import back would be circular.
+    """
+    from babeldoc.format.pdf.document_il.midend.il_translator import (
+        is_code_shaped_input,
+    )
+
+    return is_code_shaped_input(text)
 
 
 def base_font_name(font_name: str | None) -> str:
@@ -523,15 +547,17 @@ class StylesAndFormulas:
                 continue
 
             all_chars = []
+            line_texts = []
             total = 0
             mono = 0
-            line_count = 0
             has_code_syntax = False
             for composition in paragraph.pdf_paragraph_composition:
                 line = composition.pdf_line
                 if not line or not line.pdf_character:
                     continue
-                line_count += 1
+                line_texts.append(
+                    "".join(c.char_unicode or "" for c in line.pdf_character)
+                )
                 for char in line.pdf_character:
                     all_chars.append(char)
                     if char.char_unicode is None or char.char_unicode.isspace():
@@ -552,11 +578,12 @@ class StylesAndFormulas:
                 continue
             if ratio < CODE_PARAGRAPH_PURE_MONO_RATIO and not has_code_syntax:
                 continue
-            # One line of plain words is a heading, not program output —
-            # however monospace the face it is set in.
-            if line_count < 2 and looks_like_prose(
-                "".join(c.char_unicode or "" for c in all_chars)
-            ):
+            # The face is not the evidence; the text is. A monospace
+            # heading is a heading and a monospace paragraph of English
+            # sentences is prose, however many lines it runs to -- and a
+            # paragraph turned into a formula here is never sent to the
+            # translator at all, so this is the last gate before silence.
+            if not is_code_block_text(" ".join(line_texts)):
                 continue
 
             code_paragraphs.append((paragraph, all_chars))
@@ -686,7 +713,14 @@ class StylesAndFormulas:
             self.process_page_offsets(page)
         self.process_translatable_formulas(page)
         self.update_all_formula_data(page)
-        if not self.translation_config.ocr_workaround:
+        # Curves and forms are attached to the formula that encloses them so
+        # they travel with it. The scanned lane skips that because a sandwich
+        # page's graphics are pixels, not IL elements -- but a digital page
+        # inside a mostly-scanned document has real vector art (record 151's
+        # radicals and fraction rules), and skipping it there strands them.
+        if not (
+            self.translation_config.ocr_workaround and is_ocr_sandwich_page(page)
+        ):
             self.collect_contained_elements(page)
 
         # Process remaining non-formula lines after formula assignment is complete
@@ -757,7 +791,12 @@ class StylesAndFormulas:
 
     @classmethod
     def _paragraph_is_one_stack(cls, paragraph: PdfParagraph) -> bool:
-        """True when the paragraph is nothing but one stacked line.
+        """True when the paragraph is nothing but one stacked FORMULA.
+
+        Two conditions, and the second is not optional: the rows have to be
+        stacked (geometry), and the text has to be something a reader wants
+        left alone (the shared prose/code judgement). Wrapped prose meets
+        the first on every slide deck ever exported from PowerPoint.
 
         A stack that shares its paragraph with prose cannot be made
         unbreakable: the line filler has nowhere to put a 250 pt
@@ -766,9 +805,35 @@ class StylesAndFormulas:
         became 12). Only a paragraph that IS the stack becomes one block.
         """
         compositions = paragraph.pdf_paragraph_composition or []
-        return len(compositions) == 1 and cls._is_vertical_stack(
-            compositions[0].pdf_line
-        )
+        if len(compositions) != 1:
+            return False
+        line = compositions[0].pdf_line
+        if not cls._is_vertical_stack(line):
+            return False
+        # Geometry alone cannot tell a fraction from a bullet that wrapped:
+        # a paragraph finder that puts all three visual lines of
+        # "A manager is someone who works with and through other people by
+        # coordinating their work activities..." into ONE pdf_line hands
+        # this rule three rows sitting one above another with ~100%
+        # horizontal overlap -- the exact shape of a numerator over a
+        # denominator. MEASURED on two production decks: 38 of 157
+        # paragraphs (record 156) and 39 of 342 (record 138) became rigid
+        # formulas this way and were never sent to the translator, which is
+        # the dominant cause of English prose in a finished Arabic deck.
+        # So ask the shared judgement what the text IS.
+        return is_code_block_text(cls._stack_text(paragraph, line))
+
+    @staticmethod
+    def _stack_text(paragraph: PdfParagraph, line: PdfLine) -> str:
+        """The paragraph's text, for the prose/code judgement.
+
+        `paragraph.unicode` is the reconstructed reading order (with the
+        spaces the PDF only implied); the raw characters are the fallback
+        for paragraphs built by hand, as in the tests.
+        """
+        if paragraph.unicode:
+            return paragraph.unicode
+        return "".join(c.char_unicode or "" for c in (line.pdf_character or []))
 
     @classmethod
     def _is_vertical_stack(cls, line: PdfLine | None) -> bool:

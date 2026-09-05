@@ -289,7 +289,12 @@ def _run_babeldoc(job_id: str, input_pdf: Path, out_dir: Path, *, lang_in: str,
                   lang_out: str, fmt: str, scanned: bool, progress_base: float,
                   sidecar_path: Path | None = None,
                   image_text_regions: Path | None = None):
-    """Run the fork through its Python API; returns (TranslateResult, translator)."""
+    """Run the fork through its Python API.
+
+    Returns (TranslateResult, translator, coverage) — coverage being how many
+    paragraphs the run actually translated, which is the difference between a
+    translation and a copy.
+    """
     from babeldoc.format.pdf.high_level import async_translate
     from babeldoc.format.pdf.translation_config import TranslationConfig
     from babeldoc.format.pdf.translation_config import WatermarkOutputMode
@@ -297,6 +302,7 @@ def _run_babeldoc(job_id: str, input_pdf: Path, out_dir: Path, *, lang_in: str,
     from babeldoc.translator.translator import set_translate_rate_limiter
 
     from server.cost import CostTrackingTranslator
+    from server.cost import HardProviderError
 
     if not config.OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is not configured")
@@ -337,6 +343,9 @@ def _run_babeldoc(job_id: str, input_pdf: Path, out_dir: Path, *, lang_in: str,
         translation_sidecar_path=sidecar_path,
         image_text_regions=image_text_regions,
     )
+    # So the first terminal provider refusal can cancel the run in flight
+    # rather than being discovered afterwards (server/cost.py).
+    translator.translation_config = tc
 
     span = _P_BABELDOC_END - progress_base
     result_holder: dict = {}
@@ -361,6 +370,24 @@ def _run_babeldoc(job_id: str, input_pdf: Path, out_dir: Path, *, lang_in: str,
 
     asyncio.run(consume())
 
+    # Recorded before anything can raise, so a failed job still reports how
+    # far it got — GET /v1/jobs/{id} surfaces it as "coverage".
+    coverage = _coverage(tc)
+    jobs.update_job(job_id, coverage=coverage)
+    logger.info(
+        "job %s translated %d of %d paragraphs (%d untranslated)",
+        job_id,
+        coverage["paragraphs_translated"],
+        coverage["paragraphs_total"],
+        coverage["paragraphs_untranslated"],
+    )
+
+    # Ahead of every other verdict: a spent or rejected key is not a scanned
+    # document and not a babeldoc bug, and saying so is the whole point.
+    hard = translator.hard_error()
+    if hard:
+        raise HardProviderError(hard)
+
     if "error" in result_holder:
         from babeldoc.babeldoc_exception.BabelDOCException import ScannedPDFError
 
@@ -370,7 +397,23 @@ def _run_babeldoc(job_id: str, input_pdf: Path, out_dir: Path, *, lang_in: str,
         raise RuntimeError(f"babeldoc failed: {error}")
     if "result" not in result_holder:
         raise RuntimeError("babeldoc finished without producing a result")
-    return result_holder["result"], translator
+    return result_holder["result"], translator, coverage
+
+
+def _coverage(tc) -> dict:
+    """How many of the document's paragraphs came back translated.
+
+    babeldoc already counts this — it logs "Translation completed. Total: ...,
+    Untranslated: ..." and then forgets it. `record_translation_coverage`
+    banks the same two numbers on the config (and a split run accumulates
+    into it), so this is a read, not a second counter.
+    """
+    counts = getattr(tc, "translation_coverage", None) or {}
+    total = int(counts.get("total") or 0)
+    untranslated = max(0, min(int(counts.get("untranslated") or 0), total))
+    return {"paragraphs_total": total,
+            "paragraphs_translated": total - untranslated,
+            "paragraphs_untranslated": untranslated}
 
 
 def _usage(translator) -> dict:
@@ -702,7 +745,7 @@ def run_job(job_id: str) -> None:
     sidecar = jobs.sidecar_path(job_id) if fmt in config.SIDECAR_FORMATS else None
 
     try:
-        result, translator = _run_babeldoc(
+        result, translator, coverage = _run_babeldoc(
             job_id, babeldoc_input, out_dir, lang_in=lang_in, lang_out=lang_out,
             fmt=fmt, scanned=scanned, progress_base=progress_base,
             sidecar_path=sidecar, image_text_regions=image_text_regions)
@@ -726,7 +769,7 @@ def run_job(job_id: str) -> None:
         babeldoc_input = _ocr_lane(job_id, input_pdf, work,
                                    targets=list(range(pages)),
                                    lang_in=lang_in, lang_out=lang_out)
-        result, translator = _run_babeldoc(
+        result, translator, coverage = _run_babeldoc(
             job_id, babeldoc_input, out_dir, lang_in=lang_in, lang_out=lang_out,
             fmt=fmt, scanned=True, progress_base=_P_PREP,
             sidecar_path=sidecar, image_text_regions=None)
@@ -749,6 +792,14 @@ def run_job(job_id: str) -> None:
     else:
         shutil.copyfile(produced, output_pdf)
 
+    # Refused as soon as there is something to keep, and before the vocab
+    # pass: a run this incomplete must not buy one more LLM call on its way
+    # out. The partial PDF stays on disk for debugging — /v1/jobs/{id}/result
+    # 409s like any other failed job — and `usage`, the caller's signal to
+    # charge, is never written.
+    shutil.rmtree(work, ignore_errors=True)
+    _refuse_poor_coverage(coverage)
+
     # «كلمات هذه الصفحة»: one lighter LLM pass over the sidecar picks each
     # page's new general-English words, records them in the sidecar ("vocab"
     # key) and interleaves the compact vocab pages into the result. Mono runs
@@ -760,7 +811,15 @@ def run_job(job_id: str) -> None:
     if job.get("title"):
         _set_pdf_title(output_pdf, job["title"])
 
-    usage = _usage(translator)
-    shutil.rmtree(work, ignore_errors=True)
+    usage = _usage(translator) | coverage
     jobs.update_job(job_id, status="done", usage=usage,
                     progress={"percent": 100.0, "stage": "done"})
+
+
+def _refuse_poor_coverage(coverage: dict) -> None:
+    """Never hand back a mostly-English 'translation' as a finished job."""
+    total = coverage["paragraphs_total"]
+    untranslated = coverage["paragraphs_untranslated"]
+    if total > 0 and untranslated / total > config.MAX_UNTRANSLATED_RATIO:
+        raise RuntimeError(f"translation incomplete: {untranslated} of "
+                           f"{total} paragraphs untranslated")

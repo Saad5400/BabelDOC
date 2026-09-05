@@ -10,7 +10,7 @@ wrapper included, is public).
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | `POST` | `/v1/jobs` | token | Submit a PDF. Multipart: `file` (pdf, ≤100 MB); fields `lang_in` (default `en`), `lang_out` (default `ar`), `format` = `translated` \| `alternating` \| `side_by_side` (default `translated`), optional `title` (stamped into the result's PDF metadata). Returns `202 {"job_id", "status": "queued"}`. |
-| `GET` | `/v1/jobs/{id}` | token | `{"status": "queued|running|done|failed", "progress": {"percent", "stage"}, "pages", "format", "usage": {...} (when done), "error" (when failed)}` |
+| `GET` | `/v1/jobs/{id}` | token | `{"status": "queued|running|done|failed", "progress": {"percent", "stage"}, "pages", "format", "usage": {...} (when done), "error" + "coverage" (when failed)}` |
 | `GET` | `/v1/jobs/{id}/result` | token | The output PDF (`409` until `done`). |
 | `GET` | `/v1/jobs/{id}/sidecar` | token | The run's **translation sidecar** — its translated text as data (`409` until `done`, `404` when the run produced none). See below. |
 | `POST` | `/v1/compose` | token | Stateless dual builder. Multipart `original` + `translated` PDFs, field `format` = `alternating` \| `side_by_side`, optional `sidecar` JSON (see **Vocab pages**). Returns the composed PDF. Pure page shuffling (plus the vocab render when the sidecar carries one) — no LLM, no job, no charge. |
@@ -45,6 +45,18 @@ than `JOB_TTL_HOURS` are deleted on each submit.
   so a partially-priced run reads as partial rather than as cheap.
   Note: babeldoc caches translations — resubmitting identical content reports
   near-zero tokens and near-zero cost (that is real spend, not a bug).
+- **Coverage**: `usage` also carries `paragraphs_total` / `paragraphs_translated`
+  / `paragraphs_untranslated` — babeldoc's own count, not a second one — so the
+  caller can see what it is charging for. A run that leaves more than
+  `MAX_UNTRANSLATED_RATIO` of them untranslated is `failed`
+  (`translation incomplete: N of M paragraphs untranslated`) with no `usage` at
+  all, and a failed job reports how far it got under `coverage`. The partial PDF
+  stays on disk for debugging; `/result` still `409`s.
+- **Hard provider errors** (401/402/403, or a 429 that outlives the retries)
+  cancel the run on the FIRST one and fail the job as
+  `provider: <what the provider said> (key limit exceeded, HTTP 403)`. Before
+  this, a spent key was retried 3x per paragraph and then shipped as a
+  full-English PDF the caller charged for.
 
 ## One translation, many layouts
 
@@ -152,6 +164,7 @@ paths — behavior is byte-identical to before the feature.
 | `GOTENBERG_URL` | `http://localhost:3000` | The shared Gotenberg service `/v1/convert` renders office documents through. On prod: `http://gotenberg-int:3000` (same docker network) |
 | `DATA_DIR` | `/data` | Job storage (volume) |
 | `JOB_TTL_HOURS` | `24` | Job retention |
+| `MAX_UNTRANSLATED_RATIO` | `0.05` | Share of paragraphs a run may leave untranslated before it is `failed` instead of delivered (capped at `1.0` = off) |
 | `VOCAB_PAGES` | `1` | «كلمات هذه الصفحة» per-page vocabulary pages; `0` disables extraction and every insertion |
 
 ## Run locally

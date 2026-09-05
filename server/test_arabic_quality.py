@@ -8,21 +8,30 @@ memo, and the glossary file itself — so they run for free and never flake on a
 sampling temperature.
 """
 
+import json
 import threading
 from types import SimpleNamespace
 
 import pytest
-
+from babeldoc.format.pdf.document_il.midend.il_translator import ARABIC_STYLE_ADDENDUM
+from babeldoc.format.pdf.document_il.midend.il_translator import ILTranslator
 from babeldoc.format.pdf.document_il.midend.il_translator import (
-    ARABIC_STYLE_ADDENDUM,
-    ILTranslator,
     ParagraphTranslateTracker,
+)
+from babeldoc.format.pdf.document_il.midend.il_translator import (
     arabic_math_fidelity_error,
+)
+from babeldoc.format.pdf.document_il.midend.il_translator import (
+    count_translation_coverage,
+)
+from babeldoc.format.pdf.document_il.midend.il_translator import (
     dedupe_latin_gloss_parentheticals,
-    is_code_shaped_input,
+)
+from babeldoc.format.pdf.document_il.midend.il_translator import is_code_shaped_input
+from babeldoc.format.pdf.document_il.midend.il_translator import is_untranslated_prose
+from babeldoc.format.pdf.document_il.midend.il_translator import (
     postprocess_arabic_translation,
 )
-
 
 # --------------------------------------------------------------------------
 # F8 — a detached article is a spelling error the reader sees on every page
@@ -293,6 +302,7 @@ def _bare_translator(engine, source_text):
     translator.use_as_fallback = False
     translator.max_translate_attempts = 3
     translator.untranslated_by_page = {}
+    translator.untranslated_debug_ids = set()
     translator.untranslated_lock = threading.Lock()
     translator.translation_memo = {}
     translator.translation_memo_hits = 0
@@ -466,3 +476,265 @@ def test_gloss_dedup_still_strips_a_gloss_the_model_invented():
     assert "(bytecode)" not in dedupe_latin_gloss_parentheticals(
         "البايت كود (bytecode) مستقل عن المنصة", seen, source
     )
+
+
+# --------------------------------------------------------------------------
+# F14 — the model echoes the English back, and the engine ships it
+# --------------------------------------------------------------------------
+#
+# On 30 production decks 13-36% of the English prose was delivered
+# untranslated, spread over almost every page. Two mechanisms, both here:
+#
+#   * `is_code_shaped_input` called a whole paragraph "code" as soon as ANY
+#     one of its tokens carried a digit, a hyphen or was a lone letter, so the
+#     echo of a full English bullet was accepted with no retry and no log;
+#   * the batch path skipped the echo guard for anything of <= 10 tokens and
+#     threw away `post_translate_paragraph`'s return value, so a short echoed
+#     sentence was marked translated.
+#
+# Every sentence below is verbatim from record 156 or record 138.
+
+
+ECHOED_PROSE = [
+    # 138 p17 — "c++" was the code token that bought the whole sentence.
+    "He was unhappy using c++ programming language, so he developed java.",
+    # "long-lifetime" and "(10" did it here.
+    "Custom software usually has a long-lifetime (10 years or more).",
+    # 156 p5 — the bullet glyph alone was enough.
+    "• Efficiency is getting the most output from the least amount of input.",
+    # 156 p10 — the parenthesised initials.
+    "– president, chief executive officer (C E O), managing director, chancellor",
+    # 156 p6 — a figure number.
+    "Exhibit 1.1 Efficiency, Effectiveness, and Performance in Student Meetings",
+    # 138 p26 — a title with a digit glued to a word and a broken hyphen.
+    "Step2: Compiling a Java Program into Byte- codes",
+    # 138 p30 — prose ABOUT code is still prose.
+    "• Unlike the normal compiler, the JIT compiler compiles the code only "
+    "when required.",
+    # 156 p19/p20 — Title Case long enough to be a heading, not a name.
+    "What Factors Are Reshaping and Redefining Management?",
+]
+
+
+@pytest.mark.parametrize("sentence", ECHOED_PROSE)
+def test_prose_with_a_stray_code_token_is_still_prose(sentence):
+    assert is_code_shaped_input(sentence) is False
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "iload_2",
+        "this.arr;",
+        "p ∧ q",
+        "https://www.slideshare.net/wso2.org/java-performance-and-profiling",
+        "SET>java Hello",
+        "istore 2goto A iload_2 ireturn",
+        # 138 p24 — two product names and two URLs, nothing to translate.
+        "• NetBeans (www.netbeans.org) • IntelliJ IDEA (www.jetbrains.com)",
+        "String[] args",
+    ],
+)
+def test_a_line_that_is_mostly_code_still_reads_as_code(line):
+    assert is_code_shaped_input(line) is True
+
+
+def _echo_run(source, outputs):
+    """Run the single-paragraph ladder against an engine with these outputs."""
+    engine = _CountingEngine(outputs)
+    translator = _bare_translator(engine, source)
+    paragraph = _paragraph()
+    translator.translate_paragraph(
+        paragraph, page=SimpleNamespace(page_number=0), pbar=_Pbar(),
+        tracker=ParagraphTranslateTracker(),
+    )
+    return translator, engine, paragraph
+
+
+def test_an_echoed_sentence_is_retried_and_the_retry_says_so():
+    source = "He was unhappy using c++ programming language, so he developed java."
+    arabic = "لم يكن سعيدا باستخدام لغة c++، لذلك طور java."
+    translator, engine, paragraph = _echo_run(source, [source, arabic])
+
+    assert len(engine.prompts) == 2, "the echo must have cost a retry"
+    assert "UNCHANGED" in engine.prompts[1], (
+        "the retry must name the failure it is retrying"
+    )
+    assert "ar" in engine.prompts[1], "the retry must name the target language"
+    assert paragraph.unicode == arabic
+    assert translator.report_untranslated() == 0
+
+
+def test_a_sentence_that_only_ever_echoes_is_counted_untranslated():
+    source = "• Managers must create customer-responsive organizations and teams."
+    translator, engine, paragraph = _echo_run(source, [source, source, source])
+
+    assert len(engine.prompts) == 3, "every tier must have been spent"
+    assert paragraph.unicode == "", "an echo must never be applied as a translation"
+    assert translator.report_untranslated() == 1, (
+        "an English paragraph in an Arabic document is untranslated, and the "
+        "coverage numbers are what the caller bills on"
+    )
+
+
+def test_a_code_echo_costs_no_retry_and_is_not_untranslated():
+    """Otherwise MAX_UNTRANSLATED_RATIO would fail every code-heavy deck."""
+    translator, engine, _ = _echo_run("aload_0", ["aload_0"])
+    assert len(engine.prompts) == 1
+    assert translator.report_untranslated() == 0
+
+
+# ---------------------------------------------------- the batch path
+
+class _BatchEngine:
+    """Returns one canned JSON batch response, then records nothing else."""
+
+    def __init__(self, outputs):
+        self.outputs = outputs
+        self.prompts: list[str] = []
+
+    def llm_translate(self, prompt, rate_limit_params=None):
+        self.prompts.append(prompt)
+        return json.dumps(
+            [{"id": i, "output": text} for i, text in enumerate(self.outputs)],
+            ensure_ascii=False,
+        )
+
+
+class _RecordingExecutor:
+    def __init__(self):
+        self.submissions: list[dict] = []
+
+    def submit(self, fn, *args, **kwargs):
+        self.submissions.append({"fn": fn, "args": args, "kwargs": kwargs})
+
+
+def _batch_run(source, output):
+    """One paragraph through the BATCH loop, with everything else stubbed."""
+    from babeldoc.format.pdf.document_il.midend.il_translator import (
+        PageTranslateTracker,
+    )
+    from babeldoc.format.pdf.document_il.midend.il_translator_llm_only import (
+        BatchParagraph,
+    )
+    from babeldoc.format.pdf.document_il.midend.il_translator_llm_only import (
+        ILTranslatorLLMOnly,
+    )
+
+    engine = _BatchEngine([output])
+    il = _bare_translator(_CountingEngine([]), source)
+
+    batch = ILTranslatorLLMOnly.__new__(ILTranslatorLLMOnly)
+    batch.translate_engine = engine
+    batch.il_translator = il
+    batch.translation_config = il.translation_config
+    batch.translation_config.add_formula_placehold_hint = False
+    batch.total_count = batch.ok_count = batch.fallback_count = 0
+    batch.calc_token_count = lambda text: len(text.split())
+    batch._build_llm_prompt = lambda **kwargs: "BATCH PROMPT"
+
+    paragraph = _paragraph()
+    paragraph.layout_label = "plain text"
+    page_tracker = PageTranslateTracker()
+    batch_paragraph = BatchParagraph([paragraph], [SimpleNamespace(page_number=0)],
+                                     page_tracker)
+    executor = _RecordingExecutor()
+    batch.translate_paragraph(batch_paragraph, pbar=_Pbar(), executor=executor)
+    return batch, executor, paragraph
+
+
+def test_a_short_echoed_sentence_leaves_the_batch_for_the_retry_ladder():
+    """Seven tokens: under the old > 10 gate this shipped as English."""
+    source = "What Factors Are Reshaping and Redefining Management?"
+    batch, executor, paragraph = _batch_run(source, source)
+
+    assert batch.fallback_count == 1, "the echo must fall back, not count as ok"
+    assert batch.ok_count == 0
+    assert len(executor.submissions) == 1, "the retry ladder must have been queued"
+    assert executor.submissions[0]["kwargs"]["previous_output_echoed"] is True, (
+        "the ladder must be told the source was echoed, or it repeats the "
+        "prompt that produced the echo"
+    )
+
+
+def test_a_code_echo_stays_in_the_batch():
+    batch, executor, _ = _batch_run("System.out.println", "System.out.println")
+    assert batch.fallback_count == 0
+    assert batch.ok_count == 1
+    assert executor.submissions == []
+
+
+# --------------------------------------------------------------------------
+# F15 — "100% translated" for a document a third of which shipped in English
+# --------------------------------------------------------------------------
+#
+# Deck 156 (23 slides) delivered 38 English paragraphs and reported
+# `paragraphs_untranslated: 0`. None of them was an echo: 21 died in
+# `pre_translate_paragraph` (their text had become formula placeholders
+# upstream, so there was "nothing to translate") and 17 in `process_page`'s
+# placeholder-only filter. No counter in the engine watches those doors, so
+# coverage is taken from the FINISHED DOCUMENT instead: whatever the pipeline
+# believes it did, an English paragraph in an Arabic document is untranslated.
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "• Understanding management offers insights into many organizational aspects.",
+        "A manager is someone who works with and through other people.",
+        "Exhibit 1.1 Efficiency, Effectiveness, and Performance in Student Meetings",
+    ],
+)
+def test_english_prose_left_in_the_document_is_untranslated(text):
+    assert is_untranslated_prose(text, "ar") is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "الكفاءة هي الحصول على أكبر قدر من المخرجات",  # translated
+        "مزيج من العربية and some English",  # partly Arabic: the model answered
+        "aload_0",  # code
+        "System.out.println(args[0]);",
+        "1 - 14",  # page furniture
+        "JVM",  # too short to carry a verdict
+        "",
+    ],
+)
+def test_what_the_census_must_not_call_untranslated(text):
+    assert is_untranslated_prose(text, "ar") is False
+
+
+def test_the_census_abstains_for_a_non_arabic_target():
+    """The script test is Arabic-specific; for other targets it says nothing."""
+    assert is_untranslated_prose("A manager is someone who works with people.", "fr") is False
+
+
+def _doc(*texts):
+    paragraphs = [
+        SimpleNamespace(debug_id=f"p{i}", unicode=text) for i, text in enumerate(texts)
+    ]
+    return SimpleNamespace(page=[SimpleNamespace(pdf_paragraph=paragraphs)])
+
+
+def test_coverage_counts_the_paragraphs_that_shipped_in_english():
+    docs = _doc(
+        "الكفاءة هي الحصول على أكبر قدر من المخرجات",
+        "• Understanding management offers insights into many aspects.",
+        "System.out.println(args[0]);",
+        "الفعالية هي إنجاز الأنشطة",
+    )
+    assert count_translation_coverage(docs, "ar") == (4, 1)
+
+
+def test_a_failed_paragraph_is_counted_once_not_twice():
+    """The retry ladder's own record and the census are the same paragraph."""
+    docs = _doc("• Managers must create customer-responsive teams.")
+    assert count_translation_coverage(docs, "ar", {"p0"}) == (1, 1)
+
+
+def test_a_short_paragraph_the_ladder_gave_up_on_still_counts():
+    """Too short for the script test to judge, but the ladder saw it fail."""
+    docs = _doc("disk")
+    assert count_translation_coverage(docs, "ar") == (1, 0)
+    assert count_translation_coverage(docs, "ar", {"p0"}) == (1, 1)

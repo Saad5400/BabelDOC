@@ -25,6 +25,7 @@ from babeldoc.format.pdf.document_il import PdfParagraphComposition
 from babeldoc.format.pdf.document_il import PdfSameStyleCharacters
 from babeldoc.format.pdf.document_il import PdfSameStyleUnicodeCharacters
 from babeldoc.format.pdf.document_il import PdfStyle
+from babeldoc.format.pdf.document_il.midend.styles_and_formulas import looks_like_prose
 from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper
 from babeldoc.format.pdf.document_il.utils.layout_helper import get_char_unicode_string
 from babeldoc.format.pdf.document_il.utils.layout_helper import get_paragraph_unicode
@@ -364,6 +365,19 @@ _UNIT_SYMBOLS = frozenset(
 )
 
 
+# Share of a paragraph's tokens that must look like code before an echo of the
+# WHOLE paragraph is accepted. Half, not a strict majority, because
+# «String[] args» is 1-of-2 and unmistakably code, while prose never comes
+# close: «Custom software usually has a long-lifetime (10 years or more)» is
+# 4-of-10 and «He was unhappy using c++ ... so he developed java.» is 2-of-12.
+_CODE_TOKEN_SHARE = 0.5
+# Longest run of capitalised words still read as a proper name. «Ian
+# Sommerville» and «Sun Microsystems» are names to keep in Latin; a longer
+# Title Case line is a heading («What Factors Are Reshaping Management»), and
+# headings are prose.
+_PROPER_NAME_MAX_TOKENS = 3
+
+
 def is_code_shaped_input(text: str) -> bool:
     """True when the model echoing `text` back unchanged is a legitimate result.
 
@@ -371,6 +385,12 @@ def is_code_shaped_input(text: str) -> bool:
     an identical output is correct. A bare `disk`, `Mass`, `byte` or `and` on a
     diagram is not — those shipped untranslated 80 times because the echo guard
     accepted ANY input of <= 10 tokens without a retry.
+
+    A paragraph is judged as a whole. This used to return True as soon as ANY
+    single token looked code-ish, so one hyphen, one digit or one bare letter
+    made a whole English bullet "code" and its echo was accepted with no retry
+    and no log: 33 of the 39 echoed sentences in one deck and 40 of 41 in
+    another were English prose waved through by that rule.
     """
     if not any(ch.isalpha() for ch in text):
         # Pure digits and symbols: there is nothing to translate.
@@ -403,14 +423,81 @@ def is_code_shaped_input(text: str) -> bool:
             return True
         return False
 
-    if any(_is_code_token(core) for core in cores):
-        return True
-    if len(cores) > 1 and all(core[:1].isupper() for core in cores):
-        # A run of capitalised words is a proper name («Ian Sommerville»,
+    if 1 < len(cores) <= _PROPER_NAME_MAX_TOKENS and all(
+        core[:1].isupper() for core in cores
+    ):
+        # A short run of capitalised words is a proper name («Ian Sommerville»,
         # «Sun Microsystems»), which rule (c) keeps in Latin.
         return True
-    # A plain English word. Echoing it back is a surrender, not a decision.
-    return False
+    code_tokens = sum(1 for core in cores if _is_code_token(core))
+    if code_tokens == len(cores):
+        # Every token is an identifier, an operator, a number or a keyword.
+        return True
+    if looks_like_prose(text):
+        # The stricter shared detector (used by the code-paragraph rule in
+        # styles_and_formulas) says every token is a word or a bare number:
+        # no identifier, operator or path anywhere. «Chapter 3» is a heading.
+        return False
+    # Mixed. Code lines are dense in code tokens; a sentence carrying one
+    # identifier, one hyphenated word or one figure number is still a sentence,
+    # and echoing it back is a surrender, not a decision.
+    return code_tokens / len(cores) >= _CODE_TOKEN_SHARE
+
+
+# One Arabic letter is enough to prove the model answered in Arabic; the whole
+# question here is script, not quality.
+_ARABIC_LETTERS_RE = re.compile(r"[\u0600-\u06FF]")
+_LATIN_WORD_RE = re.compile(r"[A-Za-z]{2,}")
+# Below this many Latin words a paragraph carries no verdict: «JVM», «Fig. 2»
+# and «1 - 14» are not evidence that anything was skipped.
+_PROSE_WORD_MINIMUM = 4
+
+
+def is_untranslated_prose(text: str, lang_out: str) -> bool:
+    """True when `text` is prose the reader expected translated and did not get.
+
+    This is the reader's test, not the pipeline's: whatever the engine believes
+    it did, a paragraph of English sentences sitting in an Arabic document is
+    untranslated. It is deliberately blind to HOW that happened — an echo the
+    retry ladder could not fix, a provider refusal, or (the case that made this
+    necessary) a paragraph that was never sent because an upstream stage had
+    classified it as a formula.
+    """
+    if not text or not _is_arabic_lang(lang_out):
+        # Only an Arabic target gives a cheap, certain script test. For any
+        # other target this census abstains rather than guesses.
+        return False
+    if _ARABIC_LETTERS_RE.search(text):
+        return False
+    if len(_LATIN_WORD_RE.findall(text)) < _PROSE_WORD_MINIMUM:
+        return False
+    return not is_code_shaped_input(text)
+
+
+def count_translation_coverage(
+    docs, lang_out: str, failed_debug_ids: set[str] | None = None
+) -> tuple[int, int]:
+    """(paragraphs, paragraphs still in the source language) for a finished run.
+
+    Counted from the DOCUMENT after translation rather than from the stages
+    that ran, because every silent loss this had to catch was a paragraph no
+    stage ever reported on: the batch loop skips a paragraph whose text became
+    formula placeholders without a word in the log, and the run still called
+    itself 100% translated while a third of its prose shipped in English.
+    """
+    failed_debug_ids = failed_debug_ids or set()
+    total = 0
+    untranslated = 0
+    for page in getattr(docs, "page", None) or []:
+        for paragraph in getattr(page, "pdf_paragraph", None) or []:
+            if paragraph.debug_id is None or paragraph.unicode is None:
+                continue
+            total += 1
+            if paragraph.debug_id in failed_debug_ids or is_untranslated_prose(
+                paragraph.unicode, lang_out
+            ):
+                untranslated += 1
+    return total, untranslated
 
 
 def postprocess_arabic_translation(source_text: str, translated_text: str) -> str:
@@ -761,6 +848,9 @@ class ILTranslator:
         # Observability: paragraphs that remain untranslated after ALL tiers,
         # keyed by 0-based page number.
         self.untranslated_by_page: dict[int, int] = {}
+        # debug_ids of those same paragraphs, so the end-of-run census can
+        # count each loss exactly once.
+        self.untranslated_debug_ids: set[str] = set()
         self.untranslated_lock = threading.Lock()
 
         # Run-scoped consistency memo. babeldoc's own TranslationCache is keyed
@@ -840,6 +930,20 @@ class ILTranslator:
 
         if not self.use_as_fallback:
             untranslated_total = self.report_untranslated()
+            census_total, census_untranslated = count_translation_coverage(
+                docs,
+                self.translation_config.lang_out,
+                self.untranslated_debug_ids,
+            )
+            self.translation_config.record_translation_coverage(
+                census_total, census_untranslated
+            )
+            if census_untranslated:
+                logger.warning(
+                    f"Coverage census: {census_untranslated} of {census_total} "
+                    f"paragraphs are still in the source language "
+                    f"({census_untranslated / max(census_total, 1):.1%})"
+                )
             if untranslated_total:
                 logger.warning(
                     f"Translation completed with {untranslated_total} "
@@ -1699,12 +1803,17 @@ class ILTranslator:
             xobj_id=-1,
         )
 
-    def _build_simple_retry_prompt(self, text: str) -> str:
+    def _build_simple_retry_prompt(self, text: str, echoed: bool = False) -> str:
         """Minimal last-resort prompt used on the final retry tier.
 
         Drops all structure/rules/glossary blocks: some failures are caused by
         the model choking on the long rule-heavy prompt, so the last attempt
         asks for a bare translation only.
+
+        `echoed` says the previous attempt handed the source straight back —
+        the single commonest failure of the small models this runs on. Naming
+        that failure in the prompt is what turns the retry into a different
+        question rather than the same one asked twice.
         """
         script_rule = ""
         if _is_arabic_lang(self.translation_config.lang_out):
@@ -1715,20 +1824,38 @@ class ILTranslator:
                 " URLs, numbers and mathematical notation in Latin script,"
                 " exactly as written - never transliterate or re-space them."
             )
+        echo_rule = ""
+        if echoed:
+            echo_rule = (
+                f" A previous attempt returned the text below UNCHANGED, which"
+                f" is wrong: the words must be rendered in"
+                f" {self.translation_config.lang_out}, not copied. Every"
+                f" translatable word must be translated; only names, code"
+                f" identifiers, URLs and numbers may stay as they are."
+            )
         return (
             f"Translate the following text into {self.translation_config.lang_out}. "
             "Keep any placeholders or tags (e.g. {v1}, <style id='1'>...</style>) "
-            f"exactly unchanged.{script_rule} "
+            f"exactly unchanged.{script_rule}{echo_rule} "
             "Output only the translation, nothing else.\n\n"
             f"{text}"
         )
 
-    def _record_untranslated(self, page: Page | None):
-        """Count a paragraph that remains untranslated after all retry tiers."""
+    def _record_untranslated(self, page: Page | None, paragraph=None):
+        """Count a paragraph that remains untranslated after all retry tiers.
+
+        The identity is kept as well as the count: the end-of-run census
+        (`count_translation_coverage`) recognises the same paragraph by its
+        debug_id and so counts it once, whether the loss is visible in the
+        text (English prose) or not (a short label, a refused sentence).
+        """
         page_number = getattr(page, "page_number", None) if page else None
         key = page_number if page_number is not None else -1
+        debug_id = getattr(paragraph, "debug_id", None)
         with self.untranslated_lock:
             self.untranslated_by_page[key] = self.untranslated_by_page.get(key, 0) + 1
+            if debug_id is not None:
+                self.untranslated_debug_ids.add(debug_id)
 
     def report_untranslated(self) -> int:
         """Log one WARNING per page with untranslated paragraphs.
@@ -1756,6 +1883,7 @@ class ILTranslator:
         paragraph_token_count: int = 0,
         title_paragraph: TitleContextSnapshot | None = None,
         local_title_paragraph: TitleContextSnapshot | None = None,
+        previous_output_echoed: bool = False,
     ):
         """Translate a paragraph using pre and post processing functions.
 
@@ -1764,6 +1892,12 @@ class ILTranslator:
         exponential backoff; the final retry uses a simplified prompt. If all
         attempts fail, the paragraph is recorded as untranslated so the run
         summary can surface it (instead of silently keeping the source text).
+
+        `previous_output_echoed` says the caller (the batch path) already had
+        the source handed back for this paragraph. Repeating the prompt that
+        produced the echo mostly reproduces the echo, so the ladder skips
+        straight to the simplified prompt with an explicit "do not repeat the
+        source, answer in {lang_out}" instruction.
         """
         self.translation_config.raise_if_cancelled()
         with PbarContext(pbar):
@@ -1789,6 +1923,9 @@ class ILTranslator:
                     return
 
                 last_error: str | None = None
+                # True once this paragraph has had its source echoed back, so
+                # every remaining attempt asks explicitly for a translation.
+                echoed_before = previous_output_echoed
 
                 for attempt in range(self.max_translate_attempts):
                     self.translation_config.raise_if_cancelled()
@@ -1800,9 +1937,14 @@ class ILTranslator:
                     try:
                         # Perform translation
                         if self.support_llm_translate:
-                            if attempt >= self.max_translate_attempts - 1:
-                                # Last tier: simplified prompt.
-                                llm_prompt = self._build_simple_retry_prompt(text)
+                            if (
+                                attempt >= self.max_translate_attempts - 1
+                                or echoed_before
+                            ):
+                                # Last tier, or a known echo: simplified prompt.
+                                llm_prompt = self._build_simple_retry_prompt(
+                                    text, echoed=echoed_before
+                                )
                             else:
                                 llm_prompt = self.generate_prompt_for_llm(
                                     text,
@@ -1888,6 +2030,7 @@ class ILTranslator:
                         ) or self.translation_config.disable_same_text_fallback:
                             return
                         last_error = "translation result identical to input"
+                        echoed_before = True
                         llm_translate_tracker.set_error_message(last_error)
                         logger.warning(
                             f"Fallback translation attempt {attempt + 1}/"
@@ -1909,7 +2052,7 @@ class ILTranslator:
 
                 # All retry tiers exhausted: the paragraph keeps its source
                 # text. Record it so production output surfaces the loss.
-                self._record_untranslated(page)
+                self._record_untranslated(page, paragraph)
                 logger.warning(
                     f"Paragraph {paragraph.debug_id} remains untranslated after "
                     f"{self.max_translate_attempts} attempts. Last error: {last_error}"
@@ -1918,6 +2061,6 @@ class ILTranslator:
                 logger.exception(
                     f"Error translating paragraph. Paragraph: {paragraph.debug_id} ({paragraph.unicode}). Error: {e}. ",
                 )
-                self._record_untranslated(page)
+                self._record_untranslated(page, paragraph)
                 # ignore error and continue
                 return

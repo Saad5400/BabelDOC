@@ -37,6 +37,9 @@ from babeldoc.format.pdf.document_il.utils.layout_helper import (
     is_character_in_formula_layout,
 )
 from babeldoc.format.pdf.document_il.utils.layout_helper import is_text_layout
+from babeldoc.format.pdf.document_il.utils.layout_helper import (
+    is_ocr_sandwich_page,
+)
 from babeldoc.format.pdf.document_il.midend.styles_and_formulas import (
     build_code_font_ids,
 )
@@ -426,6 +429,12 @@ class ParagraphFinder:
         )
 
     def process_page(self, page: Page):
+        # Whether the scanned lane's licence to erase applies to THIS page --
+        # decided while the page still holds all of its characters. See
+        # `is_ocr_sandwich_page`.
+        ocr_page = self.translation_config.ocr_workaround and is_ocr_sandwich_page(
+            page
+        )
         layout_index, layout_map = build_layout_index(page)
         # 预处理公式布局的标签
         self._preprocess_formula_layouts(page)
@@ -504,7 +513,7 @@ class ParagraphFinder:
         # label -> code hierarchy. Keep style-distinct lines as separate
         # paragraphs. The OCR path has its own regroup pass and a flat text
         # layer without style structure, so this is digital-only.
-        if not self.translation_config.ocr_workaround:
+        if not ocr_page:
             self.split_style_boundary_paragraphs(page, paragraphs)
 
         # OCR sandwich pages: the injected text layer carries textual bullet
@@ -513,17 +522,20 @@ class ParagraphFinder:
         # (or heading/body block) so each logical paragraph translates and
         # wraps as ONE unit — layout detection on raster slides is otherwise
         # per-line and erratic.
-        if self.translation_config.ocr_workaround:
+        if ocr_page:
             self.split_text_bullet_paragraphs(paragraphs)
             self.merge_ocr_continuation_paragraphs(paragraphs)
 
         for paragraph in paragraphs:
             self.update_paragraph_data(paragraph, update_unicode=True)
 
-        if self.translation_config.ocr_workaround:
+        if ocr_page:
             self.add_text_fill_background(page)
-            # since this is ocr file,
-            # image characters are not needed
+            # The raster underneath still carries every one of these glyphs,
+            # so dropping the ones no paragraph claimed loses nothing. On a
+            # page that is NOT a sandwich they are the only copy, which is
+            # why this is gated on `ocr_page` and not on the document-wide
+            # `ocr_workaround` flag.
             page.pdf_character = []
 
         # Rotated (90 deg) runs are extracted as a column of glyphs in

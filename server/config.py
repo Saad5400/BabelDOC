@@ -132,6 +132,28 @@ OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "google/gemini-3.1-flash-lite")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
+# How much of a document may come back untranslated before the run is refused
+# rather than delivered.
+#
+# There used to be no such gate, and the day the OpenRouter key hit its monthly
+# limit is what that cost: every call 403'd, babeldoc's per-paragraph handler
+# left each paragraph in English, the job finished `done`, and the caller
+# charged a user for an English copy of their own English PDF. A translation
+# that translated nothing is not a degraded deliverable, it is a failure, and
+# the caller can only know that if the engine says so.
+#
+# 5% is loss, not policy: a slide of code identifiers or a paragraph the model
+# refuses is an ordinary, survivable event on a good run. Capped at 1.0 (100%
+# = the gate is off) because a ratio above that means nothing.
+MAX_UNTRANSLATED_RATIO = min(_positive("MAX_UNTRANSLATED_RATIO", "0.05", float),
+                             1.0)
+
+# Root log level for the whole process (server/app.py configures it). INFO,
+# because the engine's own run summary — how many paragraphs it translated —
+# is an INFO line, and under uvicorn's default configuration nothing below
+# WARNING was ever emitted at all.
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
 # No pricing knobs. Cost is whatever the provider says it was — see server/cost.py.
 # The rate table that used to live here computed a number nobody could reconcile
 # (and added a $0.001/page surcharge no provider charges), and that number went

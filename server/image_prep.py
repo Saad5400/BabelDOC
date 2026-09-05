@@ -25,11 +25,18 @@ Differences from ocr_prep.py:
 - No bullet/stretch/staircase machinery: the fork groups image-OCR lines
   per region itself; here one plain Tj per line is the whole story.
 
+Last, before anything is injected, every region is put to the gloss gate
+(server/raster_gate.py): is this reading language at all, is this image a
+logo / a blur / a code screenshot / too dense to gloss, and would one mask
+cover the label next to it. A region the gate refuses declares no
+image_bbox, so its pixels reach the reader untouched down BOTH lanes — the
+mono lane's masks and the interlinear plates alike.
+
 Usage: image_prep.py in.pdf out.pdf regions.json [--dpi 300] [--debug dbg.pdf]
 """
 
 import json
-import re
+import logging
 import subprocess
 import sys
 import tempfile
@@ -39,6 +46,7 @@ import pymupdf
 from PIL import Image  # a hard transitive dep of babeldoc (pdfminer.six)
 
 if __package__:
+    from server import raster_gate
     from server.ocr_prep import CONF_KILL
     from server.ocr_prep import JUNK_ONLY
     from server.ocr_prep import JUNK_ZONE_PAD_PT
@@ -50,6 +58,7 @@ if __package__:
     from server.ocr_prep import esc_pdf
     from server.ocr_prep import parse_hocr
 else:  # script mode: python server/image_prep.py ...
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from ocr_prep import CONF_KILL
     from ocr_prep import JUNK_ONLY
@@ -61,6 +70,10 @@ else:  # script mode: python server/image_prep.py ...
     from ocr_prep import boxes_overlap
     from ocr_prep import esc_pdf
     from ocr_prep import parse_hocr
+
+    from server import raster_gate
+
+logger = logging.getLogger("doctranslate.image_prep")
 
 DPI = 300
 MAX_DPI = 600            # render at native image resolution up to this
@@ -509,11 +522,16 @@ def seg_metrics(ln, ws, px_per_pt):
     return left, right, baseline, size_px / px_per_pt
 
 
-def build_region_ops(lines, clip, px_per_pt, inv_ptm, font, visible=False):
-    """Content-stream ops for one region: one Tj per surviving hOCR line
-    segment, x-scaled onto the recognized extent, positioned in PDF user
-    space."""
-    ops = []
+def region_segments(lines, clip, px_per_pt):
+    """One region's drawable runs, as {@link raster_gate.RasterText} items.
+
+    This is the lane's single inventory of what it is about to claim it
+    translated: the gate judges these, and {@link build_region_ops} draws
+    whichever of them survive. `box` is page space (points, y down) so the
+    gate can measure the region and the page in the same units; `payload`
+    carries the pixel geometry the ops need.
+    """
+    segments = []
     for ln in lines:
         if ln.dead:
             continue
@@ -550,21 +568,40 @@ def build_region_ops(lines, clip, px_per_pt, inv_ptm, font, visible=False):
                 # is honest: we do not claim to have translated what we
                 # cannot draw legibly.
                 continue
-            natural = font.text_length(text, fontsize=size_pt)
-            if natural <= 0:
-                continue
-            target_w_pt = (right - left) / px_per_pt
-            sx = min(SX_MAX, max(SX_MIN, target_w_pt / natural))
-            page_pt = pymupdf.Point(clip.x0 + left / px_per_pt,
-                                    clip.y0 + baseline / px_per_pt)
-            pdf_pt = page_pt * inv_ptm
-            mode = 0 if visible else 3
-            color = "1 0 0 rg " if visible else ""
-            ops.append(
-                f"BT {color}/helv {size_pt:.2f} Tf {mode} Tr "
-                f"{sx:.4f} 0 0 1 {pdf_pt.x:.2f} {pdf_pt.y:.2f} Tm "
-                f"({esc_pdf(text)}) Tj ET"
-            )
+            top = min(w.y for w in ws)
+            bottom = max(w.y2 for w in ws)
+            segments.append(raster_gate.RasterText(
+                text=text,
+                box=(clip.x0 + left / px_per_pt, clip.y0 + top / px_per_pt,
+                     clip.x0 + right / px_per_pt, clip.y0 + bottom / px_per_pt),
+                conf=sum(w.conf for w in ws) / len(ws),
+                payload=(left, right, baseline, size_pt),
+            ))
+    return segments
+
+
+def build_region_ops(segments, clip, px_per_pt, inv_ptm, font, visible=False):
+    """Content-stream ops for one region: one Tj per surviving segment,
+    x-scaled onto the recognized extent, positioned in PDF user space."""
+    ops = []
+    for segment in segments:
+        left, right, baseline, size_pt = segment.payload
+        text = segment.text
+        natural = font.text_length(text, fontsize=size_pt)
+        if natural <= 0:
+            continue
+        target_w_pt = (right - left) / px_per_pt
+        sx = min(SX_MAX, max(SX_MIN, target_w_pt / natural))
+        page_pt = pymupdf.Point(clip.x0 + left / px_per_pt,
+                                clip.y0 + baseline / px_per_pt)
+        pdf_pt = page_pt * inv_ptm
+        mode = 0 if visible else 3
+        color = "1 0 0 rg " if visible else ""
+        ops.append(
+            f"BT {color}/helv {size_pt:.2f} Tf {mode} Tr "
+            f"{sx:.4f} 0 0 1 {pdf_pt.x:.2f} {pdf_pt.y:.2f} Tm "
+            f"({esc_pdf(text)}) Tj ET"
+        )
     return ops
 
 
@@ -589,40 +626,13 @@ def rect_to_pdf_space(rect, inv_ptm):
 
 # --------------------------------------------------------------------------
 # driver
-
-
-# One line of a code screenshot, as OCR sees it: statement punctuation,
-# comment markers, declaration keywords, empty call parens, or a UML
-# attribute's `name: type` suffix.
-CODE_LINE = re.compile(
-    r"[;{}]"
-    r"|\(\s*\)"
-    r"|//|/\*|\*/"
-    r"|^\s*(public|private|protected|static|void|int|double|float|class"
-    r"|return|new|import|package)\b"
-    r"|\b\w+\s*:\s*(int|double|float|void|string|char|bool|boolean)\b",
-    re.IGNORECASE,
-)
-CODE_MIN_LINES = 2       # fewer code-ish lines than this never kills a region
-CODE_LINE_FRAC = 0.4     # ...nor a region where they are a minority
-
-
-def region_is_code(lines):
-    """Is this region a code screenshot / UML card rather than a diagram?
-
-    Judged on the lines that SURVIVED filtering, so a photo caption next to
-    junk does not tip the scale. Killing the whole region (not just the code
-    lines) is deliberate: translating a screenshot's prose comments while
-    masking half its statements produces exactly the shredded hybrid this
-    guard exists to prevent.
-    """
-    texts = [" ".join(w.text for w in ln.alive_words())
-             for ln in lines if not ln.dead]
-    texts = [t for t in texts if t.strip()]
-    if len(texts) < CODE_MIN_LINES:
-        return False
-    hits = sum(1 for t in texts if CODE_LINE.search(t))
-    return hits >= CODE_MIN_LINES and hits / len(texts) >= CODE_LINE_FRAC
+#
+# "Is this reading worth the pixels it will destroy?" is not asked here: it
+# is the same question the interlinear plates ask, so it is asked once, in
+# server/raster_gate.py, and this lane is one of its two thin callers. Asking
+# it HERE is what makes the mono lane obey it too — a region refused before
+# its invisible runs are injected never reaches paragraph_finder's masks, the
+# sidecar, or any renderer.
 
 
 def prep_document(src, dst, regions_path, dpi=DPI, dbg_path=None):
@@ -630,6 +640,7 @@ def prep_document(src, dst, regions_path, dpi=DPI, dbg_path=None):
     dbg = pymupdf.open(src) if dbg_path else None
     font = pymupdf.Font("helv")
     regions_out = {"version": 1, "pages": {}}
+    refused = {}          # gate reason -> readings left as pixels, for the log
 
     with tempfile.TemporaryDirectory() as td:
         for pno, page in enumerate(doc):
@@ -671,20 +682,26 @@ def prep_document(src, dst, regions_path, dpi=DPI, dbg_path=None):
                     )
                 filter_region_words(lines, raster, bands)
 
-                if region_is_code(lines):
-                    # A code screenshot (or a UML card, which is identifier
-                    # soup). Policy says code stays verbatim, and a masked,
-                    # half-translated screenshot is strictly worse than the
-                    # untouched original — so the whole region opts out.
+                plan = raster_gate.gloss_plan(
+                    region_segments(lines, clip, px_per_pt),
+                    region=tuple(clip), page=tuple(page.rect),
+                    sharpness=raster_gate.laplacian_variance(pix),
+                )
+                for dead in plan.dropped:
+                    refused[dead.reason] = refused.get(dead.reason, 0) + 1
+                if plan.reason is not None:
+                    logger.info("page %d region %d left as pixels (%s): %s",
+                                pno, rno, plan.reason,
+                                [d.text for d in plan.dropped][:6])
                     continue
 
-                ops = build_region_ops(lines, clip, px_per_pt, inv_ptm, font)
+                ops = build_region_ops(plan.keep, clip, px_per_pt, inv_ptm, font)
                 if not ops:
                     continue
                 page_ops.extend(ops)
                 if dbg:
                     dbg_ops.extend(build_region_ops(
-                        lines, clip, px_per_pt, inv_ptm, font, visible=True))
+                        plan.keep, clip, px_per_pt, inv_ptm, font, visible=True))
                 page_regions.append({"image_bbox": rect_to_pdf_space(raw, inv_ptm)})
 
             if page_ops:
@@ -697,6 +714,8 @@ def prep_document(src, dst, regions_path, dpi=DPI, dbg_path=None):
     if dbg:
         dbg.save(dbg_path, garbage=3, deflate=True)
     Path(regions_path).write_text(json.dumps(regions_out, indent=1))
+    if refused:
+        logger.info("image-text gate refused %s", refused)
     return regions_out
 
 

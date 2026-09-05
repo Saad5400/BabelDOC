@@ -1011,3 +1011,64 @@ def get_paragraph_bounding_box(paragraph) -> Box | None:
         return None
 
     return Box(min_x, min_y, max_x, max_y)
+
+
+#: Share of a page's characters that must be invisible before the page counts
+#: as an OCR sandwich. Comfortably above the handful of stray invisible runs a
+#: digital page can carry, and comfortably below the 1.0 an ocrmypdf/ocr_prep
+#: page actually scores (MEASURED on record 151: raster pages 42/42, 1245/1245
+#: and 1049/1049 invisible; its digital pages 0/2431 and 0/1709).
+OCR_SANDWICH_INVISIBLE_SHARE = 0.9
+
+#: PDF text rendering mode 3 — "neither fill nor stroke": invisible ink.
+INVISIBLE_TEXT_RENDER_MODE = 3
+
+
+def iter_page_characters(page):
+    """Every character the page holds, loose ones and paragraph ones alike."""
+    yield from page.pdf_character or ()
+    for paragraph in page.pdf_paragraph or ():
+        for composition in paragraph.pdf_paragraph_composition or ():
+            if composition is None:
+                continue
+            if composition.pdf_line:
+                yield from composition.pdf_line.pdf_character or ()
+            elif composition.pdf_character:
+                yield composition.pdf_character
+            elif composition.pdf_same_style_characters:
+                yield from composition.pdf_same_style_characters.pdf_character or ()
+            elif composition.pdf_formula:
+                yield from composition.pdf_formula.pdf_character or ()
+
+
+def is_ocr_sandwich_page(page) -> bool:
+    """True when this page's text is invisible ink laid over its own picture.
+
+    `--ocr-workaround` is allowed to do two destructive things to a page: paint
+    an opaque plate over every paragraph, and throw away every character that
+    did not end up in one. Both are safe on an ocrmypdf sandwich page and only
+    there, BECAUSE the raster underneath still says everything the text layer
+    said — the text is invisible, so nothing visible is being erased.
+
+    A document is filed as scanned by majority vote, and a mostly-scanned
+    document still has digital pages: record 151 is a 154-page textbook whose
+    first 29 pages are typeset and whose remaining 125 are scans. On those 29
+    the characters and the vector art ARE the page, and applying the raster
+    lane's licence to them deletes a third of the content (MEASURED: exercises
+    12-18, both columns of the radical/exponent table, and the whole worked
+    solution of p.20 vanish).
+
+    So the licence is granted per page, on the evidence that makes it safe:
+    the page's own text is invisible.
+    """
+    total = 0
+    invisible = 0
+    for char in iter_page_characters(page):
+        total += 1
+        if getattr(char, "render_mode", None) == INVISIBLE_TEXT_RENDER_MODE:
+            invisible += 1
+    if total == 0:
+        # No text to erase and nothing to mask: either answer is a no-op, and
+        # False is the answer that never destroys anything.
+        return False
+    return invisible / total >= OCR_SANDWICH_INVISIBLE_SHARE
