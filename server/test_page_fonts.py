@@ -274,3 +274,25 @@ def test_a_rewritten_cmap_round_trips_through_its_own_parser():
     assert {code: text for code, (text, _) in reparsed[0].items()} == \
         {code: text for code, (text, _) in mapping.items()}
     assert b"beginbfrange" in body.encode("ascii")
+
+
+def test_repeated_gloss_fonts_are_parsed_once_per_document(monkeypatch):
+    doc = _strip_page()
+    calls = []
+    original = pdf_creater._glyph_unicode_from_font_program
+    def track(data):
+        calls.append(data)
+        return original(data)
+    monkeypatch.setattr(pdf_creater, "_glyph_unicode_from_font_program", track)
+    # Each HTML insertion embeds another copy of the same font programs.
+    fonts = _FONT_CACHE[(HEADING, GLOSS)]
+    for index in range(3):
+        page = doc.new_page()
+        page.insert_htmlbox(pymupdf.Rect(30, 30, 500, 300),
+            f'<div>{HEADING}</div><p>{GLOSS}</p>', css=fonts.css,
+            archive=fonts.archive)
+    page_fonts.repair_arabic_text_layer(doc)
+    assert calls
+    assert len(calls) == len(set(calls))
+    assert 'كلمات' in ''.join(page.get_text() for page in doc)
+    doc.close()

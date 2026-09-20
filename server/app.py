@@ -771,7 +771,9 @@ async def overlay(
                     ("plate_opacity", plate_opacity),
                     ("plate_padding", plate_padding))
                    if value is not None})
-            result, report = await _blocking(interlinear.render_overlay,
+            from server import overlay_cache
+
+            result, report = await _blocking(overlay_cache.render,
                                              original_bytes, parsed,
                                              style=style, options=options,
                                              vocab=want_vocab)
