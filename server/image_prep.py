@@ -33,6 +33,7 @@ image_bbox, so its pixels reach the reader untouched down BOTH lanes — the
 mono lane's masks and the interlinear plates alike.
 
 Usage: image_prep.py in.pdf out.pdf regions.json [--dpi 300] [--debug dbg.pdf]
+                     [--progress-file progress.json]
 """
 
 import json
@@ -638,7 +639,20 @@ def rect_to_pdf_space(rect, inv_ptm):
 # sidecar, or any renderer.
 
 
-def prep_document(src, dst, regions_path, dpi=DPI, dbg_path=None):
+def _write_progress(path, done, total):
+    if path is None:
+        return
+    path = Path(path)
+    temporary = path.with_suffix(".tmp")
+    try:
+        temporary.write_text(json.dumps({"done": done, "total": total}))
+        temporary.replace(path)
+    except OSError:
+        logger.debug("could not publish image preparation progress", exc_info=True)
+
+
+def prep_document(src, dst, regions_path, dpi=DPI, dbg_path=None,
+                  progress_path=None):
     doc = pymupdf.open(src)
     dbg = pymupdf.open(src) if dbg_path else None
     font = pymupdf.Font("helv")
@@ -647,6 +661,7 @@ def prep_document(src, dst, regions_path, dpi=DPI, dbg_path=None):
 
     with tempfile.TemporaryDirectory() as td:
         for pno, page in enumerate(doc):
+            _write_progress(progress_path, pno, len(doc))
             regions = gather_regions(page)
             if not regions:
                 continue
@@ -714,6 +729,7 @@ def prep_document(src, dst, regions_path, dpi=DPI, dbg_path=None):
                 append_ops(dbg, dbg[pno], dbg_ops)
 
     doc.save(dst, garbage=3, deflate=True)
+    _write_progress(progress_path, len(doc), len(doc))
     if dbg:
         dbg.save(dbg_path, garbage=3, deflate=True)
     Path(regions_path).write_text(json.dumps(regions_out, indent=1))
@@ -724,6 +740,11 @@ def prep_document(src, dst, regions_path, dpi=DPI, dbg_path=None):
 
 def main():
     args = sys.argv[1:]
+    progress_path = None
+    if "--progress-file" in args:
+        i = args.index("--progress-file")
+        progress_path = args[i + 1]
+        del args[i:i + 2]
     dbg_path = None
     if "--debug" in args:
         i = args.index("--debug")
@@ -735,7 +756,8 @@ def main():
         dpi = int(args[i + 1])
         del args[i:i + 2]
     src, dst, regions_path = args
-    regions = prep_document(src, dst, regions_path, dpi=dpi, dbg_path=dbg_path)
+    regions = prep_document(src, dst, regions_path, dpi=dpi, dbg_path=dbg_path,
+                            progress_path=progress_path)
     n = sum(len(v) for v in regions["pages"].values())
     print(f"wrote {dst} and {regions_path} ({n} regions)"
           + (f" and {dbg_path}" if dbg_path else ""))

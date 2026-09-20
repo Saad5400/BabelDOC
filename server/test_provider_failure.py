@@ -330,9 +330,9 @@ def run_job_stub(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
     monkeypatch.setattr(config, "OPENAI_API_KEY", "test-key")
 
-    def _fake_run_cmd(argv, _job_id, stage):
+    def _fake_run_cmd(argv, _job_id, stage, **_kwargs):
         if stage == "image_prep":
-            Path(argv[-1]).write_text(json.dumps({"pages": []}))
+            Path(argv[4]).write_text(json.dumps({"pages": []}))
 
     monkeypatch.setattr(pipeline, "_run_cmd", _fake_run_cmd)
 

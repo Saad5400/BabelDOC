@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 from pypdf import PdfReader
@@ -278,11 +279,50 @@ class _ScannedAfterAll(RuntimeError):
     """
 
 
-def _run_cmd(argv: list[str], job_id: str, stage: str) -> None:
-    proc = subprocess.run(argv, capture_output=True, text=True, timeout=3600)
-    if proc.returncode != 0:
-        tail = (proc.stderr or proc.stdout or "")[-1500:]
-        raise RuntimeError(f"{stage} failed (exit {proc.returncode}): {tail}")
+def _run_cmd(argv: list[str], job_id: str, stage: str, *,
+             progress_file: Path | None = None, timeout: float = 3600) -> None:
+    if progress_file is None:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        stdout, stderr, returncode = proc.stdout, proc.stderr, proc.returncode
+    else:
+        started = time.monotonic()
+        last = -1.0
+
+        def update_progress():
+            nonlocal last
+            try:
+                state = json.loads(progress_file.read_text())
+                done, total = int(state["done"]), int(state["total"])
+                if total <= 0 or not 0 <= done <= total:
+                    return
+                percent = _P_DETECT + (_P_PREP - _P_DETECT) * done / total
+                if percent > last:
+                    _set_progress(job_id, percent, stage)
+                    last = percent
+            except (OSError, ValueError, KeyError, TypeError):
+                pass  # progress is advisory; never fail the document for it
+
+        with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True) as proc:
+            try:
+                while True:
+                    remaining = timeout - (time.monotonic() - started)
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(argv, timeout)
+                    try:
+                        stdout, stderr = proc.communicate(timeout=min(1.0, remaining))
+                        break
+                    except subprocess.TimeoutExpired:
+                        update_progress()
+                update_progress()
+                returncode = proc.returncode
+            except BaseException:
+                proc.kill()
+                proc.communicate()
+                raise
+    if returncode != 0:
+        tail = (stderr or stdout or "")[-1500:]
+        raise RuntimeError(f"{stage} failed (exit {returncode}): {tail}")
 
 
 def _run_babeldoc(job_id: str, input_pdf: Path, out_dir: Path, *, lang_in: str,
@@ -726,11 +766,14 @@ def run_job(job_id: str) -> None:
         # failure degrades to the old behaviour instead of failing the job.
         prep_pdf = work / "image_prep.pdf"
         regions_json = work / "image_regions.json"
+        prep_progress = work / "image_prep_progress.json"
+        prep_progress.unlink(missing_ok=True)
         _set_progress(job_id, _P_DETECT, "image_prep")
         try:
             _run_cmd([sys.executable, str(config.IMAGE_PREP_SCRIPT),
-                      str(input_pdf), str(prep_pdf), str(regions_json)],
-                     job_id, "image_prep")
+                      str(input_pdf), str(prep_pdf), str(regions_json),
+                      "--progress-file", str(prep_progress)],
+                     job_id, "image_prep", progress_file=prep_progress)
             regions = json.loads(regions_json.read_text())
             if regions.get("pages"):
                 babeldoc_input = prep_pdf
@@ -744,7 +787,7 @@ def run_job(job_id: str) -> None:
         _set_progress(job_id, _P_PREP, "translating")
         progress_base = _P_PREP
     else:
-        progress_base = _P_DETECT
+        progress_base = _P_PREP
 
     # The sidecar rides along with mono runs (SIDECAR_FORMATS): the run that is
     # already being paid for is the only place the translated text and the
