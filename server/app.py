@@ -688,7 +688,9 @@ async def compose_dual(
             sidecar_data = _parse_sidecar(sidecar_bytes)
 
         try:
-            result = await _blocking(compose.compose_dual,
+            from server import overlay_cache
+
+            result = await _blocking(overlay_cache.render_dual,
                                      parts["original"], parts["translated"],
                                      format, sidecar=sidecar_data,
                                      vocab=want_vocab)
@@ -771,12 +773,23 @@ async def overlay(
                     ("plate_opacity", plate_opacity),
                     ("plate_padding", plate_padding))
                    if value is not None})
-            result, report = await _blocking(interlinear.render_overlay,
+            from server import overlay_cache
+
+            result, report = await _blocking(overlay_cache.render,
                                              original_bytes, parsed,
                                              style=style, options=options,
                                              vocab=want_vocab)
         except interlinear.OverlayError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        drawn = report["drawn"] + report["raster_drawn"]
+        skipped = report["skipped"] + report["raster_skipped"]
+        if skipped > drawn:
+            raise HTTPException(
+                status_code=422,
+                detail="Most translations could not fit this overlay layout. "
+                       "Use the translation-only or alternating-pages download for the complete translation.",
+            )
 
         return Response(
             content=result, media_type="application/pdf",

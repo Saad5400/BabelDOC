@@ -494,14 +494,13 @@ class StylesAndFormulas:
             formula.pdf_curve.extend(assigned_curves)
             formula.pdf_form.extend(assigned_forms)
 
-        # Remove assigned elements from page level
-        for curve in curves_to_remove:
-            if curve in page.pdf_curve:
-                page.pdf_curve.remove(curve)
-
-        for form in forms_to_remove:
-            if form in page.pdf_form:
-                page.pdf_form.remove(form)
+        # Candidates reference the exact page objects. Remove by identity in
+        # one pass: repeated list membership/remove performs quadratic deep
+        # dataclass comparisons on drawing-heavy PDFs (minutes per page).
+        curve_ids = {id(curve) for curve in curves_to_remove}
+        form_ids = {id(form) for form in forms_to_remove}
+        page.pdf_curve[:] = [c for c in page.pdf_curve if id(c) not in curve_ids]
+        page.pdf_form[:] = [f for f in page.pdf_form if id(f) not in form_ids]
 
     @staticmethod
     def _base_font_name(font_name: str | None) -> str:

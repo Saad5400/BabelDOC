@@ -1,3 +1,4 @@
+import hashlib
 import io
 import itertools
 import logging
@@ -870,7 +871,7 @@ def _font_program_bytes(doc, font_xref: int) -> bytes | None:
         return None
 
 
-def _normalize_one_font(doc, font_xref: int) -> bool:
+def _normalize_one_font(doc, font_xref: int, glyph_cache=None) -> bool:
     """Put the letters back in one font's ToUnicode. True if it changed."""
     to_unicode = doc.xref_get_key(font_xref, "ToUnicode")
     if to_unicode[0] != "xref":
@@ -907,7 +908,18 @@ def _normalize_one_font(doc, font_xref: int) -> bool:
     program = _font_program_bytes(doc, font_xref)
     if program:
         try:
-            glyphs = _glyph_unicode_from_font_program(program)
+            # Story embeds the same subset for each gloss. Parse its GSUB
+            # tables once per document, rather than hundreds of times. Hash
+            # the actual program: equal ToUnicode maps need not mean equal
+            # glyphs. Keep only small maps, never the embedded font bytes.
+            key = hashlib.sha256(program).digest()
+            glyphs = glyph_cache.get(key) if glyph_cache is not None else None
+            if glyphs is None:
+                glyphs = _glyph_unicode_from_font_program(program)
+                if glyph_cache is not None and len(glyphs) <= _MAX_SUBSET_GLYPHS_FOR_GAP_FILL:
+                    if len(glyph_cache) >= 32:
+                        glyph_cache.clear()
+                    glyph_cache[key] = glyphs
         except Exception:  # noqa: BLE001 - a font we cannot read is not fatal
             logger.debug("cmap: font %s program is unreadable", font_xref,
                          exc_info=True)
@@ -941,11 +953,12 @@ def normalize_arabic_text_layer(doc) -> int:
     presentation forms in any CMap comes out untouched.
     """
     repaired = 0
+    glyph_cache = {}
     for xref in range(1, doc.xref_length()):
         try:
             if doc.xref_get_key(xref, "Type")[1] != "/Font":
                 continue
-            repaired += _normalize_one_font(doc, xref)
+            repaired += _normalize_one_font(doc, xref, glyph_cache)
         except Exception:  # noqa: BLE001 - never lose a document over its text layer
             logger.debug("cmap: could not normalize font %s", xref, exc_info=True)
     if repaired:

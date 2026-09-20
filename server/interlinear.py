@@ -339,15 +339,15 @@ def subset_font_bytes(source: Path, texts: list[str]) -> bytes:
         options.notdef_outline = True
         options.drop_tables += ["DSIG"]
 
-        font = subset.load_font(str(source), options)
-        subsetter = subset.Subsetter(options=options)
-        subsetter.populate(unicodes=_subset_codepoints(texts))
-        subsetter.subset(font)
+        with subset.load_font(str(source), options) as font:
+            subsetter = subset.Subsetter(options=options)
+            subsetter.populate(unicodes=_subset_codepoints(texts))
+            subsetter.subset(font)
 
-        buffer = BytesIO()
-        subset.save_font(font, buffer, options)
+            buffer = BytesIO()
+            subset.save_font(font, buffer, options)
 
-        return buffer.getvalue()
+            return buffer.getvalue()
     except Exception:  # noqa: BLE001 - subsetting is an optimisation
         logger.exception("subsetting the gloss font failed; using it whole")
 
@@ -769,7 +769,7 @@ def _page_ink(page: pymupdf.Page) -> list[pymupdf.Rect]:
     """
     with _GLYPH_HEIGHTS:
         ink = [pymupdf.Rect(span["bbox"])
-               for block in page.get_text("dict")["blocks"] if block["type"] == 0
+               for block in page.get_text("dict", flags=pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES)["blocks"] if block["type"] == 0
                for line in block["lines"] for span in line["spans"]
                if span["text"].strip()]
 
@@ -1512,7 +1512,12 @@ def _text_ink(page: pymupdf.Page) -> list[pymupdf.Rect]:
         pymupdf.TOOLS.set_small_glyph_heights(True)
 
         try:
-            blocks = page.get_text("dict")["blocks"]
+            # Only text geometry is needed. The default dict flags also
+            # decompress and serialize embedded images, which this pass
+            # immediately discards (10s on the 57-page incident document).
+            blocks = page.get_text(
+                "dict", flags=pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES,
+            )["blocks"]
 
             return [pymupdf.Rect(span["bbox"])
                     for block in blocks if block["type"] == 0
@@ -2609,6 +2614,8 @@ def _targets(sidecar: dict) -> list[str]:
 
 
 def _open_original(original_bytes: bytes) -> pymupdf.Document:
+    from server import pdf_tiles
+
     try:
         doc = pymupdf.open(stream=BytesIO(original_bytes), filetype="pdf")
     except Exception as exc:  # noqa: BLE001 - pymupdf raises many error types
@@ -2623,6 +2630,15 @@ def _open_original(original_bytes: bytes) -> pymupdf.Document:
         doc.close()
         raise OverlayError(f"the original has {pages} pages (max {MAX_PAGES})")
 
+    try:
+        compacted, report = pdf_tiles.compact(original_bytes)
+        if report["pages"]:
+            replacement = pymupdf.open(stream=compacted, filetype="pdf")
+            doc.close()
+            doc = replacement
+    except Exception as exc:
+        doc.close()
+        raise OverlayError(f"could not prepare the original PDF: {exc}") from exc
     return doc
 
 

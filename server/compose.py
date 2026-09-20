@@ -212,6 +212,57 @@ def _side_by_side(original: PdfReader,
     return writer
 
 
+def _side_by_side_fast(original_bytes: bytes, translated_bytes: bytes,
+                       positions: list[int]) -> bytes | None:
+    """Graft ordinary pages as forms instead of parsing every drawing in Python.
+
+    Preserve the established path for rotated/cropped/annotated inputs, whose
+    page attributes need more than form placement. Whole, plain pages can be
+    placed natively without expanding their potentially huge content streams.
+    """
+    import pymupdf
+
+    with pymupdf.open(stream=original_bytes, filetype="pdf") as original, \
+            pymupdf.open(stream=translated_bytes, filetype="pdf") as translated, \
+            pymupdf.open() as output:
+        for document, indices in ((original, range(len(original))), (translated, positions)):
+            for index in indices:
+                page = document[index]
+                if (page.rotation or page.first_annot or page.first_widget
+                        or any(link["kind"] != pymupdf.LINK_URI for link in page.get_links())
+                        or abs(page.cropbox.width - page.mediabox.width) > 0.02
+                        or abs(page.cropbox.height - page.mediabox.height) > 0.02):
+                    return None
+        for index, source in enumerate(original):
+            twin = translated[positions[index]] if index < len(positions) else None
+            sizes = [p.rect for p in (source, twin) if p is not None]
+            half_width = max(r.width for r in sizes)
+            height = max(r.height for r in sizes)
+            page = output.new_page(width=2 * half_width, height=height)
+            if source.get_contents():
+                page.show_pdf_page(pymupdf.Rect(0, 0, half_width, height), original, index)
+            if twin is not None and twin.get_contents():
+                page.show_pdf_page(pymupdf.Rect(half_width, 0, 2 * half_width, height),
+                                   translated, positions[index])
+            for source_page, offset in ((source, 0), (twin, half_width)):
+                if source_page is None:
+                    continue
+                scale = min(half_width / source_page.rect.width,
+                            height / source_page.rect.height)
+                dx = offset + (half_width - source_page.rect.width * scale) / 2
+                dy = (height - source_page.rect.height * scale) / 2
+                for link in source_page.get_links():
+                    rect = link["from"]
+                    page.insert_link({"kind": pymupdf.LINK_URI, "uri": link["uri"],
+                                      "from": pymupdf.Rect(rect.x0 * scale + dx,
+                                                          rect.y0 * scale + dy,
+                                                          rect.x1 * scale + dx,
+                                                          rect.y1 * scale + dy)})
+        for index in positions[len(original):]:
+            output.insert_pdf(translated, from_page=index, to_page=index)
+        return output.tobytes(garbage=3, deflate=True)
+
+
 def _artifact_content_positions(sidecar, page_count: int) -> list[int] | None:
     """The baked mono's content-page positions, when the sidecar records them.
 
@@ -318,10 +369,19 @@ def _crop_baked_strips(translated_bytes: bytes, positions: list[int],
             # 0.25pt below the old bottom edge: the divider (stroked ON the
             # edge) intersects and goes; content that merely ENDS at the
             # edge does not intersect and stays.
-            page.add_redact_annot(
-                pymupdf.Rect(-2, rect.height - height + 0.25,
-                             rect.width + 2, rect.height + 2))
-            page.apply_redactions()
+            contents = page.get_contents()
+            marked = {xref for xref in contents
+                      if doc.xref_stream(xref).startswith(b"% catodemy-vocab-strip-v1\n")}
+            if marked:
+                retained = " ".join(f"{xref} 0 R" for xref in contents if xref not in marked)
+                doc.xref_set_key(page.xref, "Contents", f"[{retained}]")
+            else:
+                # Old artifacts have no stream markers. Preserve the exact
+                # geometric fallback rather than guessing which bytes to cut.
+                page.add_redact_annot(
+                    pymupdf.Rect(-2, rect.height - height + 0.25,
+                                 rect.width + 2, rect.height + 2))
+                page.apply_redactions()
             media = page.mediabox
             page.set_mediabox(pymupdf.Rect(media.x0, media.y0 + height,
                                            media.x1, media.y1))
@@ -647,9 +707,8 @@ def compose_dual(original_bytes: bytes, translated_bytes: bytes,
 
     if strips:
         try:
-            translated = _read(
-                _crop_baked_strips(translated_bytes, positions, strips),
-                "translated")
+            translated_bytes = _crop_baked_strips(translated_bytes, positions, strips)
+            translated = _read(translated_bytes, "translated")
         except Exception:  # noqa: BLE001 - best-effort, never 422 over vocab
             # The baked strips stay on the pages then — still correct
             # content. The fresh vocab layer is skipped so nothing doubles.
@@ -684,10 +743,15 @@ def compose_dual(original_bytes: bytes, translated_bytes: bytes,
                          "failed; building the dual without them")
         properties, outline = {}, []
 
-    build = _alternating if fmt == "alternating" else _side_by_side
-    out = BytesIO()
-    build(original, translated_pages).write(out)
-    composed = out.getvalue()
+    composed = None
+    if fmt == "side_by_side":
+        selected = positions if positions is not None else list(range(len(translated_pages)))
+        composed = _side_by_side_fast(original_bytes, translated_bytes, selected)
+    if composed is None:
+        build = _alternating if fmt == "alternating" else _side_by_side
+        out = BytesIO()
+        build(original, translated_pages).write(out)
+        composed = out.getvalue()
 
     try:
         # The vocab strips live in the body, on each pair's unit.

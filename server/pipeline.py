@@ -684,6 +684,16 @@ def run_job(job_id: str) -> None:
     lang_in, lang_out = job["lang_in"], job["lang_out"]
 
     _set_progress(job_id, 0.5, "analyzing")
+    from server import pdf_tiles
+
+    normalized, tile_report = pdf_tiles.compact(input_pdf.read_bytes())
+    if tile_report["pages"]:
+        prepared = work / "tile-prepared.pdf"
+        prepared.write_bytes(normalized)
+        input_pdf = prepared
+        logger.info("job %s: compacted tiled backgrounds: %s", job_id, tile_report)
+    del normalized
+    _set_progress(job_id, 0.5, "analyzing")
     verdicts = classify_pages(input_pdf)
     pages = len(verdicts)
     scanned = not has_real_text_layer(input_pdf, verdicts)
