@@ -2614,6 +2614,8 @@ def _targets(sidecar: dict) -> list[str]:
 
 
 def _open_original(original_bytes: bytes) -> pymupdf.Document:
+    from server import pdf_tiles
+
     try:
         doc = pymupdf.open(stream=BytesIO(original_bytes), filetype="pdf")
     except Exception as exc:  # noqa: BLE001 - pymupdf raises many error types
@@ -2628,6 +2630,15 @@ def _open_original(original_bytes: bytes) -> pymupdf.Document:
         doc.close()
         raise OverlayError(f"the original has {pages} pages (max {MAX_PAGES})")
 
+    try:
+        compacted, report = pdf_tiles.compact(original_bytes)
+        if report["pages"]:
+            replacement = pymupdf.open(stream=compacted, filetype="pdf")
+            doc.close()
+            doc = replacement
+    except Exception as exc:
+        doc.close()
+        raise OverlayError(f"could not prepare the original PDF: {exc}") from exc
     return doc
 
 

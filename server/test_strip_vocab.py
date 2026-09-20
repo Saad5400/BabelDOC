@@ -271,3 +271,27 @@ def test_a_mono_with_no_arabic_is_returned_byte_for_byte(client):
 
     assert resp.status_code == 200
     assert resp.content == translated
+
+
+def test_marked_strip_removal_preserves_pixels_and_never_redacts(monkeypatch):
+    from server import compose
+    doc = pymupdf.open()
+    page = doc.new_page(width=400, height=500)
+    page.insert_text((30, 40), "ORIGINAL CONTENT", fontsize=18)
+    page.draw_rect(pymupdf.Rect(30, 100, 300, 400), color=(1, 0, 0), width=3)
+    before = page.get_pixmap().samples
+    source_text = page.get_text()
+    added = vocab_pages.attach_vocab(doc, {"0": VOCAB["0"]}, {0: 0})
+    assert added[0] > 0
+    baked = doc.tobytes(garbage=4, deflate=True)
+    doc.close()
+    def no_redaction(*_args, **_kwargs):
+        raise AssertionError("Marked strips must not traverse original drawings")
+    monkeypatch.setattr(pymupdf.Page, "apply_redactions", no_redaction)
+    stripped = compose._crop_baked_strips(baked, [0], added)
+    with pymupdf.open(stream=stripped, filetype="pdf") as clean:
+        assert clean[0].get_pixmap().samples == before
+        assert clean[0].get_text() == source_text
+        # Re-extending the page must not reveal hidden vocabulary.
+        clean[0].set_mediabox(pymupdf.Rect(0, -added[0], 400, 500))
+        assert clean[0].get_text() == source_text

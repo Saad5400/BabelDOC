@@ -69,3 +69,38 @@ def test_failed_build_is_retryable_and_cache_is_bounded(tmp_path, monkeypatch):
     render(b"two")
     assert sum(p.stat().st_size for p in (tmp_path / "overlay-cache").glob("*.cache")) <= 50
     assert len(calls) == 3
+
+
+def test_dual_layout_cache_keys_include_both_pdfs_layout_and_vocab(tmp_path, monkeypatch):
+    from server import compose
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    calls = []
+    def build(*args, **kwargs):
+        calls.append((args, kwargs))
+        return b"%PDF-dual"
+    monkeypatch.setattr(compose, "compose_dual", build)
+    def render(original=b"source", translated=b"translated", fmt="alternating", vocab=True):
+        return overlay_cache.render_dual(original, translated, fmt, sidecar={}, vocab=vocab)
+    assert render() == render() == b"%PDF-dual"
+    assert len(calls) == 1
+    render(original=b"different")
+    render(translated=b"different")
+    render(fmt="side_by_side")
+    render(vocab=False)
+    assert len(calls) == 5
+
+
+def test_endpoint_refuses_an_overlay_missing_most_translations(client, monkeypatch):
+    import pymupdf
+    from server.conftest import TOKEN
+    with pymupdf.open() as doc:
+        doc.new_page()
+        source = doc.tobytes()
+    monkeypatch.setattr(overlay_cache, "render", lambda *_args, **_kwargs: (
+        b"%PDF-incomplete", {"pages": 1, "drawn": 1, "skipped": 5,
+                            "raster_drawn": 0, "raster_skipped": 0}))
+    response = client.post('/v1/overlay', headers={'X-Internal-Token': TOKEN},
+                           files={'original': ('source.pdf', source, 'application/pdf'),
+                                  'sidecar': ('sidecar.json', b'{"total_pages": 1, "pages": [{"page_number": 0, "mediabox": [0, 0, 595, 842], "blocks": []}]}', 'application/json')})
+    assert response.status_code == 422
+    assert 'complete translation' in response.json()['detail']

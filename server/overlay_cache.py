@@ -13,6 +13,7 @@ import threading
 import time
 from pathlib import Path
 
+from server import compose
 from server import config
 from server import interlinear
 
@@ -25,7 +26,7 @@ TTL_SECONDS = 24 * 3600
 # a version. Cover the renderers and font/text repair code, not user filenames.
 _SOURCE_FILES = (
     "server/interlinear.py", "server/page_fonts.py", "server/vocab_pages.py",
-    "server/raster_gate.py",
+    "server/raster_gate.py", "server/compose.py", "server/pdf_tiles.py",
     "babeldoc/format/pdf/document_il/backend/pdf_creater.py",
 )
 _ROOT = Path(__file__).resolve().parent.parent
@@ -54,7 +55,25 @@ def render(original: bytes, sidecar: dict, *, style: str,
                               dataclasses.asdict(options), vocab,
                               config.VOCAB_PAGES], sort_keys=True,
                              ensure_ascii=True).encode())
-    key = digest.hexdigest()
+    return _cached(digest.hexdigest(), lambda: interlinear.render_overlay(
+        original, sidecar, style=style, options=options, vocab=vocab))
+
+
+def render_dual(original: bytes, translated: bytes, format: str, *,
+                sidecar: dict | None = None, vocab: bool = True) -> bytes:
+    digest = hashlib.sha256(original)
+    digest.update(hashlib.sha256(translated).digest())
+    digest.update(json.dumps(["compose", _REVISION, sidecar, format, vocab,
+                              config.VOCAB_PAGES], sort_keys=True,
+                             ensure_ascii=True).encode())
+    result, _ = _cached(digest.hexdigest(), lambda: (
+        compose.compose_dual(original, translated, format, sidecar=sidecar, vocab=vocab),
+        {},
+    ))
+    return result
+
+
+def _cached(key: str, build):
     root = config.DATA_DIR / "overlay-cache"
     path = root / (key + ".cache")
     started = time.monotonic()
@@ -71,8 +90,7 @@ def render(original: bytes, sidecar: dict, *, style: str,
         except (OSError, ValueError):
             logger.warning("overlay cache read failed; rebuilding", exc_info=True)
 
-        result, report = interlinear.render_overlay(
-            original, sidecar, style=style, options=options, vocab=vocab)
+        result, report = build()
         temporary = None
         try:
             header = json.dumps(report).encode() + b"\n"
@@ -88,7 +106,10 @@ def render(original: bytes, sidecar: dict, *, style: str,
             logger.warning("overlay cache write failed; serving result", exc_info=True)
         finally:
             if temporary is not None:
-                temporary.unlink(missing_ok=True)
-        logger.info("overlay built: %.3fs, %d bytes, %d pages",
-                    time.monotonic() - started, len(result), report["pages"])
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Could not remove cache temporary file", exc_info=True)
+        logger.info("PDF built: %.3fs, %d bytes",
+                    time.monotonic() - started, len(result))
         return result, report

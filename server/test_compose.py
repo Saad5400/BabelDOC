@@ -753,3 +753,23 @@ def test_the_dual_carries_no_empty_info_entries(client):
     assert info["/Title"] == "عنوان"
     assert all(value is not None and str(value) != ""
                for value in info.values())
+
+
+def test_native_side_by_side_preserves_scaled_uri_links(monkeypatch):
+    import pymupdf
+    from server import compose
+    with pymupdf.open() as source:
+        page = source.new_page(width=200, height=300)
+        page.insert_text((20, 70), "SOURCE")
+        page.insert_link({'kind': pymupdf.LINK_URI, 'uri': 'https://example.com/reference',
+                          'from': pymupdf.Rect(20, 20, 80, 40)})
+        original = source.tobytes()
+    translated = _text_pdf('TRANSLATION', (400, 600))
+    def reject_slow_path(*_args, **_kwargs):
+        raise AssertionError('ordinary pages should use native composition')
+    monkeypatch.setattr(compose, '_side_by_side', reject_slow_path)
+    result = compose.compose_dual(original, translated, 'side_by_side', vocab=False)
+    with pymupdf.open(stream=result) as doc:
+        link = doc[0].get_links()[0]
+        assert link['uri'] == 'https://example.com/reference'
+        assert tuple(link['from']) == pytest.approx((40, 40, 160, 80))

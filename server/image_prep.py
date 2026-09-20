@@ -150,6 +150,9 @@ def gather_regions(page):
     """
     regions = []
     for info in page.get_image_info(xrefs=True):
+        xref = info.get("xref", 0)
+        if xref and page.parent.xref_get_key(xref, "CatodemyTexture") == ("bool", "true"):
+            continue  # compacted decorative tiles contain no image text
         raw = pymupdf.Rect(info["bbox"])
         clip = raw & page.rect
         if clip.is_empty:

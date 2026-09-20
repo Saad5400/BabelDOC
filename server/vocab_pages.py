@@ -365,6 +365,11 @@ def attach_vocab_strip(page: pymupdf.Page, rows: list[dict],
                        "skipped", strip_height, rect.height)
         return 0.0
 
+    # Keep the appended vocabulary in identifiable, balanced streams. This
+    # lets later layouts remove only our additions without running geometric
+    # redaction over every nested drawing in the original page.
+    page.wrap_contents()
+    original_contents = set(page.get_contents())
     media = page.mediabox  # PDF space — y grows upward, so the bottom is y0
     page.set_mediabox(pymupdf.Rect(media.x0, media.y0 - strip_height,
                                    media.x1, media.y1))
@@ -403,6 +408,10 @@ def attach_vocab_strip(page: pymupdf.Page, rows: list[dict],
                 scale_low=0)
             y = row_rect.y1 + _ROW_GAP
 
+    for xref in page.get_contents():
+        if xref not in original_contents:
+            stream = page.parent.xref_stream(xref)
+            page.parent.update_stream(xref, b"% catodemy-vocab-strip-v1\n" + stream)
     return strip_height
 
 
