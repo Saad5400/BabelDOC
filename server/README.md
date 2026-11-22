@@ -165,6 +165,7 @@ paths — behavior is byte-identical to before the feature.
 | `DATA_DIR` | `/data` | Job storage (volume) |
 | `JOB_TTL_HOURS` | `24` | Job retention |
 | `MAX_UNTRANSLATED_RATIO` | `0.05` | Share of paragraphs a run may leave untranslated before it is `failed` instead of delivered (capped at `1.0` = off) |
+| `BABELDOC_ORT_THREADS` | `2` | onnxruntime intra-op threads for the layout model (the session also runs without a CPU memory arena, so its buffers go back to the OS) |
 | `VOCAB_PAGES` | `1` | «كلمات هذه الصفحة» per-page vocabulary pages; `0` disables extraction and every insertion |
 
 ## Run locally
@@ -176,8 +177,10 @@ DOCTRANSLATE_TOKEN=dev OPENAI_API_KEY=... uvicorn server.app:app --port 8000
 ```
 
 Requires `tesseract` (+eng) and ghostscript on PATH for the scanned path.
-First run downloads babeldoc assets (fonts + onnx layout model) to
-`~/.cache/babeldoc`.
+The first translation job downloads babeldoc's assets (fonts + onnx layout
+model) to `~/.cache/babeldoc` (the image bakes them in). The layout model is
+loaded per translation job and released when the job ends, so an idle service
+holds no ONNX session; the instant endpoints never load it.
 
 `/v1/convert` needs a Gotenberg to talk to — the default `GOTENBERG_URL` points
 at one on localhost:

@@ -128,7 +128,9 @@ def _worker_loop() -> None:
     # heavy babeldoc imports/asset downloads are still warming up.
     from server import pipeline
 
-    pipeline.warmup()
+    # Cheap: cache folders only. The layout model is per job (see below), so an
+    # idle worker holds no ONNX session.
+    pipeline.init()
     while True:
         job_id = _QUEUE.get()
         job = read_job(job_id)
@@ -151,6 +153,9 @@ def _worker_loop() -> None:
                 update_job(job_id, status="failed", error=str(exc)[:2000])
             finally:
                 _CURRENT_JOB_ID = None
+                # After run_job's frame is gone, so the session is really
+                # unreferenced; the slot's own release trims again, harmlessly.
+                pipeline.release_layout_model()
 
 
 def start_worker() -> None:

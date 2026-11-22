@@ -1,5 +1,6 @@
 import ast
 import logging
+import os
 import platform
 import re
 import threading
@@ -35,6 +36,14 @@ logger = logging.getLogger(__name__)
 
 # 检测操作系统类型
 os_name = platform.system()
+
+
+def _ort_intra_op_threads() -> int:
+    """onnxruntime intra-op threads: BABELDOC_ORT_THREADS, default 2."""
+    try:
+        return max(1, int(os.environ.get("BABELDOC_ORT_THREADS", "2")))
+    except ValueError:
+        return 2
 
 
 class OnnxModel(DocLayoutModel):
@@ -74,9 +83,29 @@ class OnnxModel(DocLayoutModel):
                     providers.append(provider)
         self.model = onnxruntime.InferenceSession(
             model.SerializeToString(),
+            sess_options=self._session_options(),
             providers=providers,
         )
         self.lock = threading.Lock()
+
+    @staticmethod
+    def _session_options() -> "onnxruntime.SessionOptions":
+        """Session options that let the process give memory back.
+
+        With the defaults, onnxruntime's CPU arena keeps every buffer it ever
+        allocated for the life of the session and never returns it to the OS,
+        and the memory-pattern planner pre-allocates per input shape on top;
+        a long-lived service then holds the peak of its largest page forever.
+        Both off: buffers come from the system allocator and go back to it.
+        Two intra-op threads, because the layout model shares a small host
+        with other work and onnxruntime otherwise takes one per core.
+        Override with BABELDOC_ORT_THREADS.
+        """
+        options = onnxruntime.SessionOptions()
+        options.enable_cpu_mem_arena = False
+        options.enable_mem_pattern = False
+        options.intra_op_num_threads = _ort_intra_op_threads()
+        return options
 
     @staticmethod
     def _make_static_model(model, imgsz):

@@ -324,16 +324,34 @@ def trim() -> None:
     times over. MEASURED: 464 MB returned after one 73-page overlay, 171 MB
     after loading the layout model, at a cost of 20-250 ms.
 
+    MuPDF's resource store (decoded images, fonts, display lists; up to
+    256 MB by default) is emptied first, or `malloc_trim` has nothing of it to
+    return: the store keeps its entries until it hits that cap. Only entries
+    nothing else holds are evicted (MuPDF's own scavenger does the same from
+    any thread under memory pressure), so work in flight keeps what it uses
+    and merely re-decodes anything it asks for again.
+
     Best-effort: not glibc, or a libc without `malloc_trim`, simply means the
-    `gc.collect()` and nothing more.
+    `gc.collect()` and the store shrink and nothing more.
     """
     gc.collect()
+    _shrink_mupdf_store()
     if _MALLOC_TRIM is None:  # pragma: no cover - non-glibc platform
         return
     try:
         _MALLOC_TRIM(0)
     except Exception:  # noqa: BLE001 - pragma: no cover - never worth raising
         logger.debug("malloc_trim failed", exc_info=True)
+
+
+def _shrink_mupdf_store() -> None:
+    """Evict every unreferenced entry from MuPDF's store (best-effort)."""
+    try:
+        import pymupdf
+
+        pymupdf.TOOLS.store_shrink(100)
+    except Exception:  # noqa: BLE001 - never worth failing a release over
+        logger.debug("pymupdf store_shrink failed", exc_info=True)
 
 
 #: The gate. One per process, because the memory ceiling is one per process.
