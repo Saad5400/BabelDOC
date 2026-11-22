@@ -8,6 +8,7 @@ import functools
 import hmac
 import json
 import logging
+import re
 import subprocess
 from contextlib import asynccontextmanager
 from io import BytesIO
@@ -965,7 +966,14 @@ async def add_notes_space(
                         headers=_pdf_attachment(file.filename, "notes"))
 
 
+#: What jobs.create_job() mints (uuid4 hex, 16 chars). Anything else in the URL
+#: is never a job, and is refused before it is joined onto the jobs directory.
+_JOB_ID = re.compile(r"[0-9a-f]{16}")
+
+
 def _get_job_or_404(job_id: str) -> dict:
+    if not _JOB_ID.fullmatch(job_id):
+        raise HTTPException(status_code=404, detail="job not found")
     job = jobs.read_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
