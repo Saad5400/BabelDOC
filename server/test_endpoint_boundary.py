@@ -381,3 +381,12 @@ def test_the_surrogate_scrub_leaves_real_characters_alone():
     parsed = json.loads('{"a": "\\ud83d\\ude00 ok", "b": "x\\ud800y"}')
 
     assert _scrub_surrogates(parsed) == {"a": "😀 ok", "b": "xy"}
+
+
+@pytest.mark.parametrize("job_id", ["..", "%2e%2e", "abc", "0123456789abcdef0", "ZZZZZZZZZZZZZZZZ"])
+@pytest.mark.parametrize("suffix", ["", "/result", "/sidecar"])
+def test_a_job_id_that_was_never_minted_is_a_404(client, job_id, suffix):
+    """Only the 16-hex ids create_job() mints reach the jobs directory."""
+    r = client.get(f"/v1/jobs/{job_id}{suffix}", headers={"X-Internal-Token": TOKEN})
+    assert r.status_code == 404
+
