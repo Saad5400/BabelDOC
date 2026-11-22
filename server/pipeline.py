@@ -33,7 +33,12 @@ from server import jobs
 
 logger = logging.getLogger("doctranslate.pipeline")
 
-_warmup_lock = threading.Lock()
+_layout_lock = threading.Lock()
+_initialised = False
+#: The DocLayout-YOLO ONNX session, loaded by the first babeldoc run of a job
+#: and dropped when the job ends (release_layout_model). Never process-lifetime:
+#: only translation jobs use it, and an idle service held it — and the ORT
+#: arena behind it — for weeks.
 _doc_layout_model = None
 
 # Overall progress bands (percent).
@@ -43,18 +48,60 @@ _P_PREP = 12.0
 _P_BABELDOC_END = 97.0
 
 
-def warmup() -> None:
-    """One-time heavy init: cache folders + layout model (downloads on first run)."""
-    global _doc_layout_model
-    with _warmup_lock:
-        if _doc_layout_model is not None:
+def init() -> None:
+    """One-time cheap init for the job worker: babeldoc's cache folders.
+
+    Deliberately NOT the layout model — that is loaded per job by
+    `_layout_model()` and released by `release_layout_model()`.
+    """
+    global _initialised
+    with _layout_lock:
+        if _initialised:
             return
         import babeldoc.format.pdf.high_level as high_level
-        from babeldoc.docvision.doclayout import DocLayoutModel
 
         high_level.init()
-        _doc_layout_model = DocLayoutModel.load_onnx()
-        logger.info("warmup complete (doc layout model loaded)")
+        _initialised = True
+        logger.info("pipeline init complete (layout model loads per job)")
+
+
+def _layout_model():
+    """The layout model for this job, loading it on first use.
+
+    A job can run babeldoc twice (the scanned-after-all retry); both runs share
+    one load. The assets are baked into the image (server/Dockerfile), so this
+    is a local file read plus session creation, not a download.
+    """
+    global _doc_layout_model
+    with _layout_lock:
+        if _doc_layout_model is None:
+            from babeldoc.docvision.doclayout import DocLayoutModel
+
+            started = time.monotonic()
+            _doc_layout_model = DocLayoutModel.load_onnx()
+            logger.info("doc layout model loaded in %.2fs",
+                        time.monotonic() - started)
+        return _doc_layout_model
+
+
+def release_layout_model() -> bool:
+    """Drop the job's layout model and hand its memory back to the OS.
+
+    Called by the worker once the job is over, after `run_job` has returned or
+    raised, so nothing on its stack (the TranslationConfig, the translator that
+    points at it) still holds the session. Returns whether a model was held.
+    """
+    global _doc_layout_model
+    with _layout_lock:
+        model, _doc_layout_model = _doc_layout_model, None
+    if model is None:
+        return False
+    del model
+    from server import capacity
+
+    capacity.trim()
+    logger.info("doc layout model released")
+    return True
 
 
 def _set_progress(job_id: str, percent: float, stage: str) -> None:
@@ -370,7 +417,7 @@ def _run_babeldoc(job_id: str, input_pdf: Path, out_dir: Path, *, lang_in: str,
         input_file=str(input_pdf),
         lang_in=lang_in,
         lang_out=lang_out,
-        doc_layout_model=_doc_layout_model,
+        doc_layout_model=_layout_model(),
         output_dir=str(out_dir),
         no_dual=(fmt == "translated"),
         no_mono=(fmt != "translated"),
