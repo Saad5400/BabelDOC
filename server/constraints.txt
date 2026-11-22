@@ -1,0 +1,117 @@
+# Exact versions for every runtime dependency of the doctranslate image.
+#
+# server/Dockerfile installs with `-c server/constraints.txt`, so a rebuild
+# gets these versions rather than whatever PyPI released since. Without it a
+# fresh build resolved bitstring 5.0, which removed BitStream, and the job
+# worker died on startup (see server/smoke_imports.py).
+#
+# These are the versions the server test suite passes on (Python 3.12,
+# linux x86_64). To upgrade: change a pin (or regenerate with
+#   uv pip compile pyproject.toml server/requirements.txt \
+#     --python-version 3.12 --python-platform x86_64-unknown-linux-gnu \
+#     --no-header --no-annotate -o server/constraints.txt
+# after updating a venv), run `pytest server`, and build the image: the build
+# runs the smoke test.
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.14.2
+arabic-reshaper==3.0.1
+attrs==26.1.0
+backports-zstd==1.7.0
+bitarray==3.10.1
+bitstring==4.4.0
+certifi==2026.7.22
+cffi==2.1.1
+chardet==7.6.0
+charset-normalizer==3.5.1
+click==8.5.0
+cloudpickle==3.1.2
+configargparse==1.7.5
+cryptography==50.0.1
+fastapi==0.141.1
+filelock==3.32.5
+flatbuffers==25.12.19
+fonttools==4.65.0
+fpdf2==2.9.0
+freetype-py==2.5.1
+fsspec==2026.7.0
+h11==0.16.0
+hf-xet==1.6.0
+httpcore==1.0.9
+httpcore2==2.12.0
+httpx==0.28.1
+httpx2==2.12.0
+huggingface-hub==1.29.0
+hyperscan==0.8.2
+idna==3.19
+imageio==2.37.4
+img2pdf==0.6.3
+jinja2==3.1.6
+jiter==0.16.0
+joblib==1.6.0
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+lazy-loader==0.5
+levenshtein==0.27.4
+lxml==6.1.2
+markdown-it-py==4.2.0
+markupsafe==3.0.3
+mdurl==0.1.2
+ml-dtypes==0.6.0
+msgpack==1.2.2
+narwhals==2.25.0
+networkx==3.6.1
+numpy==2.5.2
+ocrmypdf==17.13.0
+onnx==1.22.0
+onnxruntime==1.30.0
+openai==3.16.2
+opencv-python-headless==5.0.0.93
+orjson==3.12.0
+packaging==26.3
+pdfminer-six==20260107
+peewee==4.4.0
+pikepdf==10.18.2
+pillow==12.3.0
+pluggy==1.6.0
+protobuf==7.36.1
+psutil==7.2.2
+pycparser==3.0
+pydantic==2.13.5
+pydantic-core==2.46.5
+pygments==2.21.0
+pymupdf==1.28.2
+pypdf==6.19.0
+pypdfium2==5.15.2
+python-multipart==0.0.32
+pyyaml==6.0.3
+pyzstd==0.19.1
+rapidfuzz==3.14.6
+referencing==0.37.0
+regex==2026.8.31
+requests==2.34.2
+rich==15.0.0
+rpds-py==2026.9.1
+rtree==1.4.1
+ruff==0.16.5
+scikit-image==0.26.0
+scikit-learn==1.9.0
+scipy==1.18.1
+sniffio==1.3.1
+socksio==1.0.0
+starlette==1.6.0
+tenacity==9.1.4
+threadpoolctl==3.6.0
+tibs==0.5.7
+tifffile==2026.8.23
+tiktoken==0.14.0
+toml==0.10.2
+toposort==1.10
+tqdm==4.70.0
+truststore==0.10.4
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+uharfbuzz==0.56.1
+urllib3==2.7.0
+uvicorn==0.52.4
+xsdata==26.2

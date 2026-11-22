@@ -18,6 +18,8 @@ logger = logging.getLogger("doctranslate.jobs")
 _LOCK = threading.Lock()
 _QUEUE: "queue.SimpleQueue[str]" = queue.SimpleQueue()
 _WORKER: threading.Thread | None = None
+#: Why the worker thread stopped, when it did (see worker_problem()).
+_WORKER_ERROR: str | None = None
 _CURRENT_JOB_ID: str | None = None
 
 
@@ -126,11 +128,21 @@ def _worker_loop() -> None:
     global _CURRENT_JOB_ID
     # Imported here so the app can start (and /healthz answer) even while
     # heavy babeldoc imports/asset downloads are still warming up.
-    from server import pipeline
+    global _WORKER_ERROR
+    try:
+        from server import pipeline
 
-    # Cheap: cache folders only. The layout model is per job (see below), so an
-    # idle worker holds no ONNX session.
-    pipeline.init()
+        # Cheap: cache folders only. The layout model is per job (see below),
+        # so an idle worker holds no ONNX session. It is also the first import
+        # of babeldoc's whole PDF stack, so a broken dependency surfaces HERE
+        # (bitstring 5.0 dropped BitStream and killed this thread while
+        # uvicorn kept answering): record it so /healthz stops saying "ok".
+        pipeline.init()
+    except BaseException as exc:
+        _WORKER_ERROR = f"worker init failed: {type(exc).__name__}: {exc}"[:500]
+        logger.critical("job worker could not start; no translation will run",
+                        exc_info=True)
+        raise
     while True:
         job_id = _QUEUE.get()
         job = read_job(job_id)
@@ -156,6 +168,19 @@ def _worker_loop() -> None:
                 # After run_job's frame is gone, so the session is really
                 # unreferenced; the slot's own release trims again, harmlessly.
                 pipeline.release_layout_model()
+
+
+def worker_problem() -> str | None:
+    """Why translation jobs cannot run right now, or None when they can.
+
+    None too when the worker was never started (the stateless test app). A
+    started worker that is no longer alive is always a problem, with the
+    recorded reason when there is one.
+    """
+    worker = _WORKER
+    if worker is None or worker.is_alive():
+        return None
+    return _WORKER_ERROR or "job worker thread is not running"
 
 
 def start_worker() -> None:

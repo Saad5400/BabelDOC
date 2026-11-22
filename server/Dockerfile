@@ -34,7 +34,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY . /app
 
-RUN pip install -e /app && pip install -r /app/server/requirements.txt
+# Every dependency at the version pinned in server/constraints.txt: an
+# unpinned rebuild once pulled bitstring 5.0, which broke babeldoc's PDF writer.
+RUN pip install -c /app/server/constraints.txt -e /app -r /app/server/requirements.txt \
+    && pip check
 
 # Pre-download babeldoc assets (fonts + onnx layout model) into the image so
 # first boot in prod does not depend on external downloads. babeldoc caches
@@ -42,6 +45,11 @@ RUN pip install -e /app && pip install -r /app/server/requirements.txt
 RUN HOME=/opt/babeldoc-cache \
     python -c "import babeldoc.assets.assets as a; a.warmup()" \
     && chmod -R a+rX /opt/babeldoc-cache
+
+# Build-time smoke test: import everything the job worker imports and run the
+# layout model once. A dependency that no longer imports fails the BUILD here,
+# instead of silently killing the worker thread in production.
+RUN HOME=/opt/babeldoc-cache python -m server.smoke_imports
 
 # Seed /data cache from the baked assets at container start, then run the API.
 COPY server/entrypoint.sh /entrypoint.sh
