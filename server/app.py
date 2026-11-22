@@ -518,7 +518,11 @@ async def healthz():
             _cmd_version, ("ocrmypdf", "--version")),
         "gotenberg": await convert.service_status(),
     }
-    ok = all(v != "missing" for v in versions.values())
+    # A worker thread that died (a dependency that no longer imports, say)
+    # leaves uvicorn answering while no job will ever run. That is a broken
+    # engine, not a busy one, so it fails the probe.
+    worker = jobs.worker_problem()
+    ok = all(v != "missing" for v in versions.values()) and worker is None
     # What the admission gate is doing, read without entering it. A busy
     # engine and a broken one look identical from outside, and they are not
     # the same thing at all: this endpoint is what decides whether the
@@ -528,6 +532,7 @@ async def healthz():
     return JSONResponse(status_code=200 if ok else 503,
                         content={"status": "ok" if ok else "degraded",
                                  "versions": versions,
+                                 "worker": worker or "running",
                                  "capacity": capacity.stats()})
 
 
