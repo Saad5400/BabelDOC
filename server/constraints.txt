@@ -20,7 +20,7 @@ attrs==26.1.0
 backports-zstd==1.7.0
 bitarray==3.10.1
 bitstring==4.4.0
-certifi==2026.7.22
+certifi==2026.10.18
 cffi==2.1.1
 chardet==7.6.0
 charset-normalizer==3.5.1
@@ -29,7 +29,7 @@ cloudpickle==3.1.2
 configargparse==1.7.5
 cryptography==50.0.1
 fastapi==0.141.1
-filelock==3.32.5
+filelock==4.2.12
 flatbuffers==25.12.19
 fonttools==4.65.0
 fpdf2==2.9.0
@@ -58,7 +58,7 @@ markdown-it-py==4.2.0
 markupsafe==3.0.3
 mdurl==0.1.2
 ml-dtypes==0.6.0
-msgpack==1.2.2
+msgpack==1.2.3
 narwhals==2.25.0
 networkx==3.6.1
 numpy==2.5.2
@@ -72,7 +72,7 @@ packaging==26.3
 pdfminer-six==20260107
 peewee==4.4.0
 pikepdf==10.18.2
-pillow==12.3.0
+pillow==13.0.0
 pluggy==1.6.0
 protobuf==7.36.1
 psutil==7.2.2
@@ -81,7 +81,7 @@ pydantic==2.13.5
 pydantic-core==2.46.5
 pygments==2.21.0
 pymupdf==1.28.2
-pypdf==6.19.0
+pypdf==6.21.4
 pypdfium2==5.15.2
 python-multipart==0.0.32
 pyyaml==6.0.3
@@ -112,6 +112,6 @@ truststore==0.10.4
 typing-extensions==4.16.0
 typing-inspection==0.4.4
 uharfbuzz==0.56.1
-urllib3==2.7.0
+urllib3==2.8.0
 uvicorn==0.52.4
 xsdata==26.2
